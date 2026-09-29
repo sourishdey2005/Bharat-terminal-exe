@@ -851,6 +851,47 @@ BharatTerminal/
 
 ---
 
+## 🔮 Price Forecasting (Forecast Tab)
+
+The **Forecast** tab under *Advanced* charts the trailing closes against a
+predicted continuation, using a three-engine fallback chain. The app never
+crashes or hangs when a model is missing — each engine reports availability
+up front, failures degrade to the next engine, and the panel always says
+which engine actually ran.
+
+| Order | Engine | Needs | Context / Horizon |
+|------:|--------|-------|:-----------------:|
+| 1 | IBM Granite TTM R2 | `models/ttm-q8.gguf` + `models/config.json` + `ttm-rs` CLI on `PATH` | 512 / 96 |
+| 2 | NanoForecast v0.5 | `models/nanoforecast.onnx` (+ ONNX Runtime for `ort` to dlopen) | 512 / 48 |
+| 3 | oxidiviner auto-ARIMA | nothing — pure Rust | any / any |
+
+Notes worth knowing:
+
+- **Model files live in `models/`** next to the executable (same rule as
+  `prefs.json`/`cache.db`), falling back to `./models` for `cargo run`.
+  The Granite GGUF (~1 MB) and its `config.json` can be fetched from
+  Hugging Face; the NanoForecast repo currently ships only
+  `model.safetensors`, so its ONNX has to be exported before that engine
+  can load — until then ARIMA carries the forecast, honestly labelled.
+- **2 GB RAM discipline:** the ONNX session uses one intra-op and one
+  inter-op thread, Level1 graph optimization only, and
+  `with_memory_pattern(false)` so the arena allocator cannot pin large
+  blocks. The status bar's **RAM readout** (this process's RSS, refreshed
+  once a second) makes that verifiable while you work.
+- **Horizon slider (5–96 bars)** with a Run button; the first visit
+  auto-runs once data is present. Neural engines return up to their fixed
+  output window; ARIMA returns exactly the requested horizon.
+
+```rust
+// crates/bt-analytics/src/forecast/mod.rs
+use bt_analytics::{Forecaster, models_dir};
+
+let f = Forecaster::with_default_paths(); // probes models/ for both files
+println!("engine: {}", f.model_name());
+let (values, engine) = f.predict_with_engine(&closes, 20)?;
+println!("{} forecast {} points", engine, values.len());
+```
+
 ## 📂 Where Settings and Cache Live
 
 Both are stored in a `data/` folder **next to the executable**, not in the

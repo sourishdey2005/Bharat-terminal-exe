@@ -19,6 +19,7 @@ use egui::{Color32, Id, RichText, Stroke, Vec2};
 use egui_plot::{Bar, BarChart, Legend, Line, MarkerShape, Plot, PlotPoints, Points};
 use serde::{Deserialize, Serialize};
 
+use bt_analytics::Forecaster;
 use bt_core::{
     synthetic_correlated_returns, synthetic_ohlcv, Candle, OhlcvSeries, APP_NAME, AUTHOR, TAGLINE,
 };
@@ -1294,6 +1295,7 @@ enum Tab {
     AIResearch,
     IndiaDashboard,
     MultiCompare,
+    Forecast,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1499,6 +1501,7 @@ fn tabs_in_category(cat: TabCategory) -> &'static [(Tab, &'static str)] {
             (Tab::DonchianBreakout, "Donchian Breakout"),
             (Tab::CopulaHeatmap, "Copula Heatmap"),
             (Tab::CorrelationNetworkAdv, "Corr Network Adv"),
+            (Tab::Forecast, "Forecast"),
         ],
         TabCategory::Comparison => &[(Tab::MultiCompare, "Multi-Compare")],
     }
@@ -1867,6 +1870,24 @@ struct BharatApp {
     /// ScrollArea inflates the available space. Used to budget multi-pane
     /// chart layouts so the volume pane is never pushed off-screen.
     viewport_h: f32,
+    /// Multi-model price forecaster (Granite TTM -> NanoForecast -> ARIMA).
+    /// Cheap to hold: engines load lazily and missing model files simply
+    /// disable their engine.
+    forecaster: Option<Forecaster>,
+    /// Forecast horizon in bars, chosen on the Forecast tab.
+    forecast_horizon: usize,
+    /// Last forecast output, with the engine that produced it.
+    forecast_values: Vec<f64>,
+    forecast_engine: String,
+    /// History tail the cached forecast was computed from (plotted behind it).
+    forecast_basis: Vec<f64>,
+    /// Inline forecast error, shown on the Forecast tab (never a toast).
+    forecast_error: Option<String>,
+    /// Process RSS sampler for the status bar, refreshed at most once a
+    /// second so the readout costs nothing per frame.
+    sys: sysinfo::System,
+    ram_mb: f64,
+    ram_at: Instant,
 }
 
 impl BharatApp {
@@ -1943,6 +1964,15 @@ impl BharatApp {
             data_range_key: String::new(),
             last_range_key: String::new(),
             viewport_h: 600.0,
+            forecaster: Some(Forecaster::with_default_paths()),
+            forecast_horizon: 20,
+            forecast_values: Vec::new(),
+            forecast_engine: String::new(),
+            forecast_basis: Vec::new(),
+            forecast_error: None,
+            sys: sysinfo::System::new(),
+            ram_mb: 0.0,
+            ram_at: Instant::now() - Duration::from_secs(10),
         };
 
         app.trigger_fetch();
@@ -2237,7 +2267,19 @@ impl BharatApp {
         price_envelope(series, wx0, wx1).map_or(lo + 0.5 * range, |(a, b)| 0.5 * (a + b))
     }
 
-    fn status_bar(&self, ctx: &egui::Context) {
+    fn status_bar(&mut self, ctx: &egui::Context) {
+        // Refresh the process-RSS readout at most once a second: enumerating
+        // processes every frame would cost more than the label is worth.
+        if self.ram_at.elapsed() >= Duration::from_secs(1) {
+            self.sys.refresh_processes();
+            if let Some(process) = sysinfo::get_current_pid()
+                .ok()
+                .and_then(|pid| self.sys.process(pid))
+            {
+                self.ram_mb = process.memory() as f64 / 1024.0 / 1024.0;
+            }
+            self.ram_at = Instant::now();
+        }
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.colored_label(if self.live { PROFIT } else { Color32::GRAY }, "\u{25CF}");
@@ -2250,6 +2292,9 @@ impl BharatApp {
                 ui.label(format!("Latency: {}ms", self.status_latency_ms));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(RichText::new(format!("Made by {AUTHOR}")).color(AMBER));
+                    ui.separator();
+                    ui.label(format!("RAM: {:.0} MB", self.ram_mb))
+                        .on_hover_text("This app's own memory footprint");
                 });
             });
         });
@@ -2560,6 +2605,164 @@ impl BharatApp {
             Tab::AIResearch => self.draw_ai_research(ui),
             Tab::IndiaDashboard => self.draw_india_dashboard(ui),
             Tab::MultiCompare => self.draw_multi_compare(ui),
+            Tab::Forecast => self.draw_forecast(ui),
+        }
+    }
+
+    fn draw_forecast(&mut self, ui: &mut egui::Ui) {
+        let symbol = self.data.candles.symbol.clone();
+        ui.label(RichText::new(format!("GP — Forecast — {}", symbol)).strong());
+
+        let loaded = self
+            .forecaster
+            .as_ref()
+            .map_or("none (ARIMA fallback only)", |f| f.model_name());
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Engine").small());
+            ui.colored_label(AMBER, loaded);
+            ui.separator();
+            ui.label(RichText::new("Horizon").small());
+            if ui
+                .add(egui::Slider::new(&mut self.forecast_horizon, 5..=96).suffix(" bars"))
+                .changed()
+            {
+                // A new horizon invalidates the cached run.
+                self.forecast_values.clear();
+                self.forecast_engine.clear();
+            }
+            if ui.button("Run forecast").clicked() {
+                self.run_forecast();
+            }
+        });
+
+        // Model inventory, so a missing file is visible instead of silent.
+        let (granite_on, nano_on) = self
+            .forecaster
+            .as_ref()
+            .map_or((false, false), |f| (f.has_granite(), f.has_nano()));
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Granite TTM R2").small());
+            ui.colored_label(
+                if granite_on { PROFIT } else { Color32::GRAY },
+                if granite_on { "ready" } else { "missing" },
+            )
+            .on_hover_text("models/ttm-q8.gguf + models/config.json + ttm-rs on PATH");
+            ui.separator();
+            ui.label(RichText::new("NanoForecast v0.5").small());
+            ui.colored_label(
+                if nano_on { PROFIT } else { Color32::GRAY },
+                if nano_on { "ready" } else { "missing" },
+            )
+            .on_hover_text("models/nanoforecast.onnx (+ ONNX Runtime)");
+            ui.separator();
+            ui.label(RichText::new("ARIMA").small());
+            ui.colored_label(PROFIT, "ready")
+                .on_hover_text("Pure-Rust fallback, always available");
+        });
+
+        if let Some(err) = self.forecast_error.clone() {
+            ui.colored_label(LOSS, format!("Forecast failed: {err}"));
+        }
+
+        // First visit with data auto-runs once; afterwards the button rules.
+        if self.forecast_values.is_empty()
+            && self.forecast_error.is_none()
+            && !self.data.candles.candles.is_empty()
+        {
+            self.run_forecast();
+        }
+
+        if self.forecast_values.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.label("No forecast yet — press Run forecast.");
+            });
+            return;
+        }
+
+        ui.horizontal(|ui| {
+            ui.label(format!(
+                "Showing {} bars via {}",
+                self.forecast_values.len(),
+                self.forecast_engine
+            ));
+        });
+
+        let basis: Vec<[f64; 2]> = self
+            .forecast_basis
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| [i as f64, v])
+            .collect();
+        let start_x = basis.len() as f64 - 1.0;
+        let fc: Vec<[f64; 2]> = {
+            let mut pts = vec![[start_x, self.forecast_basis.last().copied().unwrap_or(0.0)]];
+            pts.extend(
+                self.forecast_values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &v)| [start_x + 1.0 + i as f64, v]),
+            );
+            pts
+        };
+        Plot::new("forecast_plot")
+            .height((ui.available_height() - 8.0).max(160.0))
+            .auto_bounds(egui::emath::Vec2b::new(true, true))
+            .legend(Legend::default())
+            .show(ui, |plot_ui| {
+                plot_ui.line(
+                    Line::new(PlotPoints::from(basis))
+                        .name("History")
+                        .color(Color32::from_gray(150)),
+                );
+                plot_ui.line(
+                    Line::new(PlotPoints::from(fc))
+                        .name(format!("Forecast ({})", self.forecast_engine))
+                        .color(AMBER)
+                        .width(2.0),
+                );
+            });
+    }
+
+    /// Runs the forecaster over the trailing closes and caches the result.
+    fn run_forecast(&mut self) {
+        self.forecast_error = None;
+        let closes: Vec<f64> = self
+            .data
+            .candles
+            .candles
+            .iter()
+            .rev()
+            .take(512)
+            .map(|c| c.close)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        if closes.len() < 10 {
+            self.forecast_error = Some("not enough history (need 10+ bars)".into());
+            self.forecast_values.clear();
+            return;
+        }
+        match self
+            .forecaster
+            .as_ref()
+            .map(|f| f.predict_with_engine(&closes, self.forecast_horizon))
+        {
+            Some(Ok((values, engine))) => {
+                // Plot a readable trailing window behind the forecast.
+                let tail = closes.len().min(120);
+                self.forecast_basis = closes[closes.len() - tail..].to_vec();
+                self.forecast_values = values;
+                self.forecast_engine = engine.to_string();
+            }
+            Some(Err(e)) => {
+                self.forecast_error = Some(e.to_string());
+                self.forecast_values.clear();
+            }
+            None => {
+                self.forecast_error = Some("forecaster not initialised".into());
+                self.forecast_values.clear();
+            }
         }
     }
 
@@ -8499,6 +8702,18 @@ mod tests {
         assert!(!APP_NAME.is_empty());
         assert!(!AUTHOR.is_empty());
         assert!(!TAGLINE.is_empty());
+    }
+
+    /// The Forecast panel must stay reachable: listed under Advanced with a
+    /// stable label, so a refactor of the tab bar cannot silently orphan it.
+    #[test]
+    fn test_forecast_tab_is_listed_under_advanced() {
+        let advanced = tabs_in_category(TabCategory::Advanced);
+        let entry = advanced
+            .iter()
+            .find(|(tab, _)| *tab == Tab::Forecast);
+        assert!(entry.is_some(), "Forecast tab missing from Advanced");
+        assert_eq!(entry.unwrap().1, "Forecast");
     }
 
     #[test]

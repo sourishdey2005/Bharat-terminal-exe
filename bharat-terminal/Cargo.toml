@@ -30,12 +30,19 @@ plotters = { version = "0.3", features = ["svg", "bitmap"] }
 image = "0.25"
 rayon = "1.10"
 rusqlite = { version = "0.32", features = ["bundled"] }
-futures-util = "0.3"
+futures-util = "1.10"
 tokio-tungstenite = "0.24"
 clap = { version = "4.5", features = ["derive", "env"] }
 egui = "0.28"
 eframe = { version = "0.28", default-features = false, features = ["default", "persistence", "accesskit"] }
 egui_plot = "0.28"
+# Forecasting (bt-analytics): Granite TTM + NanoForecast + ARIMA fallback.
+# ort uses load-dynamic so the ONNX runtime is dlopen()ed at runtime only;
+# builds and tests stay hermetic with no ONNX binaries required.
+ort = { version = "2.0.0-rc.10", features = ["load-dynamic", "ndarray"] }
+oxidiviner = "1"
+ndarray = "0.15"
+sysinfo = "0.30"
 
 [profile.release]
 opt-level = 3
