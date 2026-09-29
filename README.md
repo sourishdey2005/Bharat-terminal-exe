@@ -879,9 +879,12 @@ Notes worth knowing:
 - **Model files live in `models/`** next to the executable (same rule as
   `prefs.json`/`cache.db`), falling back to `./models` for `cargo run`.
   The Granite GGUF (~1 MB) and its `config.json` can be fetched from
-  Hugging Face; the NanoForecast repo currently ships only
+  Hugging Face, and the MSI installer ships both, so an installed app
+  resolves its weights out of the box — only the `ttm-rs` CLI remains
+  user-supplied. The NanoForecast repo currently ships only
   `model.safetensors`, so its ONNX has to be exported before that engine
-  can load — until then ARIMA carries the forecast, honestly labelled.
+  can load — until then the statistical bench carries the forecast,
+  honestly labelled.
 - **2 GB RAM discipline:** the ONNX session uses one intra-op and one
   inter-op thread, Level1 graph optimization only, and
   `with_memory_pattern(false)` so the arena allocator cannot pin large

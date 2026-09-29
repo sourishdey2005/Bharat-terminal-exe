@@ -50,24 +50,47 @@ pub const NANO_ONNX: &str = "nanoforecast.onnx";
 
 /// Directory that holds optional model files.
 ///
-/// The executable's own directory wins (this matches where `prefs.json` and
-/// `cache.db` live), falling back to the process working directory so
-/// `cargo run` from the crate root keeps working.
+/// Probes several layouts and returns the first `models/` directory that
+/// actually exists, so the files are found whether the app runs from an
+/// installed folder, from `cargo run` at the workspace root, or from a
+/// `target/` build directory:
+///
+/// 1. `<executable-dir>/models` (installed app, same rule as prefs/cache)
+/// 2. `<working-dir>/models` (`cargo run` from the project root)
+/// 3. walking up from the executable directory (covers
+///    `target/release/bt-app` finding `<project>/models`)
+///
+/// Falls back to `<executable-dir>/models` when nothing exists yet.
 pub fn models_dir() -> PathBuf {
+    let mut candidates: Vec<PathBuf> = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let candidate = dir.join("models");
-            if candidate.is_dir() {
-                return candidate;
-            }
-            // Even when the directory does not exist yet, prefer the
-            // executable's folder so a user-placed models/ is found.
-            if dir.is_dir() {
-                return candidate;
+            candidates.push(dir.join("models"));
+            // Walk up a few levels for cargo build layouts:
+            // target/release/bt-app -> <project>/models.
+            let mut ancestor = dir.to_path_buf();
+            for _ in 0..4 {
+                if let Some(parent) = ancestor.parent() {
+                    ancestor = parent.to_path_buf();
+                    candidates.push(ancestor.join("models"));
+                } else {
+                    break;
+                }
             }
         }
     }
-    PathBuf::from("./models")
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("models"));
+    }
+    candidates
+        .into_iter()
+        .find(|p| p.is_dir())
+        .unwrap_or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(|d| d.join("models")))
+                .unwrap_or_else(|| PathBuf::from("./models"))
+        })
 }
 
 /// A selectable forecasting engine.

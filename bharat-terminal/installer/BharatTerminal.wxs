@@ -51,6 +51,7 @@
       <ComponentRef Id="CliExe" />
       <ComponentRef Id="LicenseFile" />
       <ComponentRef Id="ReadmeFile" />
+      <ComponentRef Id="ModelFiles" />
       <ComponentRef Id="StartMenuShortcuts" />
     </Feature>
 
@@ -66,10 +67,19 @@
           <Component Id="LicenseFile" Guid="*">
             <File Id="LicenseTxt" Source="../../LICENSE" Name="LICENSE.txt" KeyPath="yes" />
           </Component>
-          <Component Id="ReadmeFile" Guid="*">
-            <File Id="ReadmeMd" Source="../../README.md" KeyPath="yes" />
-          </Component>
-        </Directory>
+            <Component Id="ReadmeFile" Guid="*">
+              <File Id="ReadmeMd" Source="../../README.md" KeyPath="yes" />
+            </Component>
+            <!-- Forecast model files. Small (~1 MB total); installing them
+                 means the Granite slot resolves its weights out of the box
+                 and only the ttm-rs CLI remains user-supplied. -->
+            <Directory Id="ModelsFolder" Name="models">
+              <Component Id="ModelFiles" Guid="A46E760F-AD4E-4FE6-A2E8-64AB8B0553CD">
+                <File Id="TtmGguf" Source="../models/ttm-q8.gguf" KeyPath="yes" />
+                <File Id="TtmConfig" Source="../models/config.json" />
+              </Component>
+            </Directory>
+          </Directory>
       </Directory>
     </StandardDirectory>
     <StandardDirectory Id="ProgramMenuFolder">
