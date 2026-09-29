@@ -863,7 +863,16 @@ which engine actually ran.
 |------:|--------|-------|:-----------------:|
 | 1 | IBM Granite TTM R2 | `models/ttm-q8.gguf` + `models/config.json` + `ttm-rs` CLI on `PATH` | 512 / 96 |
 | 2 | NanoForecast v0.5 | `models/nanoforecast.onnx` (+ ONNX Runtime for `ort` to dlopen) | 512 / 48 |
-| 3 | oxidiviner auto-ARIMA | nothing — pure Rust | any / any |
+| 3 | Auto bench | nothing — pure Rust | any / any |
+| 4 | ARIMA(1,1,1) | nothing | any / any |
+| 5 | Exp. smoothing (0.3) | nothing | any / any |
+| 6 | Moving average (5) | nothing | any / any |
+
+The **Prefer** dropdown on the panel selects the starting engine; anything
+missing or failing falls down the chain automatically, and the result line
+names the engine that actually ran (with a fallback note when it differs
+from the preference). `Auto` runs the statistical auto-selector, which
+tries ARIMA, then smoothing, then moving average and reports the winner.
 
 Notes worth knowing:
 

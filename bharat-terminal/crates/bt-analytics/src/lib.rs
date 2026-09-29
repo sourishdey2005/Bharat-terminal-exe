@@ -19,7 +19,7 @@ pub mod risk;
 pub use forecast::granite::GraniteForecaster;
 pub use forecast::nanoforecast::NanoForecaster;
 pub use forecast::statistical::StatisticalForecaster;
-pub use forecast::{ForecastError, Forecaster};
+pub use forecast::{Engine, ForecastError, Forecaster};
 pub use indicators::{
     adx, atr, bollinger, cci, cmf, donchian, ema, heikin_ashi, keltner, macd, obv, parabolic_sar,
     renko, roc, rsi, sma, stochastic, vwap, williams_r,

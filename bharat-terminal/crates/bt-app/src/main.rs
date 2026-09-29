@@ -19,6 +19,7 @@ use egui::{Color32, Id, RichText, Stroke, Vec2};
 use egui_plot::{Bar, BarChart, Legend, Line, MarkerShape, Plot, PlotPoints, Points};
 use serde::{Deserialize, Serialize};
 
+use bt_analytics::Engine as ForecastEngine;
 use bt_analytics::Forecaster;
 use bt_core::{
     synthetic_correlated_returns, synthetic_ohlcv, Candle, OhlcvSeries, APP_NAME, AUTHOR, TAGLINE,
@@ -1876,6 +1877,9 @@ struct BharatApp {
     forecaster: Option<Forecaster>,
     /// Forecast horizon in bars, chosen on the Forecast tab.
     forecast_horizon: usize,
+    /// Preferred forecast engine, chosen on the Forecast tab. A missing or
+    /// failing preference falls back down the chain automatically.
+    forecast_preferred: ForecastEngine,
     /// Last forecast output, with the engine that produced it.
     forecast_values: Vec<f64>,
     forecast_engine: String,
@@ -1966,6 +1970,7 @@ impl BharatApp {
             viewport_h: 600.0,
             forecaster: Some(Forecaster::with_default_paths()),
             forecast_horizon: 20,
+            forecast_preferred: ForecastEngine::Auto,
             forecast_values: Vec::new(),
             forecast_engine: String::new(),
             forecast_basis: Vec::new(),
@@ -2617,9 +2622,42 @@ impl BharatApp {
             .forecaster
             .as_ref()
             .map_or("none (ARIMA fallback only)", |f| f.model_name());
+        let (granite_on, nano_on) = self
+            .forecaster
+            .as_ref()
+            .map_or((false, false), |f| (f.has_granite(), f.has_nano()));
         ui.horizontal(|ui| {
             ui.label(RichText::new("Engine").small());
             ui.colored_label(AMBER, loaded);
+            ui.separator();
+            ui.label(RichText::new("Prefer").small());
+            let mut preferred = self.forecast_preferred;
+            egui::ComboBox::from_id_source("forecast_engine_pick")
+                .selected_text(preferred.label())
+                .show_ui(ui, |ui| {
+                    for engine in ForecastEngine::ALL {
+                        let available = match engine {
+                            ForecastEngine::Auto => true,
+                            ForecastEngine::Granite => granite_on,
+                            ForecastEngine::Nano => nano_on,
+                            ForecastEngine::Arima
+                            | ForecastEngine::ExpSmooth
+                            | ForecastEngine::MovAvg => true,
+                        };
+                        let label = if available {
+                            engine.label().to_string()
+                        } else {
+                            format!("{} (missing files)", engine.label())
+                        };
+                        ui.selectable_value(&mut preferred, engine, label);
+                    }
+                });
+            if preferred != self.forecast_preferred {
+                self.forecast_preferred = preferred;
+                // A new preference invalidates the cached run.
+                self.forecast_values.clear();
+                self.forecast_engine.clear();
+            }
             ui.separator();
             ui.label(RichText::new("Horizon").small());
             if ui
@@ -2636,10 +2674,6 @@ impl BharatApp {
         });
 
         // Model inventory, so a missing file is visible instead of silent.
-        let (granite_on, nano_on) = self
-            .forecaster
-            .as_ref()
-            .map_or((false, false), |f| (f.has_granite(), f.has_nano()));
         ui.horizontal(|ui| {
             ui.label(RichText::new("Granite TTM R2").small());
             ui.colored_label(
@@ -2685,6 +2719,19 @@ impl BharatApp {
                 self.forecast_values.len(),
                 self.forecast_engine
             ));
+            // When the preference was unavailable the chain fell through;
+            // say so instead of letting the label imply otherwise.
+            if self.forecast_preferred != ForecastEngine::Auto
+                && self.forecast_engine != self.forecast_preferred.label()
+            {
+                ui.colored_label(
+                    Color32::GRAY,
+                    format!(
+                        "(preferred {} unavailable — fell back)",
+                        self.forecast_preferred.label()
+                    ),
+                );
+            }
         });
 
         let basis: Vec<[f64; 2]> = self
@@ -2743,11 +2790,9 @@ impl BharatApp {
             self.forecast_values.clear();
             return;
         }
-        match self
-            .forecaster
-            .as_ref()
-            .map(|f| f.predict_with_engine(&closes, self.forecast_horizon))
-        {
+        match self.forecaster.as_ref().map(|f| {
+            f.predict_with_preference(self.forecast_preferred, &closes, self.forecast_horizon)
+        }) {
             Some(Ok((values, engine))) => {
                 // Plot a readable trailing window behind the forecast.
                 let tail = closes.len().min(120);
@@ -8709,9 +8754,7 @@ mod tests {
     #[test]
     fn test_forecast_tab_is_listed_under_advanced() {
         let advanced = tabs_in_category(TabCategory::Advanced);
-        let entry = advanced
-            .iter()
-            .find(|(tab, _)| *tab == Tab::Forecast);
+        let entry = advanced.iter().find(|(tab, _)| *tab == Tab::Forecast);
         assert!(entry.is_some(), "Forecast tab missing from Advanced");
         assert_eq!(entry.unwrap().1, "Forecast");
     }

@@ -1,24 +1,83 @@
 // crates/bt-analytics/src/forecast/statistical.rs
 // Author: Sourish Dey
 
-//! oxidiviner auto-ARIMA (fallback engine).
+//! Statistical forecast bench (always-live fallback engines).
 //!
-//! Pure Rust, zero model files, always available. `auto_select` tries
-//! ARIMA(1,1,1), then exponential smoothing, then a moving average, and
-//! reports which one won. Forecasts exactly `horizon` points of real,
-//! finite values.
+//! Pure Rust, zero model files, always available:
+//! - `Auto`: `auto_select` tries ARIMA(1,1,1), then exponential smoothing,
+//!   then a moving average, and reports which one won.
+//! - `Arima`, `ExpSmooth`, `MovAvg`: each member run directly.
+//!
+//! Every engine enforces the same contract: exactly `horizon` finite points.
 
 use chrono::{Duration, Utc};
-use oxidiviner::quick::auto_select;
+use oxidiviner::models::exponential_smoothing::SimpleESModel;
+use oxidiviner::quick::{arima, auto_select, moving_average};
 use oxidiviner::TimeSeriesData;
 
-use super::ForecastError;
+use super::{Engine, ForecastError};
 
 pub struct StatisticalForecaster;
 
 impl StatisticalForecaster {
     pub fn new() -> Self {
         Self
+    }
+
+    /// Run one bench member (or the auto-selector) by name.
+    pub fn forecast_engine(
+        &self,
+        engine: Engine,
+        history: &[f64],
+        horizon: usize,
+    ) -> Result<(Vec<f64>, &'static str), ForecastError> {
+        let data = history_data(history)?;
+        let (values, name): (Vec<f64>, &'static str) = match engine {
+            Engine::Auto => {
+                let (v, model) = auto_select(data, horizon)
+                    .map_err(|e| ForecastError::Statistical(e.to_string()))?;
+                // `auto_select` names its winner with an owned string; map the
+                // three known winners back to static names.
+                let name = if model.starts_with("ARIMA") {
+                    "ARIMA(1,1,1)"
+                } else if model.starts_with("SimpleES") {
+                    "ExpSmooth(0.3)"
+                } else if model.starts_with("MA(") {
+                    "MovAvg(5)"
+                } else {
+                    "Auto bench"
+                };
+                (v, name)
+            }
+            Engine::Arima => (
+                arima(data, horizon).map_err(|e| ForecastError::Statistical(e.to_string()))?,
+                "ARIMA(1,1,1)",
+            ),
+            Engine::ExpSmooth => {
+                let mut model = SimpleESModel::new(0.3)
+                    .map_err(|e| ForecastError::Statistical(format!("{e:?}")))?;
+                model
+                    .fit(&data)
+                    .map_err(|e| ForecastError::Statistical(format!("{e:?}")))?;
+                (
+                    model
+                        .forecast(horizon)
+                        .map_err(|e| ForecastError::Statistical(format!("{e:?}")))?,
+                    "ExpSmooth(0.3)",
+                )
+            }
+            Engine::MovAvg => (
+                moving_average(data, horizon, Some(5))
+                    .map_err(|e| ForecastError::Statistical(e.to_string()))?,
+                "MovAvg(5)",
+            ),
+            Engine::Granite | Engine::Nano => {
+                return Err(ForecastError::Statistical(
+                    "not a statistical engine".into(),
+                ));
+            }
+        };
+        Ok((checked(values, horizon)?, name))
     }
 
     /// Name of the model `auto_select` chose on the last call is returned by
@@ -32,38 +91,42 @@ impl StatisticalForecaster {
         history: &[f64],
         horizon: usize,
     ) -> Result<(Vec<f64>, String), ForecastError> {
-        const MIN_POINTS: usize = 10;
-        if history.len() < MIN_POINTS {
-            return Err(ForecastError::InsufficientData(MIN_POINTS, history.len()));
-        }
-        if !history.iter().all(|v| v.is_finite()) {
-            return Err(ForecastError::Statistical(
-                "history contains non-finite values".into(),
-            ));
-        }
-
-        // ARIMA cares about order, not calendar spacing; synthesize a daily
-        // grid ending now so the timestamps are strictly increasing.
-        let now = Utc::now();
-        let timestamps: Vec<_> = (0..history.len())
-            .map(|i| now - Duration::days((history.len() - 1 - i) as i64))
-            .collect();
-        let data = TimeSeriesData::new(timestamps, history.to_vec(), "bharat-terminal")
-            .map_err(|e| ForecastError::Statistical(e.to_string()))?;
-        let (mut forecast, model) =
-            auto_select(data, horizon).map_err(|e| ForecastError::Statistical(e.to_string()))?;
-
-        // Contract: exactly `horizon` finite points. `auto_select` honours the
-        // period count, but enforce it here so callers never have to care.
-        forecast.truncate(horizon);
-        if forecast.len() != horizon || !forecast.iter().all(|v| v.is_finite()) {
-            return Err(ForecastError::Statistical(
-                "engine returned an incomplete forecast".into(),
-            ));
-        }
-        tracing::debug!("ARIMA forecast via {}", model);
-        Ok((forecast, model))
+        let (values, name) = self.forecast_engine(Engine::Auto, history, horizon)?;
+        Ok((values, name.to_string()))
     }
+}
+
+/// Validated, timestamped input for the oxidiviner bench.
+fn history_data(history: &[f64]) -> Result<TimeSeriesData, ForecastError> {
+    const MIN_POINTS: usize = 10;
+    if history.len() < MIN_POINTS {
+        return Err(ForecastError::InsufficientData(MIN_POINTS, history.len()));
+    }
+    if !history.iter().all(|v| v.is_finite()) {
+        return Err(ForecastError::Statistical(
+            "history contains non-finite values".into(),
+        ));
+    }
+    // ARIMA cares about order, not calendar spacing; synthesize a daily grid
+    // ending now so the timestamps are strictly increasing.
+    let now = Utc::now();
+    let timestamps: Vec<_> = (0..history.len())
+        .map(|i| now - Duration::days((history.len() - 1 - i) as i64))
+        .collect();
+    TimeSeriesData::new(timestamps, history.to_vec(), "bharat-terminal")
+        .map_err(|e| ForecastError::Statistical(e.to_string()))
+}
+
+/// Contract enforcement: exactly `horizon` finite points.
+fn checked(values: Vec<f64>, horizon: usize) -> Result<Vec<f64>, ForecastError> {
+    let mut values = values;
+    values.truncate(horizon);
+    if values.len() != horizon || !values.iter().all(|v| v.is_finite()) {
+        return Err(ForecastError::Statistical(
+            "engine returned an incomplete forecast".into(),
+        ));
+    }
+    Ok(values)
 }
 
 impl Default for StatisticalForecaster {
@@ -92,6 +155,57 @@ mod tests {
     }
 
     #[test]
+    fn test_each_bench_member_runs_directly() {
+        let f = StatisticalForecaster::new();
+        // Noisy, realistic history: a perfect ramp is degenerate for ARIMA
+        // fitting (unit-root blowup), while market data always carries noise.
+        let history = noisy_trend(80);
+        for engine in [Engine::Arima, Engine::ExpSmooth, Engine::MovAvg] {
+            let (v, name) = f.forecast_engine(engine, &history, 12).unwrap();
+            assert_eq!(v.len(), 12, "{name}");
+            assert!(v.iter().all(|x| x.is_finite()), "{name}");
+        }
+    }
+
+    /// Noisy deterministic history shared by the direct-engine tests.
+    fn noisy_trend(n: usize) -> Vec<f64> {
+        (0..n)
+            .map(|i| 100.0 + i as f64 * 0.5 + 3.0 * ((i as f64 * 0.7).sin()))
+            .collect()
+    }
+
+    #[test]
+    fn test_bench_members_agree_on_a_trend() {
+        // Three independent methods on a noisy trend must all point forward,
+        // not collapse or explode.
+        let history = noisy_trend(100);
+        let last = history[history.len() - 1];
+        for engine in [Engine::Arima, Engine::ExpSmooth, Engine::MovAvg] {
+            let (v, name) = f_engine(engine, &history);
+            assert!(
+                v[4] > last - 10.0 && v[4] < last + 10.0,
+                "{name} drifted: {}",
+                v[4]
+            );
+        }
+
+        fn f_engine(engine: Engine, history: &[f64]) -> (Vec<f64>, &'static str) {
+            StatisticalForecaster::new()
+                .forecast_engine(engine, history, 5)
+                .unwrap()
+        }
+    }
+
+    #[test]
+    fn test_direct_arima_rejects_degenerate_ramps_cleanly() {
+        // A perfect ramp blows up ARIMA(1,1,1) coefficient fitting. That must
+        // surface as an ordinary error (the chain then falls through), never
+        // a panic or garbage output.
+        let f = StatisticalForecaster::new();
+        assert!(f.forecast_engine(Engine::Arima, &trend(80), 12).is_err());
+    }
+
+    #[test]
     fn test_arima_rejects_short_and_bad_history() {
         let f = StatisticalForecaster::new();
         assert!(f.forecast(&trend(9), 5).is_err());
@@ -108,5 +222,12 @@ mod tests {
         let v = f.forecast(&flat, 10).unwrap();
         // A constant series must forecast ~constant, not explode.
         assert!(v.iter().all(|x| (*x - 42.0).abs() < 5.0));
+    }
+
+    #[test]
+    fn test_neural_variants_are_rejected_by_the_bench() {
+        let f = StatisticalForecaster::new();
+        assert!(f.forecast_engine(Engine::Granite, &trend(60), 5).is_err());
+        assert!(f.forecast_engine(Engine::Nano, &trend(60), 5).is_err());
     }
 }

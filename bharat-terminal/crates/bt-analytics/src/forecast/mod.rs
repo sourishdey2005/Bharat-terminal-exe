@@ -70,6 +70,45 @@ pub fn models_dir() -> PathBuf {
     PathBuf::from("./models")
 }
 
+/// A selectable forecasting engine.
+///
+/// `Auto` runs the statistical auto-selector (ARIMA → exponential smoothing
+/// → moving average) unless a neural engine is loaded, in which case neural
+/// engines take precedence. The concrete variants run exactly that model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Engine {
+    Auto,
+    Granite,
+    Nano,
+    Arima,
+    ExpSmooth,
+    MovAvg,
+}
+
+impl Engine {
+    /// Display name for menus and labels.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Engine::Auto => "Auto (best available)",
+            Engine::Granite => "Granite TTM R2",
+            Engine::Nano => "NanoForecast v0.5",
+            Engine::Arima => "ARIMA(1,1,1)",
+            Engine::ExpSmooth => "Exp. smoothing (0.3)",
+            Engine::MovAvg => "Moving average (5)",
+        }
+    }
+
+    /// Every engine, in fallback order.
+    pub const ALL: [Engine; 6] = [
+        Engine::Granite,
+        Engine::Nano,
+        Engine::Auto,
+        Engine::Arima,
+        Engine::ExpSmooth,
+        Engine::MovAvg,
+    ];
+}
+
 /// Unified forecaster with an automatic fallback chain.
 pub struct Forecaster {
     granite: Option<GraniteForecaster>,
@@ -122,6 +161,18 @@ impl Forecaster {
         history: &[f64],
         horizon: usize,
     ) -> Result<(Vec<f64>, &'static str), ForecastError> {
+        self.predict_with_preference(Engine::Auto, history, horizon)
+    }
+
+    /// Predict starting from a preferred engine, falling back through the
+    /// rest of the chain below it. An unavailable or failing preference
+    /// degrades silently to the next engine; only a total failure errors.
+    pub fn predict_with_preference(
+        &self,
+        preferred: Engine,
+        history: &[f64],
+        horizon: usize,
+    ) -> Result<(Vec<f64>, &'static str), ForecastError> {
         if history.is_empty() {
             return Err(ForecastError::EmptyHistory);
         }
@@ -129,36 +180,40 @@ impl Forecaster {
             return Ok((Vec::new(), "none"));
         }
 
-        // Try Granite TTM first.
-        if let Some(g) = &self.granite {
-            match g.predict(history, horizon) {
-                Ok(v) => {
-                    tracing::debug!("Granite TTM forecast: {} points", v.len());
-                    return Ok((v, "Granite TTM R2"));
+        let start = Engine::ALL
+            .iter()
+            .position(|e| *e == preferred)
+            .unwrap_or(0);
+        let mut last_error = String::from("no engine available");
+        for engine in &Engine::ALL[start..] {
+            let attempt = match engine {
+                Engine::Granite => self
+                    .granite
+                    .as_ref()
+                    .map(|g| g.predict(history, horizon).map(|v| (v, "Granite TTM R2"))),
+                Engine::Nano => self.nano.as_ref().map(|n| {
+                    n.predict(history, horizon)
+                        .map(|v| (v, "NanoForecast v0.5"))
+                }),
+                Engine::Auto | Engine::Arima | Engine::ExpSmooth | Engine::MovAvg => {
+                    Some(self.statistical.forecast_engine(*engine, history, horizon))
                 }
-                Err(e) => tracing::warn!("Granite failed: {}. Trying NanoForecast.", e),
+            };
+            match attempt {
+                Some(Ok((v, name))) => {
+                    tracing::debug!("{name} forecast: {} points", v.len());
+                    return Ok((v, name));
+                }
+                Some(Err(e)) => {
+                    tracing::warn!("{preferred:?} chain: {engine:?} failed ({e}), trying next");
+                    last_error = e.to_string();
+                }
+                None => {
+                    tracing::debug!("{engine:?} not loaded, trying next");
+                }
             }
         }
-
-        // Try NanoForecast second.
-        if let Some(n) = &self.nano {
-            match n.predict(history, horizon) {
-                Ok(v) => {
-                    tracing::debug!("NanoForecast: {} points", v.len());
-                    return Ok((v, "NanoForecast v0.5"));
-                }
-                Err(e) => tracing::warn!("NanoForecast failed: {}. Using ARIMA.", e),
-            }
-        }
-
-        // Fallback to ARIMA.
-        self.statistical
-            .forecast(history, horizon)
-            .map(|v| {
-                tracing::debug!("ARIMA fallback forecast: {} points", v.len());
-                (v, "ARIMA (statistical)")
-            })
-            .map_err(|e| ForecastError::AllFailed(e.to_string()))
+        Err(ForecastError::AllFailed(last_error))
     }
 
     /// Predict using the best available model.
@@ -222,7 +277,57 @@ mod tests {
         let (v, engine) = f.predict_with_engine(&trend(60), 12).unwrap();
         assert_eq!(v.len(), 12);
         assert!(v.iter().all(|x| x.is_finite()));
-        assert_eq!(engine, "ARIMA (statistical)");
+        // The auto-selector names its winner; any bench member proves the
+        // fallback ran instead of erroring.
+        assert!(
+            ["ARIMA(1,1,1)", "ExpSmooth(0.3)", "MovAvg(5)", "Auto bench"].contains(&engine),
+            "unexpected engine: {engine}"
+        );
+    }
+
+    #[test]
+    fn test_preferred_engine_runs_when_healthy() {
+        // Noisy history: a perfect ramp is degenerate for direct ARIMA
+        // fitting, while market data always carries noise.
+        let history: Vec<f64> = (0..60)
+            .map(|i| 100.0 + i as f64 * 0.5 + 3.0 * ((i as f64 * 0.7).sin()))
+            .collect();
+        let f = Forecaster::new(None, None);
+        for (preferred, expected) in [
+            (Engine::Arima, "ARIMA(1,1,1)"),
+            (Engine::ExpSmooth, "ExpSmooth(0.3)"),
+            (Engine::MovAvg, "MovAvg(5)"),
+        ] {
+            let (v, engine) = f.predict_with_preference(preferred, &history, 8).unwrap();
+            assert_eq!(v.len(), 8);
+            assert_eq!(engine, expected);
+        }
+    }
+
+    #[test]
+    fn test_missing_preferred_engine_falls_down_the_chain() {
+        // Granite files are absent, so preferring it must degrade to the
+        // statistical bench rather than fail.
+        let f = Forecaster::new(None, None);
+        let (v, engine) = f
+            .predict_with_preference(Engine::Granite, &trend(60), 8)
+            .unwrap();
+        assert_eq!(v.len(), 8);
+        assert_ne!(engine, "Granite TTM R2");
+        let (v, engine) = f
+            .predict_with_preference(Engine::Nano, &trend(60), 8)
+            .unwrap();
+        assert_eq!(v.len(), 8);
+        assert_ne!(engine, "NanoForecast v0.5");
+    }
+
+    #[test]
+    fn test_engine_labels_cover_the_chain() {
+        assert_eq!(Engine::ALL.len(), 6);
+        for engine in Engine::ALL {
+            assert!(!engine.label().is_empty());
+        }
+        assert_eq!(Engine::Auto.label(), "Auto (best available)");
     }
 
     #[test]
