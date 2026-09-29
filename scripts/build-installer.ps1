@@ -16,10 +16,30 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $project = Join-Path $root "bharat-terminal"
 $installerDir = Join-Path $project "installer"
+$nativeDir = Join-Path $project "native"
 $msiOut = Join-Path $project "releases\BharatTerminal-v3.0.0.msi"
 
 Write-Host "Building Bharat Terminal v3 (release)..." -ForegroundColor Cyan
 cargo build --release --workspace --manifest-path (Join-Path $project "Cargo.toml")
+
+# Pinned ONNX Runtime 1.28.0 (matches ort-sys; never committed, ~16 MB).
+$ortVersion = "1.28.0"
+$ortDll = Join-Path $nativeDir "onnxruntime.dll"
+if (-not (Test-Path $ortDll)) {
+    Write-Host "Fetching ONNX Runtime $ortVersion..." -ForegroundColor Yellow
+    New-Item -ItemType Directory -Path $nativeDir -Force | Out-Null
+    $zip = Join-Path ([System.IO.Path]::GetTempPath()) "onnxruntime-win-x64.zip"
+    curl.exe -sL --max-time 300 -o $zip `
+        "https://github.com/microsoft/onnxruntime/releases/download/v$ortVersion/onnxruntime-win-x64-$ortVersion.zip"
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) "ortx"
+    if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force }
+    Expand-Archive -Path $zip -DestinationPath $tmp -Force
+    Copy-Item "$tmp\onnxruntime-win-x64-$ortVersion\lib\*.dll" $nativeDir -Force
+    Remove-Item $zip -Force -ErrorAction SilentlyContinue
+    Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+} else {
+    Write-Host "ONNX Runtime already present." -ForegroundColor DarkGray
+}
 
 Write-Host "Packaging per-user MSI..." -ForegroundColor Yellow
 Push-Location $installerDir

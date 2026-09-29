@@ -1,0 +1,5 @@
+{
+  "temperature": 1.0700489282608032,
+  "onnx_model": "/content/drive/MyDrive/WatchSignal_Training/train_output_v3_1/stock_signal_lstm_v1_seed42.onnx",
+  "release_date": "2026-04-15"
+}

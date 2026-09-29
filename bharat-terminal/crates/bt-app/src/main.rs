@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use bt_analytics::Engine as ForecastEngine;
 use bt_analytics::Forecaster;
+use bt_analytics::{Signal, SignalOutput, WatchSignalModel};
 use bt_core::{
     synthetic_correlated_returns, synthetic_ohlcv, Candle, OhlcvSeries, APP_NAME, AUTHOR, TAGLINE,
 };
@@ -1875,6 +1876,10 @@ struct BharatApp {
     /// Cheap to hold: engines load lazily and missing model files simply
     /// disable their engine.
     forecaster: Option<Forecaster>,
+    /// WatchSignal LSTM classifier (BUY/HOLD/SELL), when its ONNX is present.
+    watchsignal: Option<WatchSignalModel>,
+    /// Latest classified signal, refreshed with each forecast run.
+    last_signal: Option<SignalOutput>,
     /// Forecast horizon in bars, chosen on the Forecast tab.
     forecast_horizon: usize,
     /// Preferred forecast engine, chosen on the Forecast tab. A missing or
@@ -1969,6 +1974,8 @@ impl BharatApp {
             last_range_key: String::new(),
             viewport_h: 600.0,
             forecaster: Some(Forecaster::with_default_paths()),
+            watchsignal: Self::load_watchsignal(),
+            last_signal: None,
             forecast_horizon: 20,
             forecast_preferred: ForecastEngine::Auto,
             forecast_values: Vec::new(),
@@ -2300,6 +2307,36 @@ impl BharatApp {
                     ui.separator();
                     ui.label(format!("RAM: {:.0} MB", self.ram_mb))
                         .on_hover_text("This app's own memory footprint");
+                    // Active forecast engine: green while a neural model runs,
+                    // amber for NanoForecast, grey for the statistical bench.
+                    let (dot, dot_color) = if self.forecast_engine == "Granite TTM R2" {
+                        ("● Granite TTM R2", PROFIT)
+                    } else if self.forecast_engine == "NanoForecast v0.5" {
+                        ("● NanoForecast", AMBER)
+                    } else if self.forecast_engine.is_empty() {
+                        ("○ forecast idle", Color32::GRAY)
+                    } else {
+                        ("● ARIMA bench", Color32::GRAY)
+                    };
+                    ui.separator();
+                    ui.label(RichText::new(dot).color(dot_color))
+                        .on_hover_text("Engine behind the last forecast run");
+                    // Headline trading signal, when the classifier is loaded.
+                    if let Some(output) = &self.last_signal {
+                        let headline = output.headline();
+                        let color = match headline {
+                            Signal::Buy => PROFIT,
+                            Signal::Hold => Color32::GRAY,
+                            Signal::Sell => LOSS,
+                        };
+                        ui.separator();
+                        ui.label(
+                            RichText::new(format!("Signal: {}", headline.label()))
+                                .color(color)
+                                .strong(),
+                        )
+                        .on_hover_text("WatchSignal LSTM classification");
+                    }
                 });
             });
         });
@@ -2734,6 +2771,32 @@ impl BharatApp {
             }
         });
 
+        // Trading-signal readout. The feature layout is provisional (the
+        // training order was never published), so the panel says so.
+        if let Some(output) = self.last_signal.clone() {
+            ui.horizontal(|ui| {
+                let headline = output.headline();
+                let color = match headline {
+                    Signal::Buy => PROFIT,
+                    Signal::Hold => Color32::GRAY,
+                    Signal::Sell => LOSS,
+                };
+                ui.label(RichText::new("Signal").small());
+                ui.colored_label(color, RichText::new(headline.label()).strong());
+                ui.colored_label(Color32::GRAY, format!("{:.0}%", output.confidence * 100.0));
+                ui.colored_label(Color32::GRAY, "(experimental layout)".to_string())
+                    .on_hover_text(
+                        "The 55-feature order is provisional until the training \
+                         layout is confirmed; treat live signals accordingly.",
+                    );
+            });
+        } else if self.watchsignal.is_some() {
+            ui.colored_label(
+                Color32::GRAY,
+                "Signal: need 80+ bars of history — load a longer range.",
+            );
+        }
+
         let basis: Vec<[f64; 2]> = self
             .forecast_basis
             .iter()
@@ -2751,6 +2814,15 @@ impl BharatApp {
             );
             pts
         };
+        // One line colour per engine family, so switching engines visibly
+        // changes the chart instead of repainting the same amber line.
+        let forecast_color = if self.forecast_engine == "Granite TTM R2" {
+            PROFIT
+        } else if self.forecast_engine == "NanoForecast v0.5" {
+            AMBER
+        } else {
+            INFO
+        };
         Plot::new("forecast_plot")
             .height((ui.available_height() - 8.0).max(160.0))
             .auto_bounds(egui::emath::Vec2b::new(true, true))
@@ -2764,19 +2836,35 @@ impl BharatApp {
                 plot_ui.line(
                     Line::new(PlotPoints::from(fc))
                         .name(format!("Forecast ({})", self.forecast_engine))
-                        .color(AMBER)
+                        .color(forecast_color)
                         .width(2.0),
                 );
             });
     }
 
     /// Runs the forecaster over the trailing closes and caches the result.
+    /// Loads the WatchSignal classifier when its ONNX file is present next
+    /// to the executable (or under `./models`). Absence is normal and only
+    /// disables the signal readout.
+    fn load_watchsignal() -> Option<WatchSignalModel> {
+        use bt_analytics::forecast::models_dir;
+        let path = models_dir().join("stock_signal_lstm_v1_seed42.onnx");
+        if !path.exists() {
+            return None;
+        }
+        match WatchSignalModel::new(&path.to_string_lossy()) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                tracing::warn!("WatchSignal unavailable: {}", e);
+                None
+            }
+        }
+    }
+
     fn run_forecast(&mut self) {
         self.forecast_error = None;
-        let closes: Vec<f64> = self
-            .data
-            .candles
-            .candles
+        let candles = &self.data.candles.candles;
+        let closes: Vec<f64> = candles
             .iter()
             .rev()
             .take(512)
@@ -2809,6 +2897,13 @@ impl BharatApp {
                 self.forecast_values.clear();
             }
         }
+        // Refresh the trading signal alongside the forecast. A missing model
+        // or short history clears the readout instead of erroring: the
+        // forecast itself must never depend on the classifier.
+        self.last_signal = self
+            .watchsignal
+            .as_ref()
+            .and_then(|m| m.predict_candles(candles).ok());
     }
 
     fn draw_candlestick(&self, ui: &mut egui::Ui) {

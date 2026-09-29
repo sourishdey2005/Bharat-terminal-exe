@@ -601,6 +601,7 @@ dependencies = [
  "ort",
  "oxidiviner",
  "rayon",
+ "serde_json",
  "sysinfo",
  "thiserror 1.0.69",
  "tracing",
@@ -624,6 +625,7 @@ dependencies = [
  "sysinfo",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

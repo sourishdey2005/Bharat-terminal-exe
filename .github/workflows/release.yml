@@ -25,6 +25,13 @@ jobs:
           dotnet tool install --global wix --version 5.0.2
           wix extension add --global WixToolset.UI.wixext/5.0.2
       
+      - name: Fetch pinned ONNX Runtime
+        run: |
+          New-Item -ItemType Directory -Path "native" -Force | Out-Null
+          curl.exe -sL --max-time 300 -o "$env:TEMP\onnxruntime-win-x64.zip" "https://github.com/microsoft/onnxruntime/releases/download/v1.28.0/onnxruntime-win-x64-1.28.0.zip"
+          Expand-Archive -Path "$env:TEMP\onnxruntime-win-x64.zip" -DestinationPath "$env:TEMP\ortx" -Force
+          Copy-Item "$env:TEMP\ortx\onnxruntime-win-x64-1.28.0\lib\*.dll" "native" -Force
+      
       - name: Build MSI installer
         working-directory: bharat-terminal/installer
         run: wix build BharatTerminal.wxs -o "../releases/BharatTerminal-v3.0.0.msi" -ext WixToolset.UI.wixext -arch x64 -d AppVersion=3.0.0
@@ -49,6 +56,7 @@ jobs:
             - Real market data (Yahoo + Coinbase)
             - Live mode with 30s auto-refresh
             - 78 companies supported
+            - Forecast tab: Granite TTM + ARIMA bench + WatchSignal LSTM
             - Windows installer + portable ZIP
             
             ## Installation

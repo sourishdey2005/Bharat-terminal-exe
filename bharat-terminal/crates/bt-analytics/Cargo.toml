@@ -12,6 +12,7 @@ rayon = "1.10"
 thiserror = "1"
 chrono = { workspace = true }
 tracing = { workspace = true }
+serde_json = { workspace = true }
 ort = { workspace = true }
 oxidiviner = { workspace = true }
 sysinfo = { workspace = true }

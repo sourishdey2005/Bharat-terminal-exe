@@ -14,12 +14,14 @@
 
 pub mod forecast;
 pub mod indicators;
+pub mod ort_runtime;
 pub mod risk;
+pub mod signal;
 
 pub use forecast::granite::GraniteForecaster;
 pub use forecast::nanoforecast::NanoForecaster;
 pub use forecast::statistical::StatisticalForecaster;
-pub use forecast::{Engine, ForecastError, Forecaster};
+pub use forecast::{models_dir, Engine, ForecastError, Forecaster};
 pub use indicators::{
     adx, atr, bollinger, cci, cmf, donchian, ema, heikin_ashi, keltner, macd, obv, parabolic_sar,
     renko, roc, rsi, sma, stochastic, vwap, williams_r,
@@ -30,6 +32,7 @@ pub use risk::{
     rolling_max_drawdown, rolling_moments, rolling_sharpe, rolling_sortino, rolling_volatility,
     sharpe, skewness, sortino, treynor, var_historical,
 };
+pub use signal::{Signal, SignalOutput, WatchSignalModel, SIGNAL_N_FEATURES, SIGNAL_SEQ_LEN};
 
 #[cfg(test)]
 mod tests {

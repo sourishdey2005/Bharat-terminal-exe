@@ -52,6 +52,7 @@
       <ComponentRef Id="LicenseFile" />
       <ComponentRef Id="ReadmeFile" />
       <ComponentRef Id="ModelFiles" />
+      <ComponentRef Id="NativeRuntime" />
       <ComponentRef Id="StartMenuShortcuts" />
     </Feature>
 
@@ -61,9 +62,17 @@
           <Component Id="AppExe" Guid="*">
             <File Id="BtAppExe" Source="../target/release/bt-app.exe" KeyPath="yes" />
           </Component>
-          <Component Id="CliExe" Guid="*">
-            <File Id="BtCliExe" Source="../target/release/bt-cli.exe" KeyPath="yes" />
-          </Component>
+            <Component Id="CliExe" Guid="*">
+              <File Id="BtCliExe" Source="../target/release/bt-cli.exe" KeyPath="yes" />
+            </Component>
+            <!-- Pinned ONNX Runtime 1.28.0 (matches ort-sys). Lives next to
+                 the executables so the loader finds it before any
+                 incompatible system copy. Fetched by scripts/build-installer.ps1,
+                 never committed. -->
+            <Component Id="NativeRuntime" Guid="E7EB95B0-2355-49DA-B7E2-5111186B2CC4">
+              <File Id="OnnxRuntime" Source="../native/onnxruntime.dll" KeyPath="yes" />
+              <File Id="OnnxProvidersShared" Source="../native/onnxruntime_providers_shared.dll" />
+            </Component>
           <Component Id="LicenseFile" Guid="*">
             <File Id="LicenseTxt" Source="../../LICENSE" Name="LICENSE.txt" KeyPath="yes" />
           </Component>

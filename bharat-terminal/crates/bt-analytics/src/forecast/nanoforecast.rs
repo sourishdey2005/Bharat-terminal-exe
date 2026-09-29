@@ -39,7 +39,9 @@ impl NanoForecaster {
             return Err(ForecastError::ModelNotFound(model_path.to_string()));
         }
 
-        ort::init().with_name("bharat-terminal").commit();
+        // Pinned runtime only: a blind init() could dlopen an incompatible
+        // system build and crash natively instead of erroring.
+        crate::ort_runtime::ensure_initialized().map_err(ForecastError::Nano)?;
 
         // CRITICAL for 2 GB RAM: single threads, Level1 only, and no arena
         // memory pattern — otherwise the allocator can pin hundreds of MB.

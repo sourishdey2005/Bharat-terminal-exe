@@ -12,6 +12,9 @@ prefs.json
 # egui / eframe persistence
 *.ron
 
+# Pinned native runtime (fetched by scripts/build-installer.ps1, ~16 MB)
+bharat-terminal/native/*.dll
+
 # WiX build artifacts (rebuilt by every MSI build)
 *.wixpdb
 *.wixobj

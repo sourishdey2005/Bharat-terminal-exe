@@ -861,12 +861,29 @@ which engine actually ran.
 
 | Order | Engine | Needs | Context / Horizon |
 |------:|--------|-------|:-----------------:|
-| 1 | IBM Granite TTM R2 | `models/ttm-q8.gguf` + `models/config.json` + `ttm-rs` CLI on `PATH` | 512 / 96 |
+| 1 | IBM Granite TTM R2 | `models/ttm-q8.gguf` + `models/config.json` + `zsfm` CLI on `PATH` | 512 / 96 |
 | 2 | NanoForecast v0.5 | `models/nanoforecast.onnx` (+ ONNX Runtime for `ort` to dlopen) | 512 / 48 |
 | 3 | Auto bench | nothing — pure Rust | any / any |
 | 4 | ARIMA(1,1,1) | nothing | any / any |
 | 5 | Exp. smoothing (0.3) | nothing | any / any |
 | 6 | Moving average (5) | nothing | any / any |
+
+Granite runs through the `zsfm` CLI (`zsfm ttm infer` reading
+`{"context": [...], "horizon": N}` on stdin), resolved from `PATH` with a
+`~/.cargo/bin` fallback and a 60 s timeout, so a wedged subprocess can never
+freeze the app. A live run measures ~0.2 s for 64 points. Each engine paints
+its own line colour (Granite green, NanoForecast amber, statistical blue),
+so switching engines visibly changes the chart.
+
+Alongside forecasting, the **WatchSignal LSTM** (`models/stock_signal_lstm_v1_seed42.onnx`)
+classifies the trailing 30 bars into a single BUY/HOLD/SELL signal with a
+confidence readout, shown in the status bar and on the Forecast tab. The
+model's true output is one `(sell, hold, buy)` triple (measured, not
+assumed), calibrated with the shipped temperature (1.07) when the scores
+are logits rather than probabilities. Its 55-feature layout is provisional
+(the training order was never published), and both the tab and the code say
+so — treat live signals as experimental until the training layout is
+confirmed.
 
 The **Prefer** dropdown on the panel selects the starting engine; anything
 missing or failing falls down the chain automatically, and the result line
@@ -880,11 +897,16 @@ Notes worth knowing:
   `prefs.json`/`cache.db`), falling back to `./models` for `cargo run`.
   The Granite GGUF (~1 MB) and its `config.json` can be fetched from
   Hugging Face, and the MSI installer ships both, so an installed app
-  resolves its weights out of the box — only the `ttm-rs` CLI remains
+  resolves its weights out of the box — only the `zsfm` CLI remains
   user-supplied. The NanoForecast repo currently ships only
   `model.safetensors`, so its ONNX has to be exported before that engine
   can load — until then the statistical bench carries the forecast,
   honestly labelled.
+- **ONNX Runtime is pinned, not probed:** `ort` is pointed at an exact 1.28.0
+  `onnxruntime.dll` next to the executable (shipped by the installer,
+  `native/` for developers) because blindly loading the OS-resolved DLL
+  can pull an incompatible inbox build and crash natively instead of
+  erroring. No DLL, no inference — a plain error the chain handles.
 - **2 GB RAM discipline:** the ONNX session uses one intra-op and one
   inter-op thread, Level1 graph optimization only, and
   `with_memory_pattern(false)` so the arena allocator cannot pin large
