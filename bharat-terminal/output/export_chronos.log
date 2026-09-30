@@ -1,0 +1,12 @@
+Loading amazon/chronos-bolt-tiny (real pretrained checkpoint)
+reference (untouched torch) (64,)
+(a) patched torch vs untouched: rel = 0.000e+00
+exporting fp32 at opset 18
+wrote chronos_bolt_tiny.onnx (34.77 MB)
+legalize: ReduceSum(axes attr)=0, Gather(float indices)=2
+quantiles=9 horizon=64
+(b) onnx fp32 median vs torch: rel = 8.976e-08
+    median head=[2606.9619140625, 2609.181884765625, 2613.654052734375, 2617.964111328125, 2620.97998046875]
+quantizing to int8 (dynamic, per-channel)
+(c) onnx int8 9.12 MB vs torch rel = 6.054e-04
+OK

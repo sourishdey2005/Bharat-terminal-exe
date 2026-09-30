@@ -1,0 +1,14 @@
+dataset: 1509 windows from 7 symbols, lookback=32 horizon=5
+train 1207 windows, validation 302 windows
+random-walk baseline validation RMSE: 1.0863
+training DLinear
+  dlinear epoch    0  val RMSE 1.0863  (random walk 1.0863, does NOT count as a result)
+  dlinear epoch   50  val RMSE 1.0948  MAE 0.7687
+  dlinear epoch  100  val RMSE 1.1033  MAE 0.7761
+  dlinear epoch  150  val RMSE 1.0990  MAE 0.7669
+  dlinear epoch  200  val RMSE 1.0991  MAE 0.7659
+  dlinear epoch  250  val RMSE 1.0995  MAE 0.7680
+  dlinear epoch  300  val RMSE 1.1001  MAE 0.7678
+  dlinear epoch  350  val RMSE 1.0996  MAE 0.7688
+  dlinear epoch  400  val RMSE 1.0997  MAE 0.7687
+dlinear: val RMSE 1.0948 (random walk 1.0863, -0.8%), MAE 0.7687, best epoch 50, 3.1s, 330 params
