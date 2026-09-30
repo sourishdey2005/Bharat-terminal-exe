@@ -17,6 +17,7 @@ pub mod forecast;
 pub mod indicators;
 pub mod models;
 pub mod ort_runtime;
+pub mod quant_analytics;
 pub mod risk;
 pub mod signal;
 
@@ -34,7 +35,14 @@ pub use indicators::{
     adx, atr, bollinger, cci, cmf, donchian, ema, heikin_ashi, keltner, macd, obv, parabolic_sar,
     renko, roc, rsi, sma, stochastic, vwap, williams_r,
 };
-pub use models::{BharatModelEngine, ForecastOutput, Model, ModelError, SlidingBuffer};
+pub use models::{
+    BharatModelEngine, ForecastOutput, Model, ModelError, QuantileConeOutput, QuantileForecaster,
+    SlidingBuffer,
+};
+pub use quant_analytics::{
+    FftCycleOutput, QuantAnalyticsEngine, QuantError, Regime, RegimeOutput, FFT_MAX_BARS,
+    FFT_MIN_BARS, REGIME_MIN_BARS, REGIME_STATES,
+};
 pub use risk::{
     alpha, beta, calmar, correlation, correlation_matrix, covariance_matrix, cvar, drawdown_series,
     efficient_frontier, information_ratio, kurtosis, max_drawdown, rolling_correlation,

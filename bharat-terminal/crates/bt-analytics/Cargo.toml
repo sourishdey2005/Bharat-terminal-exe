@@ -15,6 +15,7 @@ tracing = { workspace = true }
 serde_json = { workspace = true }
 ort = { workspace = true }
 oxidiviner = { workspace = true }
+rustfft = { workspace = true }
 sysinfo = { workspace = true }
 
 [dev-dependencies]

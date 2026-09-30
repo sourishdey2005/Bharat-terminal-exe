@@ -34,8 +34,8 @@ pub struct Surface {
     pub x_label: String,
     /// Column axis label, e.g. "price level".
     pub y_label: String,
-    /// Colour ramp endpoints; values are mapped across this range.
-    pub ramp: (Color32, Color32),
+    /// Colour ramp; values are mapped across this range.
+    pub ramp: Ramp,
 }
 
 impl Surface {
@@ -101,12 +101,7 @@ impl Surface {
 
     /// Colour for a normalized position in `[0, 1]`.
     pub fn color_at(&self, t: f64) -> Color32 {
-        let t = t.clamp(0.0, 1.0) as f32;
-        Color32::from_rgb(
-            lerp(self.ramp.0.r(), self.ramp.1.r(), t),
-            lerp(self.ramp.0.g(), self.ramp.1.g(), t),
-            lerp(self.ramp.0.b(), self.ramp.1.b(), t),
-        )
+        self.ramp.at(t as f32)
     }
 }
 
@@ -120,7 +115,7 @@ pub struct SurfaceSpec {
     pub values: Vec<f64>,
     pub x_label: String,
     pub y_label: String,
-    pub ramp: (Color32, Color32),
+    pub ramp: Ramp,
 }
 
 impl SurfaceSpec {
@@ -129,7 +124,7 @@ impl SurfaceSpec {
         title: impl Into<String>,
         subtitle: impl Into<String>,
         grid: Grid,
-        ramp: (Color32, Color32),
+        ramp: Ramp,
     ) -> Self {
         Self {
             title: title.into(),
@@ -172,20 +167,136 @@ fn lerp(a: u8, b: u8, t: f32) -> u8 {
         .clamp(0.0, 255.0) as u8
 }
 
+/// Multi-stop colour ramp.
+///
+/// A two-colour lerp can only ever produce one straight line through RGB, which
+/// is why the earlier surfaces looked washed out next to a plasma-coloured
+/// reference: real colormaps bend through three or more hues so the eye can
+/// read height even where the gradient is shallow. A [`Ramp`] stores a small
+/// fixed palette and interpolates between adjacent stops, so it stays `Copy` and
+/// costs no allocation per cell.
+///
+/// At most [`Ramp::MAX_STOPS`] stops; a shorter ramp simply leaves the tail
+/// unused, which is how [`Ramp::pair`] is expressed without a heap.
+#[derive(Debug, Clone, Copy)]
+pub struct Ramp {
+    stops: [Color32; Ramp::MAX_STOPS],
+    len: u8,
+}
+
+impl Ramp {
+    /// Stops a ramp can hold. Five is enough to read as a colormap and small
+    /// enough that interpolation stays cheap in the per-cell hot loop.
+    pub const MAX_STOPS: usize = 5;
+
+    /// A ramp through `stops`, low value first. Truncates to [`Self::MAX_STOPS`].
+    ///
+    /// Not `const`: the palette constants use [`Self::five`] instead, because a
+    /// slice cannot be built in a const context.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn stops(stops: &[Color32]) -> Self {
+        let mut r = Self {
+            stops: [Color32::BLACK; Self::MAX_STOPS],
+            len: stops.len().clamp(2, Self::MAX_STOPS) as u8,
+        };
+        for (slot, c) in r.stops.iter_mut().zip(stops) {
+            *slot = *c;
+        }
+        r
+    }
+
+    /// A five-stop ramp, in `const`-friendly form.
+    pub const fn five(a: Color32, b: Color32, c: Color32, d: Color32, e: Color32) -> Self {
+        Self {
+            stops: [a, b, c, d, e],
+            len: 5,
+        }
+    }
+
+    /// Colour at a normalized position in `[0, 1]`.
+    ///
+    /// Piecewise-linear between stops. A single stop cannot be represented, so
+    /// the minimum is two; `stops()` enforces that.
+    pub fn at(&self, t: f32) -> Color32 {
+        let t = t.clamp(0.0, 1.0);
+        let last = (self.len.max(2) - 1) as usize;
+        let scaled = t * last as f32;
+        let i = (scaled.floor() as usize).min(last - 1);
+        let local = scaled - i as f32;
+        let a = self.stops[i];
+        let b = self.stops[i + 1];
+        Color32::from_rgb(
+            lerp(a.r(), b.r(), local),
+            lerp(a.g(), b.g(), local),
+            lerp(a.b(), b.b(), local),
+        )
+    }
+}
+
 /// Heat ramp: cold to hot.
-pub const RAMP_FIRE: (Color32, Color32) = (
-    Color32::from_rgb(0x18, 0x2A, 0x4A),
+pub const RAMP_FIRE: Ramp = Ramp::five(
+    Color32::from_rgb(0x10, 0x18, 0x36),
+    Color32::from_rgb(0x3B, 0x2C, 0x8C),
+    Color32::from_rgb(0xC0, 0x39, 0x7A),
     Color32::from_rgb(0xFF, 0x6B, 0x35),
+    Color32::from_rgb(0xFF, 0xE1, 0x8A),
 );
 /// Cool ramp for risk/volatility surfaces.
-pub const RAMP_ICE: (Color32, Color32) = (
-    Color32::from_rgb(0x0B, 0x2A, 0x3A),
-    Color32::from_rgb(0x00, 0xE5, 0xFF),
+pub const RAMP_ICE: Ramp = Ramp::five(
+    Color32::from_rgb(0x06, 0x14, 0x2E),
+    Color32::from_rgb(0x11, 0x4E, 0x8C),
+    Color32::from_rgb(0x25, 0xA8, 0xD8),
+    Color32::from_rgb(0x5C, 0xF0, 0xE8),
+    Color32::from_rgb(0xE8, 0xFF, 0xFF),
 );
-/// Green-to-red ramp for return-signed surfaces.
-pub const RAMP_SIGNED: (Color32, Color32) = (
-    Color32::from_rgb(0xD9, 0x3A, 0x3A),
-    Color32::from_rgb(0x1E, 0xC9, 0x6B),
+/// Red-to-green ramp for return-signed surfaces.
+pub const RAMP_SIGNED: Ramp = Ramp::five(
+    Color32::from_rgb(0x8C, 0x14, 0x2E),
+    Color32::from_rgb(0xE0, 0x3A, 0x4A),
+    Color32::from_rgb(0x8A, 0x8F, 0x99),
+    Color32::from_rgb(0x2F, 0xC7, 0x6B),
+    Color32::from_rgb(0x9B, 0xF5, 0xB0),
+);
+/// Plasma-like ramp: the deep indigo to magenta to amber progression that makes
+/// a height field read as a lit volume rather than a flat sheet.
+pub const RAMP_PLASMA: Ramp = Ramp::five(
+    Color32::from_rgb(0x14, 0x0A, 0x35),
+    Color32::from_rgb(0x6A, 0x1B, 0x8F),
+    Color32::from_rgb(0xC9, 0x2E, 0x8C),
+    Color32::from_rgb(0xF7, 0x73, 0x4B),
+    Color32::from_rgb(0xFD, 0xE8, 0x6A),
+);
+/// Aurora: teal through green to pale gold.
+pub const RAMP_AURORA: Ramp = Ramp::five(
+    Color32::from_rgb(0x04, 0x1F, 0x2E),
+    Color32::from_rgb(0x0E, 0x7C, 0x86),
+    Color32::from_rgb(0x2A, 0xC9, 0x7A),
+    Color32::from_rgb(0xC8, 0xE0, 0x5A),
+    Color32::from_rgb(0xFF, 0xF4, 0xC2),
+);
+/// Inferno: black through purple and red to yellow.
+pub const RAMP_INFERNO: Ramp = Ramp::five(
+    Color32::from_rgb(0x00, 0x00, 0x0C),
+    Color32::from_rgb(0x4A, 0x0C, 0x6B),
+    Color32::from_rgb(0xA3, 0x1C, 0x55),
+    Color32::from_rgb(0xE8, 0x51, 0x1B),
+    Color32::from_rgb(0xFB, 0xD7, 0x3C),
+);
+/// Violet to hot pink, for order-flow and skew surfaces.
+pub const RAMP_NEON: Ramp = Ramp::five(
+    Color32::from_rgb(0x1A, 0x08, 0x33),
+    Color32::from_rgb(0x5B, 0x21, 0xA6),
+    Color32::from_rgb(0xA8, 0x3A, 0xE0),
+    Color32::from_rgb(0xE8, 0x59, 0xB0),
+    Color32::from_rgb(0xFF, 0xB0, 0xD8),
+);
+/// Gunmetal to bright cyan, for eigen/PCA structure.
+pub const RAMP_STEEL: Ramp = Ramp::five(
+    Color32::from_rgb(0x0A, 0x0E, 0x14),
+    Color32::from_rgb(0x1E, 0x3A, 0x52),
+    Color32::from_rgb(0x2F, 0x7A, 0x99),
+    Color32::from_rgb(0x3F, 0xC9, 0xD8),
+    Color32::from_rgb(0xC8, 0xFF, 0xFF),
 );
 
 /// Isometric projection from a unit cube to screen space.
@@ -721,7 +832,7 @@ pub fn price_surface(series: &OhlcvSeries) -> Surface {
         format!("3D Price Surface \u{2014} {}", series.symbol),
         "Close over time (low-to-high ridge)",
         Grid::new(cols, levels, values, "time", "price range"),
-        RAMP_ICE,
+        RAMP_PLASMA,
     ))
 }
 
@@ -838,7 +949,7 @@ pub fn risk_landscape(series: &OhlcvSeries) -> Surface {
             "window (bars)",
             "window (bars)",
         ),
-        RAMP_SIGNED,
+        RAMP_INFERNO,
     ))
 }
 
@@ -896,7 +1007,7 @@ pub fn beta_surface(series: &OhlcvSeries) -> Surface {
             "horizon (bars)",
             "window (bars)",
         ),
-        RAMP_ICE,
+        RAMP_STEEL,
     ))
 }
 
@@ -956,7 +1067,7 @@ pub fn entropy_surface(series: &OhlcvSeries) -> Surface {
             "tolerance (fraction of std)",
             "embedding dim",
         ),
-        RAMP_FIRE,
+        RAMP_ICE,
     ))
 }
 
@@ -1078,7 +1189,7 @@ pub fn signal_surface(series: &OhlcvSeries) -> Surface {
         format!("Signal Surface \u{2014} {}", series.symbol),
         "Trend conviction by fast x slow window",
         Grid::new(slow.len(), fast.len(), values, "slow (bars)", "fast (bars)"),
-        RAMP_ICE,
+        RAMP_AURORA,
     ))
 }
 
@@ -1201,7 +1312,7 @@ pub fn order_flow_surface(series: &OhlcvSeries) -> Surface {
             format!("Order Flow 3D \u{2014} {}", series.symbol),
             "Volume pressure by time x price",
             Grid::new(cols, rows, values, "price", "time"),
-            RAMP_FIRE,
+            RAMP_PLASMA,
         ));
     }
     let (lo, hi) = price_bounds(series);
@@ -1221,7 +1332,7 @@ pub fn order_flow_surface(series: &OhlcvSeries) -> Surface {
         format!("Order Flow 3D \u{2014} {}", series.symbol),
         "Volume pressure by time x price",
         Grid::new(cols, rows, values, "price bucket", "time"),
-        RAMP_FIRE,
+        RAMP_PLASMA,
     ))
 }
 
@@ -1237,6 +1348,37 @@ fn price_bounds(series: &OhlcvSeries) -> (f64, f64) {
     } else {
         (0.0, 1.0)
     }
+}
+
+/// Return percentage over a grid of (time bucket x trailing window).
+///
+/// Lived inline in the app before; moved here so it can take part in the
+/// gallery like every other surface. Reading it top-down shows whether early and
+/// late windows agree, which is what makes a regime read.
+pub fn regime_timeline_surface(series: &OhlcvSeries) -> Surface {
+    let closes = closes(series);
+    let buckets = 40.min(closes.len()).max(2);
+    let windows = [5usize, 10, 20, 40];
+    let mut values = vec![f64::NAN; buckets * windows.len()];
+    for bi in 0..buckets {
+        let end = ((bi + 1) * closes.len()) / buckets;
+        for (wi, &w) in windows.iter().enumerate() {
+            if end <= w {
+                continue;
+            }
+            let base = closes[end - w - 1];
+            let now = closes[end - 1];
+            if base > 0.0 {
+                values[bi * windows.len() + wi] = (now / base - 1.0) * 100.0;
+            }
+        }
+    }
+    Surface::new(SurfaceSpec::new(
+        format!("Regime Timeline \u{2014} {}", series.symbol),
+        "Return % by time bucket x window",
+        Grid::new(buckets, windows.len(), values, "time bucket", "window"),
+        RAMP_SIGNED,
+    ))
 }
 
 /// Skew/kurtosis surface over a grid of windows.
@@ -1278,7 +1420,7 @@ pub fn skew_kurt_surface(series: &OhlcvSeries) -> Surface {
         format!("Skew-Kurt Surface \u{2014} {}", series.symbol),
         "Skew and excess kurtosis by window",
         Grid::new(cols, windows.len(), values, "statistic", "window"),
-        RAMP_SIGNED,
+        RAMP_NEON,
     ))
 }
 
@@ -1309,7 +1451,7 @@ pub fn signal_evolution_surface(series: &OhlcvSeries) -> Surface {
         format!("Signal Evolution \u{2014} {}", series.symbol),
         "Past return % by window x bars ago",
         Grid::new(offsets.len(), windows.len(), values, "bars ago", "window"),
-        RAMP_SIGNED,
+        RAMP_AURORA,
     ))
 }
 
@@ -1344,7 +1486,7 @@ pub fn equity_surface(series: &OhlcvSeries) -> Surface {
             "hold (bars)",
             "window (bars)",
         ),
-        RAMP_SIGNED,
+        RAMP_FIRE,
     ))
 }
 
@@ -1377,7 +1519,7 @@ pub fn var_band_surface(series: &OhlcvSeries) -> Surface {
             "confidence",
             "window (bars)",
         ),
-        RAMP_FIRE,
+        RAMP_INFERNO,
     ))
 }
 
@@ -1433,7 +1575,7 @@ pub fn eigenvalue_surface(series: &OhlcvSeries) -> Surface {
             "factors (dim)",
             "window (bars)",
         ),
-        RAMP_ICE,
+        RAMP_STEEL,
     ))
 }
 
@@ -1527,7 +1669,7 @@ pub fn returns_heatmap(series: &OhlcvSeries) -> Surface {
             "period (bars)",
             "time bucket",
         ),
-        RAMP_SIGNED,
+        RAMP_INFERNO,
     ))
 }
 
@@ -1546,7 +1688,7 @@ pub fn pca_surface(series: &OhlcvSeries) -> Surface {
         format!("PCA Projection \u{2014} {}", series.symbol),
         "Variance explained by leading factors",
         Grid::new(windows.len(), windows.len(), values, "window B", "window A"),
-        RAMP_ICE,
+        RAMP_PLASMA,
     ))
 }
 
@@ -1612,6 +1754,165 @@ fn pca_explained(closes: &[f64], window: usize, dim: usize) -> f64 {
     (total / trace).clamp(0.0, 1.0) * 100.0
 }
 
+// ---------------------------------------------------------------------------
+// Gallery: the 20 surfaces as five pages of four
+// ---------------------------------------------------------------------------
+
+/// Visualisations per gallery page.
+pub const GALLERY_PER_PAGE: usize = 4;
+
+/// Total surfaces in the gallery. Changing this without adding builders is a
+/// compile error via the array length, which is the point.
+pub const GALLERY_TOTAL: usize = 20;
+
+/// Pages needed to show every surface.
+pub const GALLERY_PAGES: usize = GALLERY_TOTAL / GALLERY_PER_PAGE;
+
+/// Height of a gallery panel's own title band, in the same units as the panel.
+pub const GALLERY_TITLE_H: f32 = 20.0;
+
+/// Every surface builder, in fixed page order.
+///
+/// The order is chosen so that no two surfaces sharing a row use the same colour
+/// ramp: a gallery where all four panels are the same hue reads as one blur.
+pub const GALLERY_BUILDERS: [fn(&OhlcvSeries) -> Surface; GALLERY_TOTAL] = [
+    price_surface,
+    volatility_surface,
+    return_surface,
+    risk_landscape,
+    beta_surface,
+    entropy_surface,
+    alpha_surface,
+    signal_surface,
+    regime_surface,
+    regime_timeline_surface,
+    momentum_surface,
+    order_flow_surface,
+    skew_kurt_surface,
+    signal_evolution_surface,
+    equity_surface,
+    var_band_surface,
+    risk_return_surface,
+    eigenvalue_surface,
+    returns_heatmap,
+    pca_surface,
+];
+
+/// The four builders shown on `page` (0-based).
+///
+/// Out-of-range pages clamp to the last page rather than panicking, because the
+/// page index is user state that can outlive a change to [`GALLERY_TOTAL`].
+pub fn gallery_page(page: usize) -> &'static [fn(&OhlcvSeries) -> Surface] {
+    let idx = page.min(GALLERY_PAGES.saturating_sub(1)) * GALLERY_PER_PAGE;
+    &GALLERY_BUILDERS[idx..idx + GALLERY_PER_PAGE]
+}
+
+/// Short label for each gallery slot, matching [`GALLERY_BUILDERS`].
+pub const GALLERY_LABELS: [&str; GALLERY_TOTAL] = [
+    "Price Surface",
+    "Volatility",
+    "Return Surface",
+    "Risk Landscape",
+    "Beta Surface",
+    "Entropy Surface",
+    "Alpha Surface",
+    "Signal Surface",
+    "Regime Cluster",
+    "Regime Timeline",
+    "Momentum Surface",
+    "Order Flow",
+    "Skew-Kurt",
+    "Signal Evolution",
+    "Equity Surface",
+    "VaR Band",
+    "Risk-Return Cloud",
+    "Eigenvalue Cloud",
+    "Returns Heatmap",
+    "PCA Projection",
+];
+
+/// The four cell rects for a gallery page, laid out 2x2.
+///
+/// Splitting the canvas in half on each axis is the whole layout: equal cells
+/// are what "equally sized sections" means, and the caller hard-clips each one
+/// so a surface can never grow into its neighbour.
+pub fn gallery_cells(area: Rect, gap: f32) -> [Rect; GALLERY_PER_PAGE] {
+    let cell_w = ((area.width() - gap) / 2.0).max(1.0);
+    let cell_h = ((area.height() - gap) / 2.0).max(1.0);
+    let at = |col: usize, row: usize| {
+        Rect::from_min_size(
+            pos2(
+                area.min.x + col as f32 * (cell_w + gap),
+                area.min.y + row as f32 * (cell_h + gap),
+            ),
+            egui::vec2(cell_w, cell_h),
+        )
+    };
+    [at(0, 0), at(1, 0), at(0, 1), at(1, 1)]
+}
+
+/// Draw one gallery panel into `cell`: a title band plus the surface.
+///
+/// Deliberately leaner than [`draw_frame`] — no subtitle row, no reset button, no
+/// legend strip. Four of these share the canvas, and every row of chrome is
+/// height taken away from all four plots.
+pub fn draw_gallery_panel(ui: &mut Ui, surface: &Surface, cell: Rect) {
+    ui.painter()
+        .rect_stroke(cell, 2.0, Stroke::new(1.0_f32, Color32::from_gray(55)));
+    ui.painter().text(
+        pos2(cell.min.x + 8.0, cell.min.y + 3.0),
+        egui::Align2::LEFT_TOP,
+        &surface.title,
+        egui::FontId::proportional(12.0),
+        Color32::from_gray(185),
+    );
+
+    let plot = Rect::from_min_max(
+        pos2(cell.min.x, cell.min.y + GALLERY_TITLE_H),
+        pos2(cell.max.x, cell.max.y),
+    );
+    if plot.height() < 40.0 || plot.width() < 40.0 {
+        return;
+    }
+
+    let (yaw, pitch) = camera_for(&surface.title);
+    let rect = ui
+        .allocate_ui_at_rect(plot, |plot_ui| render_surface(plot_ui, surface, yaw, pitch))
+        .inner;
+    apply_camera_drag(ui, surface, rect);
+}
+
+/// Per-surface viewpoint, defaulting to isometric.
+fn camera_for(title: &str) -> (f32, f32) {
+    with_cameras(|c| {
+        c.get(title)
+            .copied()
+            .unwrap_or((Projector::DEFAULT_YAW, Projector::DEFAULT_PITCH))
+    })
+}
+
+/// Apply this frame's drag to the surface's stored viewpoint.
+fn apply_camera_drag(ui: &mut Ui, surface: &Surface, rect: Rect) {
+    let id = ui.make_persistent_id(("surface_cam", &surface.title));
+    let response = ui.interact(rect, id, Sense::click_and_drag());
+    if response.double_clicked() {
+        with_cameras(|c| {
+            c.remove(&surface.title);
+        });
+    } else if response.dragged() {
+        let delta = response.drag_delta();
+        with_cameras(|cams| {
+            let (yaw, pitch) = cams
+                .entry(surface.title.clone())
+                .or_insert((Projector::DEFAULT_YAW, Projector::DEFAULT_PITCH));
+            // Yaw wraps; pitch is clamped so the model never flips upside down
+            // or collapses edge-on into a line.
+            *yaw = (*yaw + delta.x * 0.01) % std::f32::consts::TAU;
+            *pitch = (*pitch - delta.y * 0.01).clamp(0.15_f32, 1.4_f32);
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1628,7 +1929,7 @@ mod tests {
                 "bad",
                 "",
                 Grid::new(3, 3, vec![1.0, 2.0], "x", "y"),
-                RAMP_FIRE,
+                RAMP_AURORA,
             ))
         });
         assert!(
@@ -1740,13 +2041,135 @@ mod tests {
             "t",
             "",
             Grid::new(2, 1, vec![0.0, 1.0], "x", "y"),
-            RAMP_FIRE,
+            RAMP_STEEL,
         ));
-        assert_eq!(s.color_at(0.0), RAMP_FIRE.0);
-        assert_eq!(s.color_at(1.0), RAMP_FIRE.1);
+        // A ramp's endpoints are its first and last stops.
+        assert_eq!(s.color_at(0.0), RAMP_STEEL.at(0.0));
+        assert_eq!(s.color_at(1.0), RAMP_STEEL.at(1.0));
         // Out-of-range clamps rather than wrapping.
-        assert_eq!(s.color_at(-5.0), RAMP_FIRE.0);
-        assert_eq!(s.color_at(5.0), RAMP_FIRE.1);
+        assert_eq!(s.color_at(-5.0), RAMP_STEEL.at(0.0));
+        assert_eq!(s.color_at(5.0), RAMP_STEEL.at(1.0));
+    }
+
+    /// A multi-stop ramp must actually bend. The old two-colour lerp could only
+    /// trace one straight line through RGB, which is what made the surfaces look
+    /// washed out; asserting a mid-stop is interpolated from *neither* endpoint
+    /// locks that in.
+    #[test]
+    fn test_ramp_interpolates_between_stops() {
+        let ramp = Ramp::five(
+            Color32::from_rgb(0, 0, 0),
+            Color32::from_rgb(0, 0, 255),
+            Color32::from_rgb(0, 255, 0),
+            Color32::from_rgb(255, 0, 0),
+            Color32::from_rgb(255, 255, 255),
+        );
+        // Five stops divide [0, 1] into quarters, so t = 0.5 is the middle stop.
+        assert_eq!(ramp.at(0.5), Color32::from_rgb(0, 255, 0));
+        assert_eq!(ramp.at(0.25), Color32::from_rgb(0, 0, 255));
+        // Halfway *between* the first two stops must be a blend of them, not
+        // either one on its own — that interpolation is what a two-stop lerp
+        // could never do across three hues.
+        assert_eq!(ramp.at(0.125), Color32::from_rgb(0, 0, 128));
+        // A two-stop ramp is still linear, for a surface that wants it.
+        let pair = Ramp::stops(&[Color32::from_rgb(0, 0, 0), Color32::from_rgb(10, 20, 30)]);
+        assert_eq!(pair.at(0.5), Color32::from_rgb(5, 10, 15));
+    }
+
+    /// The gallery must divide into exactly five pages of four, with no surface
+    /// left out and none listed twice.
+    #[test]
+    fn test_gallery_is_five_pages_of_four() {
+        assert_eq!(GALLERY_TOTAL, 20);
+        assert_eq!(GALLERY_PER_PAGE, 4);
+        assert_eq!(GALLERY_PAGES, 5);
+        assert_eq!(GALLERY_BUILDERS.len(), GALLERY_TOTAL);
+        assert_eq!(GALLERY_LABELS.len(), GALLERY_TOTAL);
+
+        let mut seen: Vec<usize> = Vec::new();
+        for page in 0..GALLERY_PAGES {
+            let builders = gallery_page(page);
+            assert_eq!(builders.len(), GALLERY_PER_PAGE, "page {page}");
+        }
+        for (i, b) in GALLERY_BUILDERS.iter().enumerate() {
+            let ptr = *b as usize;
+            assert!(!seen.contains(&ptr), "builder {i} appears twice");
+            seen.push(ptr);
+        }
+        // Out-of-range pages clamp instead of panicking.
+        assert_eq!(gallery_page(99).len(), GALLERY_PER_PAGE);
+    }
+
+    /// Every gallery builder must produce a drawable surface from a normal
+    /// series, or a page would show an empty panel.
+    #[test]
+    fn test_every_gallery_builder_is_drawable() {
+        // Built here rather than pulled from bt_core so this module's tests stay
+        // self-contained.
+        let mut candles = Vec::with_capacity(200);
+        for i in 0..200 {
+            let base = 100.0 + i as f64 * 0.1;
+            let wick = 0.5 + (i % 7) as f64 * 0.1;
+            candles.push(bt_core::Candle::new(
+                1_000_000.0 + i as f64 * 86_400.0,
+                base,
+                base + wick,
+                base - wick,
+                base + 0.2,
+                10_000.0 + (i % 11) as f64 * 500.0,
+            ));
+        }
+        let s = bt_core::OhlcvSeries {
+            symbol: "GAL".into(),
+            candles,
+        };
+        for (i, build) in GALLERY_BUILDERS.iter().enumerate() {
+            let surface = build(&s);
+            assert!(
+                surface.is_drawable(),
+                "gallery slot {i} ({}) is not drawable",
+                GALLERY_LABELS[i]
+            );
+            assert_eq!(
+                surface.values.len(),
+                surface.cols * surface.rows,
+                "gallery slot {} ({}) has a mismatched grid",
+                i,
+                GALLERY_LABELS[i]
+            );
+        }
+    }
+
+    /// Gallery cells must be equal and non-overlapping, which is the whole point
+    /// of the layout.
+    #[test]
+    fn test_gallery_cells_are_equal_and_disjoint() {
+        let area = Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(1900.0, 900.0));
+        let cells = gallery_cells(area, 10.0);
+        for (i, c) in cells.iter().enumerate() {
+            assert_eq!(c.width(), cells[0].width(), "cell {i} width differs");
+            assert_eq!(c.height(), cells[0].height(), "cell {i} height differs");
+            assert!(
+                c.width() > 100.0 && c.height() > 100.0,
+                "cell {i} too small"
+            );
+        }
+        for (i, c) in cells.iter().enumerate() {
+            for (j, other) in cells.iter().enumerate().skip(i + 1) {
+                assert!(
+                    !c.intersects(*other),
+                    "cells {i} and {j} overlap: {c:?} vs {other:?}"
+                );
+            }
+        }
+        // Together they cover the canvas minus the gaps.
+        let covered: f32 = cells.iter().map(|c| c.width() * c.height()).sum();
+        let total = area.width() * area.height();
+        assert!(
+            covered / total > 0.97,
+            "cells cover only {:.0}%",
+            covered / total * 100.0
+        );
     }
 
     // ------------------------------------------------------------------

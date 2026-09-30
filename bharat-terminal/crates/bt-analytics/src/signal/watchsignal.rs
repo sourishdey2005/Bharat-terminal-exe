@@ -68,6 +68,14 @@ pub struct SignalOutput {
     pub signal: Signal,
     /// Winning-class confidence in [0, 1].
     pub confidence: f32,
+    /// Calibrated per-class probabilities, in the model's own `[Sell, Hold, Buy]`
+    /// order — **not** `[Buy, Hold, Sell]`. `confidence` is always
+    /// `probabilities[signal as usize]`.
+    ///
+    /// Kept because a badge that only shows the winner cannot distinguish "51%
+    /// sure to buy" from "95% sure to buy", which is the difference between a
+    /// trade and no trade.
+    pub probabilities: [f32; 3],
 }
 
 impl SignalOutput {
@@ -176,6 +184,7 @@ impl WatchSignalModel {
         Ok(SignalOutput {
             confidence: probs[signal as usize],
             signal,
+            probabilities: probs,
         })
     }
 
@@ -650,9 +659,28 @@ mod tests {
             let out = SignalOutput {
                 signal,
                 confidence: 0.8,
+                probabilities: [0.1, 0.1, 0.8],
             };
             assert_eq!(out.headline(), signal);
         }
+    }
+
+    /// `confidence` must be the winning class's probability, not an
+    /// independently-computed number. The badge shows both, and if they could
+    /// disagree the chart would tell the user two different stories.
+    #[test]
+    fn test_confidence_matches_the_winning_probability() {
+        let probs = [0.15, 0.55, 0.30];
+        let signal = Signal::Sell; // index 0, per the model's own class order
+        let out = SignalOutput {
+            signal,
+            confidence: probs[signal as usize],
+            probabilities: probs,
+        };
+        assert_eq!(out.confidence, out.probabilities[out.signal as usize]);
+        // Sum to one, so the three bars in the UI read as a distribution.
+        let sum: f32 = out.probabilities.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5, "probabilities sum to {sum}");
     }
 
     #[test]

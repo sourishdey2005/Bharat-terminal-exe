@@ -23,6 +23,7 @@
 //! ```
 
 pub mod engine;
+pub mod quantile_engine;
 pub mod sliding_window;
 
 pub use engine::{
@@ -30,4 +31,5 @@ pub use engine::{
     CHRONOS_QUANTILES, DLINEAR_HORIZON, DLINEAR_LOOKBACK, FILE_CHRONOS, FILE_CHRONOS_FP32,
     FILE_DLINEAR, FILE_NHITS, MAX_CACHED_SESSIONS, NHITS_HORIZON, NHITS_LOOKBACK, SIGNAL_WINDOW,
 };
+pub use quantile_engine::{QuantileConeOutput, QuantileForecaster};
 pub use sliding_window::SlidingBuffer;

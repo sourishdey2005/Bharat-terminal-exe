@@ -321,6 +321,32 @@ impl Forecaster {
         self.predict_with_engine(history, horizon).map(|(v, _)| v)
     }
 
+    /// The p10/p50/p90 corridor for the best available *quantile* engine.
+    ///
+    /// The point-forecast chain deliberately returns bare `Vec<f64>`, which
+    /// throws away the bands Chronos computes. This is the one path that keeps
+    /// them, so a fan chart can be drawn from the same engine the point line
+    /// came from rather than from a second, possibly different, inference.
+    ///
+    /// Returns `None` when the winning engine emits no quantiles (ARIMA, the
+    /// moving average, NanoForecast) or when Chronos is not installed. Callers
+    /// must treat `None` as "no band available" and not as zero width.
+    pub fn predict_quantile_cone(
+        &self,
+        history: &[f64],
+        horizon: usize,
+    ) -> Option<crate::models::QuantileConeOutput> {
+        if horizon == 0 || history.len() < crate::models::CHRONOS_CONTEXT {
+            return None;
+        }
+        let out = self
+            .local
+            .predict_chronos(history)
+            .map_err(|e| tracing::debug!("cone: chronos unavailable ({e})"))
+            .ok()?;
+        crate::models::QuantileConeOutput::from_forecast(&out, horizon)
+    }
+
     pub fn has_granite(&self) -> bool {
         self.granite.is_some()
     }

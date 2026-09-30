@@ -15,13 +15,16 @@ use std::time::{Duration, Instant};
 
 use chrono::{Duration as ChronoDuration, Utc};
 use eframe::egui;
-use egui::{Color32, Id, RichText, Stroke, Vec2};
+use egui::{pos2, Color32, Id, RichText, Sense, Stroke, Vec2};
 use egui_plot::{Bar, BarChart, Legend, Line, MarkerShape, Plot, PlotPoints, Points};
 use serde::{Deserialize, Serialize};
 
 use bt_analytics::Engine as ForecastEngine;
 use bt_analytics::Forecaster;
-use bt_analytics::{Signal, SignalOutput, WatchSignalModel};
+use bt_analytics::{
+    FftCycleOutput, QuantAnalyticsEngine, QuantileConeOutput, Regime, RegimeOutput, Signal,
+    SignalOutput, WatchSignalModel,
+};
 use bt_core::{
     synthetic_correlated_returns, synthetic_ohlcv, Candle, OhlcvSeries, APP_NAME, AUTHOR, TAGLINE,
 };
@@ -1474,6 +1477,8 @@ enum Tab {
     EigenvalueCloud,
     ReturnsHeatmap,
     PcaProjection,
+    /// All twenty 3D surfaces as five pages of four equally sized panels.
+    ThreeD_Gallery,
     FourInOne,
 }
 
@@ -1725,6 +1730,7 @@ fn tabs_in_category(cat: TabCategory) -> &'static [(Tab, &'static str)] {
         ],
         TabCategory::Comparison => &[(Tab::MultiCompare, "Multi-Compare")],
         TabCategory::ThreeD => &[
+            (Tab::ThreeD_Gallery, "3D Gallery (5x4)"),
             (Tab::PriceSurface, "3D Price Surface"),
             (Tab::VolatilitySurface, "3D Volatility"),
             (Tab::ReturnSurface, "3D Return Surface"),
@@ -2150,6 +2156,16 @@ struct BharatApp {
     /// the same size — a header the dashboard cannot see is a header it cannot
     /// reserve space for.
     panel_compact: bool,
+    /// Which page of the 3D gallery is showing (0-based, 4 surfaces per page).
+    three_d_page: usize,
+    /// Which forecast paradigm is featured (0 cone, 1 cycle, 2 regime, 3 signal).
+    paradigm_mode: usize,
+    /// p10/p50/p90 corridor from the quantile model, when one ran.
+    paradigm_cone: Option<QuantileConeOutput>,
+    /// FFT cycle projection, when there was enough history.
+    paradigm_cycle: Option<FftCycleOutput>,
+    /// Market regime classification, when there was enough history.
+    paradigm_regime: Option<RegimeOutput>,
     /// Multi-model price forecaster (Granite TTM -> NanoForecast -> ARIMA).
     /// Cheap to hold: engines load lazily and missing model files simply
     /// disable their engine.
@@ -2382,6 +2398,11 @@ impl BharatApp {
             viewport_h: 600.0,
             forced_plot_h: None,
             panel_compact: false,
+            three_d_page: 0,
+            paradigm_mode: 0,
+            paradigm_cone: None,
+            paradigm_cycle: None,
+            paradigm_regime: None,
             forecaster: Some(Forecaster::with_default_paths()),
             watchsignal: Self::load_watchsignal(),
             last_signal: None,
@@ -3121,6 +3142,7 @@ impl BharatApp {
             Tab::EigenvalueCloud => self.draw_eigenvalue_cloud(ui),
             Tab::ReturnsHeatmap => self.draw_returns_heatmap(ui),
             Tab::PcaProjection => self.draw_pca_projection(ui),
+            Tab::ThreeD_Gallery => self.draw_three_d_gallery(ui),
             Tab::FourInOne => self.draw_four_in_one(ui),
         }
     }
@@ -3320,7 +3342,7 @@ impl BharatApp {
     /// Shared by the Forecast tab and the dashboard's dedicated forecast band so
     /// the two can never draw different things from the same cached run.
     /// `min_h` is a floor the caller can impose when it owns a fixed band.
-    fn draw_forecast_chart(&self, ui: &mut egui::Ui, min_h: Option<f32>) {
+    fn draw_forecast_chart(&mut self, ui: &mut egui::Ui, min_h: Option<f32>) {
         if self.forecast_values.is_empty() {
             ui.centered_and_justified(|ui| {
                 ui.label("No forecast yet \u{2014} press Run forecast.");
@@ -3422,6 +3444,416 @@ impl BharatApp {
                 .on_hover_text(format!("Bar {} of {} ahead", i + 1, pred.len()));
             }
         });
+
+        self.draw_paradigms(ui);
+    }
+
+    /// The four visual paradigms, side by side with the point forecast.
+    ///
+    /// Each answers a question the point forecast cannot:
+    ///
+    /// * **Cone** - how wide is the uncertainty, and how does it widen?
+    /// * **Cycle** - is there periodic structure the level forecast is averaging away?
+    /// * **Regime** - what kind of market is this, right now?
+    /// * **Signal** - which direction does the classifier favour, and how sure is it?
+    ///
+    /// Results are cached by [`Self::run_forecast`] and only recomputed when the
+    /// user runs a forecast, so switching paradigms costs nothing.
+    fn draw_paradigms(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.label(RichText::new("Visual paradigms").strong());
+
+        // Which paradigm to feature. All four still report their numbers below,
+        // so this only picks which one gets the large chart.
+        const MODES: [&str; 4] = ["Cone", "Cycle", "Regime", "Signal"];
+        ui.horizontal_wrapped(|ui| {
+            for (i, m) in MODES.iter().enumerate() {
+                if ui.selectable_label(self.paradigm_mode == i, *m).clicked() {
+                    self.paradigm_mode = i;
+                }
+            }
+        });
+
+        let closes: Vec<f64> = self.data.candles.candles.iter().map(|c| c.close).collect();
+        let horizon = self.forecast_horizon;
+
+        // ---- 1. Probabilistic quantile cone --------------------------------
+        match &self.paradigm_cone {
+            Some(cone) => {
+                ui.colored_label(
+                    INFO,
+                    RichText::new(format!(
+                        "Cone: {} steps, p10 {:.2} \u{2192} p50 {:.2} \u{2192} p90 {:.2} (width {:.0} \u{2192} {:.0})",
+                        cone.horizon_steps,
+                        cone.p10_lower.first().copied().unwrap_or(0.0),
+                        cone.p50_median.first().copied().unwrap_or(0.0),
+                        cone.p90_upper.first().copied().unwrap_or(0.0),
+                        cone.widths().first().copied().unwrap_or(0.0),
+                        cone.widths().last().copied().unwrap_or(0.0),
+                    ))
+                    .small(),
+                );
+                if self.paradigm_mode == 0 {
+                    self.draw_cone_chart(ui, cone);
+                }
+            }
+            None => {
+                ui.colored_label(
+                    Color32::GRAY,
+                    RichText::new(
+                        "Cone: needs the Chronos model (64+ bars). Not available for this range.",
+                    )
+                    .small(),
+                );
+            }
+        }
+
+        // ---- 2. Frequency-domain cycle extrapolation -----------------------
+        match &self.paradigm_cycle {
+            Some(fft) => {
+                let periods = fft
+                    .dominant_periods
+                    .iter()
+                    .map(|p| format!("{p}b"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                ui.colored_label(
+                    PURPLE,
+                    RichText::new(format!(
+                        "Cycle: dominant periods [{}], first projection {:.2}",
+                        if periods.is_empty() {
+                            "none".into()
+                        } else {
+                            periods
+                        },
+                        fft.cycle_projection.first().copied().unwrap_or(0.0),
+                    ))
+                    .small(),
+                );
+                if self.paradigm_mode == 1 {
+                    self.draw_cycle_chart(ui, fft);
+                }
+            }
+            None => {
+                ui.colored_label(
+                    Color32::GRAY,
+                    RichText::new("Cycle: needs 32+ bars of history.").small(),
+                );
+            }
+        }
+
+        // ---- 3. Market regime ----------------------------------------------
+        match &self.paradigm_regime {
+            Some(reg) => {
+                let col = match reg.current_regime {
+                    Regime::BullTrend => PROFIT,
+                    Regime::Consolidation => Color32::GRAY,
+                    Regime::BearVolatile => LOSS,
+                };
+                ui.horizontal(|ui| {
+                    ui.colored_label(
+                        col,
+                        RichText::new(format!("Regime: {}", reg.current_regime.label())).strong(),
+                    );
+                    ui.colored_label(
+                        Color32::GRAY,
+                        RichText::new(format!(
+                            "drift {:+.3}%/bar  vol {:.2}%  jump {:.1}x  margin {:.0}%",
+                            reg.trend_drift * 100.0,
+                            reg.volatility_score * 100.0,
+                            reg.vol_ratio,
+                            reg.margin() * 100.0
+                        ))
+                        .small(),
+                    );
+                });
+                if self.paradigm_mode == 2 {
+                    self.draw_regime_chart(ui, reg);
+                }
+            }
+            None => {
+                ui.colored_label(
+                    Color32::GRAY,
+                    RichText::new("Regime: needs 16+ bars of history.").small(),
+                );
+            }
+        }
+
+        // ---- 4. Directional classifier -------------------------------------
+        match &self.last_signal {
+            Some(sig) => {
+                let col = match sig.headline() {
+                    Signal::Buy => PROFIT,
+                    Signal::Hold => Color32::GRAY,
+                    Signal::Sell => LOSS,
+                };
+                ui.horizontal(|ui| {
+                    ui.colored_label(
+                        col,
+                        RichText::new(format!("Signal: {}", sig.headline().label())).strong(),
+                    );
+                    ui.colored_label(
+                        Color32::GRAY,
+                        RichText::new(format!(
+                            "confidence {:.0}%  [S {:.2} H {:.2} B {:.2}]",
+                            sig.confidence * 100.0,
+                            sig.probabilities[0],
+                            sig.probabilities[1],
+                            sig.probabilities[2]
+                        ))
+                        .small(),
+                    );
+                });
+                if self.paradigm_mode == 3 {
+                    self.draw_signal_chart(ui, sig);
+                }
+            }
+            None => {
+                ui.colored_label(
+                    Color32::GRAY,
+                    RichText::new(
+                        "Signal: needs the WatchSignal LSTM model and 30+ bars of history.",
+                    )
+                    .small(),
+                );
+            }
+        }
+    }
+
+    /// The shaded cone: a semi-transparent polygon between p10 and p90, with the
+    /// median drawn boldly through the middle.
+    fn draw_cone_chart(&self, ui: &mut egui::Ui, cone: &QuantileConeOutput) {
+        let basis = &self.forecast_basis;
+        if basis.is_empty() || cone.horizon_steps == 0 {
+            return;
+        }
+        let start_x = basis.len() as f64 - 1.0;
+        let upper: Vec<[f64; 2]> = cone
+            .p90_upper
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| [start_x + 1.0 + i as f64, v])
+            .collect();
+        let lower: Vec<[f64; 2]> = cone
+            .p10_lower
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| [start_x + 1.0 + i as f64, v])
+            .collect();
+        let median: Vec<[f64; 2]> = cone
+            .p50_median
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| [start_x + 1.0 + i as f64, v])
+            .collect();
+        let history: Vec<[f64; 2]> = basis
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| [i as f64, v])
+            .collect();
+
+        Plot::new("paradigm_cone_plot")
+            .height((ui.available_height() - AXIS_H - 8.0).max(140.0))
+            .auto_bounds(egui::emath::Vec2b::new(true, true))
+            .legend(Legend::default())
+            .show(ui, |plot_ui| {
+                plot_ui.line(
+                    Line::new(PlotPoints::from(history))
+                        .name("History")
+                        .color(HISTORY_COLOR)
+                        .width(1.5_f32),
+                );
+                // Fill between the two bands: upper left-to-right, then lower
+                // right-to-left, so the polygon closes on itself. `fill_color`
+                // and `stroke` are the inherent Polygon setters; `color()` lives
+                // on the PlotItem trait and would need importing.
+                let mut ring: Vec<[f64; 2]> = upper.clone();
+                ring.extend(lower.iter().rev().copied());
+                plot_ui.polygon(
+                    egui_plot::Polygon::new(PlotPoints::from(ring))
+                        .name("p10-p90 corridor")
+                        .fill_color(INFO.gamma_multiply(0.16))
+                        .stroke(Stroke::new(1.0_f32, INFO.gamma_multiply(0.55))),
+                );
+                plot_ui.line(
+                    Line::new(PlotPoints::from(median))
+                        .name("p50 median")
+                        .color(INFO)
+                        .width(2.5_f32),
+                );
+            });
+    }
+
+    /// The FFT projection: a distinct colour, oscillating rather than drifting.
+    fn draw_cycle_chart(&self, ui: &mut egui::Ui, fft: &FftCycleOutput) {
+        let basis = &self.forecast_basis;
+        if basis.is_empty() {
+            return;
+        }
+        let start_x = basis.len() as f64 - 1.0;
+        // Anchor on the last close so the projected wave joins the history.
+        let mut pts: Vec<[f64; 2]> = vec![[start_x, basis[basis.len() - 1]]];
+        pts.extend(
+            fft.cycle_projection
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| [start_x + 1.0 + i as f64, v]),
+        );
+        let history: Vec<[f64; 2]> = basis
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| [i as f64, v])
+            .collect();
+
+        Plot::new("paradigm_cycle_plot")
+            .height((ui.available_height() - AXIS_H - 8.0).max(140.0))
+            .auto_bounds(egui::emath::Vec2b::new(true, true))
+            .legend(Legend::default())
+            .show(ui, |plot_ui| {
+                plot_ui.line(
+                    Line::new(PlotPoints::from(history))
+                        .name("History")
+                        .color(HISTORY_COLOR)
+                        .width(1.5_f32),
+                );
+                plot_ui.vline(
+                    egui_plot::VLine::new(start_x + 0.5)
+                        .name("Extrapolation starts")
+                        .color(PURPLE.gamma_multiply(0.8))
+                        .width(1.0_f32),
+                );
+                plot_ui.line(
+                    Line::new(PlotPoints::from(pts))
+                        .name("FFT cycle projection")
+                        .color(PURPLE)
+                        .width(2.5_f32),
+                );
+                if let Some(p) = fft.primary_period() {
+                    plot_ui.vline(
+                        egui_plot::VLine::new(start_x + p as f64)
+                            .name(&format!("1 cycle = {p} bars"))
+                            .color(TEAL.gamma_multiply(0.7))
+                            .width(1.0_f32),
+                    );
+                }
+            });
+    }
+
+    /// Regime over time: each bar coloured by which state the classifier would
+    /// have called, so a regime change is visible rather than inferred.
+    fn draw_regime_chart(&self, ui: &mut egui::Ui, current: &RegimeOutput) {
+        let closes: Vec<f64> = self.data.candles.candles.iter().map(|c| c.close).collect();
+        if closes.len() < 2 {
+            return;
+        }
+        // Re-classify on a rolling window. Cheap (no neural net) and it turns a
+        // single label into a history.
+        let stride = 4.max(closes.len() / 120);
+        let mut bars: Vec<Bar> = Vec::new();
+        let mut pts: Vec<[f64; 2]> = Vec::new();
+        for end in (16..=closes.len()).step_by(stride) {
+            let Ok(reg) = QuantAnalyticsEngine::classify_regime(&closes[..end]) else {
+                continue;
+            };
+            let col = match reg.current_regime {
+                Regime::BullTrend => PROFIT,
+                Regime::Consolidation => Color32::GRAY,
+                Regime::BearVolatile => LOSS,
+            };
+            let t = self.data.candles.candles[end - 1].t;
+            bars.push(
+                Bar::new(t, reg.regime_id() as f64 + 1.0)
+                    .width(DAY_SECS * stride as f64 * 0.8)
+                    .fill(col.gamma_multiply(0.8)),
+            );
+            pts.push([t, closes[end - 1]]);
+        }
+        if bars.is_empty() {
+            return;
+        }
+        let cur_col = match current.current_regime {
+            Regime::BullTrend => PROFIT,
+            Regime::Consolidation => Color32::GRAY,
+            Regime::BearVolatile => LOSS,
+        };
+
+        Plot::new("paradigm_regime_plot")
+            .height((ui.available_height() - AXIS_H - 8.0).max(140.0))
+            .show_axes([false, true])
+            .legend(Legend::default())
+            .show(ui, |plot_ui| {
+                plot_ui
+                    .bar_chart(BarChart::new(bars).name("Regime state (1 chop / 2 bull / 3 bear)"));
+                plot_ui.line(
+                    Line::new(PlotPoints::from(pts))
+                        .name("Close")
+                        .color(HISTORY_COLOR)
+                        .width(1.5_f32),
+                );
+                plot_ui.hline(
+                    egui_plot::HLine::new(current.regime_id() as f64 + 1.0)
+                        .name(&format!("Now: {}", current.current_regime.label()))
+                        .color(cur_col)
+                        .width(2.0_f32),
+                );
+            });
+    }
+
+    /// The classifier as a confidence bar per class.
+    fn draw_signal_chart(&self, ui: &mut egui::Ui, sig: &SignalOutput) {
+        // Model order is [Sell, Hold, Buy]; the bars must follow it.
+        let names = ["Sell", "Hold", "Buy"];
+        let colors = [LOSS, Color32::GRAY, PROFIT];
+        let rect_h = 96.0_f32;
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), rect_h.min(ui.available_height())),
+            Sense::hover(),
+        );
+        let p = ui.painter_at(rect);
+        let bar_w = rect.width() / 3.0;
+        for i in 0..3 {
+            let frac = sig.probabilities[i].clamp(0.0, 1.0) as f32;
+            let x0 = rect.min.x + i as f32 * bar_w + 6.0;
+            let full = (bar_w - 12.0).max(1.0);
+            let track = egui::Rect::from_min_max(
+                pos2(x0, rect.min.y + 26.0),
+                pos2(x0 + full, rect.min.y + 46.0),
+            );
+            p.rect_filled(track, 3.0, Color32::from_gray(45));
+            p.rect_filled(
+                egui::Rect::from_min_max(
+                    track.min,
+                    egui::pos2(track.min.x + full * frac, track.max.y),
+                ),
+                3.0,
+                colors[i],
+            );
+            p.text(
+                egui::pos2(x0, rect.min.y + 4.0),
+                egui::Align2::LEFT_TOP,
+                names[i],
+                egui::FontId::proportional(12.0),
+                colors[i],
+            );
+            p.text(
+                egui::pos2(x0, rect.min.y + 50.0),
+                egui::Align2::LEFT_TOP,
+                format!("{:.2}", sig.probabilities[i]),
+                egui::FontId::proportional(13.0),
+                Color32::from_gray(200),
+            );
+        }
+        p.text(
+            rect.center(),
+            egui::Align2::CENTER_BOTTOM,
+            format!(
+                "LSTM directional confidence \u{2014} {} at {:.0}%",
+                sig.headline().label(),
+                sig.confidence * 100.0
+            ),
+            egui::FontId::proportional(11.0),
+            Color32::GRAY,
+        );
     }
 
     /// Runs the forecaster over the trailing closes and caches the result.
@@ -3486,6 +3918,41 @@ impl BharatApp {
             .watchsignal
             .as_ref()
             .and_then(|m| m.predict_candles(candles).ok());
+
+        // `candles` borrows `self`, so the slice the regimes need is copied out
+        // before the mutable borrow.
+        let mut tail = candles
+            .iter()
+            .rev()
+            .take(closes.len())
+            .cloned()
+            .collect::<Vec<_>>();
+        tail.reverse();
+        self.run_paradigms(&closes, &tail);
+    }
+
+    /// Compute the four non-point paradigms for the current window.
+    ///
+    /// Each is independent: one failing leaves the others intact, because a
+    /// missing model file must never blank the regime badge. Nothing here can
+    /// fail the point forecast, which has already been cached by the time this
+    /// runs.
+    fn run_paradigms(&mut self, closes: &[f64], candles: &[Candle]) {
+        // Cone. Kept only if the bands are properly nested; a crossed corridor
+        // would render as an impossible shape.
+        self.paradigm_cone = self
+            .forecaster
+            .as_ref()
+            .and_then(|f| f.predict_quantile_cone(closes, self.forecast_horizon));
+
+        // Frequency-domain cycle.
+        self.paradigm_cycle =
+            QuantAnalyticsEngine::extrapolate_fft(closes, self.forecast_horizon, 3).ok();
+
+        // Regime, using the range data when it lines up with the closes.
+        self.paradigm_regime = QuantAnalyticsEngine::classify_regime_ranged(closes, Some(candles))
+            .or_else(|_| QuantAnalyticsEngine::classify_regime(closes))
+            .ok();
     }
 
     fn draw_stoch_rsi(&self, ui: &mut egui::Ui) {
@@ -4327,6 +4794,102 @@ impl BharatApp {
         );
     }
 
+    /// The 3D gallery: every surface, four to a page, in equal cells.
+    ///
+    /// The twenty surfaces used to mean twenty separate tabs, so "compare the
+    /// regime view against the skew view" cost nineteen clicks. They now share
+    /// five pages of four, and the page is a single field rather than twenty tab
+    /// entries, so moving through them cannot desynchronise the tab bar.
+    ///
+    /// Cell geometry comes from [`views3d::gallery_cells`], and every cell is
+    /// hard-clipped, so a surface that reports more rows than fit is cropped
+    /// rather than allowed to grow over its neighbour.
+    fn draw_three_d_gallery(&mut self, ui: &mut egui::Ui) {
+        let symbol = self.data.candles.symbol.clone();
+        ui.label(RichText::new(format!("3D Gallery \u{2014} {}", symbol)).strong());
+
+        if self.data.candles.candles.is_empty() {
+            ui.label("No data for this symbol.");
+            return;
+        }
+
+        const GAP: f32 = 10.0;
+        const NAV_H: f32 = 26.0;
+
+        // Page navigation. Clamped, so shrinking the window or a stale index can
+        // never walk off the end of the builder table.
+        let pages = views3d::GALLERY_PAGES;
+        let mut page = self.three_d_page.min(pages - 1);
+        ui.allocate_ui_at_rect(
+            egui::Rect::from_min_size(
+                ui.available_rect_before_wrap().min,
+                egui::vec2(ui.available_width(), NAV_H),
+            ),
+            |ui| {
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(page > 0, egui::Button::new("\u{2190} Prev").small())
+                        .clicked()
+                    {
+                        page -= 1;
+                    }
+                    ui.label(
+                        RichText::new(format!("Page {} of {pages}", page + 1))
+                            .small()
+                            .strong(),
+                    );
+                    if ui
+                        .add_enabled(page + 1 < pages, egui::Button::new("Next \u{2192}").small())
+                        .clicked()
+                    {
+                        page += 1;
+                    }
+                    ui.separator();
+                    // Direct page jumps, so page 5 is one click away.
+                    for p in 0..pages {
+                        let selected = p == page;
+                        if ui.selectable_label(selected, (p + 1).to_string()).clicked() {
+                            page = p;
+                        }
+                    }
+                    ui.separator();
+                    let base = page * views3d::GALLERY_PER_PAGE;
+                    let names: Vec<&str> =
+                        views3d::GALLERY_LABELS[base..base + views3d::GALLERY_PER_PAGE].to_vec();
+                    ui.colored_label(
+                        Color32::GRAY,
+                        RichText::new(format!("this page: {}", names.join("  \u{00B7}  "))).small(),
+                    );
+                    ui.separator();
+                    ui.colored_label(
+                        Color32::GRAY,
+                        RichText::new("drag a panel to rotate \u{00B7} double-click to reset")
+                            .small(),
+                    );
+                });
+            },
+        );
+        self.three_d_page = page;
+
+        let area = ui.available_rect_before_wrap();
+        let cells = views3d::gallery_cells(area, GAP);
+        let builders = views3d::gallery_page(page);
+        for (cell, build) in cells.iter().zip(builders) {
+            let surface = build(&self.data.candles);
+            let cell = *cell;
+            ui.allocate_ui_at_rect(cell, |child| {
+                // Hard clip: `render_surface` sizes itself from
+                // `available_height`, and without this a short series could
+                // paint straight through the panel below.
+                child.set_clip_rect(cell);
+                views3d::draw_gallery_panel(child, &surface, cell);
+            });
+        }
+
+        // Claim the area so the parent layout does not reuse it.
+        ui.allocate_space(egui::vec2(area.width(), area.height()));
+    }
+
     fn draw_price_surface(&self, ui: &mut egui::Ui) {
         views3d::draw_frame(ui, &views3d::price_surface(&self.data.candles));
     }
@@ -4404,43 +4967,9 @@ impl BharatApp {
     }
 
     fn draw_regime_timeline(&self, ui: &mut egui::Ui) {
-        // A 3D ridge over time: each row is a trailing-return window, each
-        // column a bar, and the height is the signed move. Reading the surface
-        // top-down shows whether early and late windows agree, which is what a
-        // regime read is.
-        let s = &self.data.candles;
-        let closes: Vec<f64> = s.candles.iter().map(|c| c.close).collect();
-        let buckets = 40.min(closes.len());
-        let windows = [5usize, 10, 20, 40];
-        let mut values = vec![f64::NAN; buckets * windows.len()];
-        if buckets >= 2 {
-            for (bi, _) in (0..buckets).enumerate() {
-                let end = ((bi + 1) * closes.len()) / buckets;
-                for (wi, &w) in windows.iter().enumerate() {
-                    if end <= w {
-                        continue;
-                    }
-                    let base = closes[end - w - 1];
-                    let now = closes[end - 1];
-                    if base > 0.0 {
-                        values[bi * windows.len() + wi] = (now / base - 1.0) * 100.0;
-                    }
-                }
-            }
-        }
-        let surface = views3d::Surface::new(views3d::SurfaceSpec::new(
-            format!("3D Regime Timeline \u{2014} {}", s.symbol),
-            "Return % by time bucket x window",
-            views3d::Grid::new(
-                buckets.max(2),
-                windows.len(),
-                values,
-                "time bucket",
-                "window",
-            ),
-            views3d::RAMP_SIGNED,
-        ));
-        views3d::draw_frame(ui, &surface);
+        // Builder shared with the 3D gallery, so this tab and the gallery can
+        // never disagree about what "Regime Timeline" means.
+        views3d::draw_frame(ui, &views3d::regime_timeline_surface(&self.data.candles));
     }
 
     /// Four charts in a genuine 2x2 split of the available canvas.
@@ -11060,6 +11589,96 @@ mod tests {
                 engine.label()
             );
         }
+    }
+
+    /// The gallery tab must be reachable, and it must be the first entry in the 3D
+    /// category so it is what a user lands on.
+    #[test]
+    fn test_3d_gallery_is_listed_first() {
+        let three_d = tabs_in_category(TabCategory::ThreeD);
+        assert!(
+            three_d.iter().any(|(t, _)| *t == Tab::ThreeD_Gallery),
+            "the gallery tab is not listed under 3D & Surfaces"
+        );
+        assert_eq!(
+            three_d[0].0,
+            Tab::ThreeD_Gallery,
+            "the gallery should be the first 3D entry"
+        );
+        // Every 3D surface the gallery offers must also be reachable on its own,
+        // so the gallery is an overview of the category rather than a parallel
+        // set of tabs that can drift out of step with it.
+        let gallery_titles: Vec<String> = views3d::GALLERY_BUILDERS
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("3D {}", views3d::GALLERY_LABELS[i]))
+            .collect();
+        let listed: Vec<&str> = three_d.iter().map(|(_, label)| *label).collect();
+        for want in &gallery_titles {
+            assert!(
+                listed.iter().any(|l| l.contains(want.as_str())),
+                "gallery entry '{want}' has no matching tab in the 3D category"
+            );
+        }
+    }
+
+    /// The paradigm enum is only meaningful if the ids it exposes are stable and
+    /// distinct: the regime chart plots `regime_id + 1` as bar height, so a
+    /// collision would draw two states at the same level.
+    #[test]
+    fn test_regime_ids_are_distinct_and_ordered() {
+        use bt_analytics::Regime;
+        let ids: Vec<usize> = Regime::ALL.iter().map(|r| r.id()).collect();
+        assert_eq!(ids, vec![0, 1, 2]);
+        let names: Vec<&str> = Regime::ALL.iter().map(|r| r.name()).collect();
+        assert_eq!(
+            names,
+            vec!["BULL_TREND", "CONSOLIDATION_CHOP", "BEAR_VOLATILE"]
+        );
+        for r in Regime::ALL {
+            assert!(!r.label().is_empty());
+            assert_eq!(r.id(), r.id()); // stable
+        }
+    }
+
+    /// The four paradigms must actually disagree on the same input. If any two
+    /// returned the same numbers the feature would be the flat-line problem it
+    /// was built to fix.
+    #[test]
+    fn test_paradigms_are_distinct_on_the_same_window() {
+        use bt_analytics::{QuantAnalyticsEngine, Regime};
+        // A trending series with a cycle, then a violent repricing.
+        let mut closes: Vec<f64> = (0..120)
+            .map(|i| {
+                let t = i as f64;
+                3000.0 + t * 1.5 + 40.0 * (t * std::f64::consts::TAU / 21.0).sin()
+            })
+            .collect();
+        for (i, c) in closes.iter_mut().enumerate().skip(108) {
+            *c *= if i % 2 == 0 { 1.03 } else { 1.0 / 1.03 };
+        }
+
+        let fft = QuantAnalyticsEngine::extrapolate_fft(&closes, 12, 3).expect("fft");
+        // The FFT must find structure: a flat line means it found nothing.
+        let first = fft.cycle_projection[0];
+        let last = fft.cycle_projection[fft.cycle_projection.len() - 1];
+        assert!(
+            (last - first).abs() > 0.5,
+            "the cycle projection is flat ({first} -> {last}); it is not a projection"
+        );
+        assert_eq!(
+            fft.primary_period(),
+            Some(21),
+            "the injected 21-bar cycle was not recovered"
+        );
+
+        let regime = QuantAnalyticsEngine::classify_regime(&closes).expect("regime");
+        assert_eq!(
+            regime.current_regime,
+            Regime::BearVolatile,
+            "the injected shock did not flip the regime"
+        );
+        assert!(regime.vol_ratio > 1.0);
     }
 
     /// The status bar must name every engine in the chain, not just the two that

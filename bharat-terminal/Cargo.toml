@@ -42,6 +42,9 @@ egui_plot = "0.28"
 ort = { version = "2.0.0-rc.10", features = ["load-dynamic", "ndarray"] }
 oxidiviner = "1"
 ndarray = "0.15"
+# Frequency-domain cycle extrapolation for the FFT paradigm on the Forecast tab.
+# Pure Rust, no BLAS: a 256-point transform is tens of microseconds.
+rustfft = "6.2"
 sysinfo = "0.30"
 
 [profile.release]
