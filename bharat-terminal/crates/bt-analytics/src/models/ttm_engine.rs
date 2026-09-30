@@ -118,6 +118,60 @@ pub enum TtmStatus {
     GraphBroken(String),
 }
 
+/// Pick the 96-step price path out of a TinyTimeMixer output tensor.
+///
+/// TTM emits `[batch, prediction_length, num_patches]`, not a flat horizon.
+/// With the shipped R2 configuration that is `[1, 96, 8]`: one column per patch,
+/// because the decoder reconstructs a whole patch block and the univariate
+/// series is the last column. Taking the first 96 values of the flattened
+/// buffer - the obvious reading - would instead walk 12 horizon steps with all 8
+/// patch channels interleaved, and hand back numbers that look like a forecast
+/// while being none of the thing.
+///
+/// So the channel axis is respected: with one channel the tensor is already the
+/// path, and with several the last column is taken, matching how TTM is
+/// consumed upstream.
+fn select_horizon(shape: &[i64], flat: &[f32]) -> Result<Vec<f32>, String> {
+    let dims: Vec<usize> = shape
+        .iter()
+        .map(|d| {
+            usize::try_from(*d).map_err(|_| format!("negative output dim {d} in shape {shape:?}"))
+        })
+        .collect::<Result<_, _>>()?;
+
+    // Normalise to [batch, horizon, channels]; the graphs are concrete, so a
+    // symbolic batch collapses to 1 here rather than being guessed at.
+    match dims.len() {
+        3 => {}
+        2 => return Err(format!("expected [batch, horizon, channel], got {dims:?}")),
+        _ => return Err(format!("unexpected output rank {} in {dims:?}", dims.len())),
+    }
+    let batch = dims[0].max(1);
+    let horizon = dims[1];
+    let channels = dims[2].max(1);
+    let expected = batch * horizon * channels;
+    if expected != flat.len() {
+        return Err(format!(
+            "output shape {dims:?} implies {expected} values but the tensor holds {}",
+            flat.len()
+        ));
+    }
+    if horizon < TTM_HORIZON {
+        return Err(format!(
+            "output projects {horizon} bars, expected {TTM_HORIZON}"
+        ));
+    }
+
+    let mut out = Vec::with_capacity(TTM_HORIZON);
+    for step in 0..TTM_HORIZON {
+        // Univariate series: first batch element, last patch channel, per step.
+        let idx = step * channels + (channels - 1);
+        debug_assert!(idx < horizon * channels);
+        out.push(flat[idx]);
+    }
+    Ok(out)
+}
+
 impl TtmEngine {
     /// Point at a `models` directory. Nothing is read until the first forecast.
     pub fn new<P: AsRef<Path>>(models_dir: P) -> Self {
@@ -184,10 +238,15 @@ impl TtmEngine {
             .lock()
             .map_err(|_| fail("session lock poisoned".into()))?;
         if guard.is_none() {
+            // Resolve the runtime first, unconditionally. `ort` panics (and
+            // `panic = "abort"` makes that fatal) if its lazy loader resolves
+            // the bare name `onnxruntime.dll` to the System32 inbox build, so
+            // the pinned path has to be set before any ort API is touched -
+            // including on the branch below that decides no session is needed.
+            crate::ort_runtime::ensure_initialized().map_err(ModelError::Runtime)?;
             if !self.is_available() {
                 return Err(ModelError::ModelNotFound(FILE_TTM_R2.to_string()));
             }
-            crate::ort_runtime::ensure_initialized().map_err(ModelError::Runtime)?;
             let s = Session::builder()
                 .map_err(|e| fail(e.to_string()))?
                 .with_optimization_level(GraphOptimizationLevel::Level1)
@@ -210,6 +269,14 @@ impl TtmEngine {
 
     /// Project 96 bars from a 512-bar window.
     pub fn forecast(&self, window: &[f64]) -> Result<TtmForecastResult, ModelError> {
+        // Pin the runtime before building any ort value. `Tensor::from_array`
+        // is itself an ort call, and the first one in the process is what makes
+        // `ort` dlopen the runtime: left until `with_session`, it resolved the
+        // bare name `onnxruntime.dll`, picked the 1.17 inbox build out of
+        // System32 and `panic!`ed. `BharatModelEngine::run_window_raw` orders
+        // the same two steps the other way round, so this engine does too.
+        crate::ort_runtime::ensure_initialized().map_err(ModelError::Runtime)?;
+
         if window.len() < TTM_CONTEXT {
             return Err(ModelError::InsufficientHistory {
                 needed: TTM_CONTEXT,
@@ -244,19 +311,21 @@ impl TtmEngine {
                     model: "TinyTimeMixer R2 (int8)",
                     message: e.to_string(),
                 })?;
-            let (_shape, flat_out) =
+            let (shape, flat_out) =
                 outputs[0]
                     .try_extract_tensor::<f32>()
                     .map_err(|e| ModelError::Onnx {
                         model: "TinyTimeMixer R2 (int8)",
                         message: e.to_string(),
                     })?;
-            // Output is [1, 96, 1]; take the first `TTM_HORIZON` scalars and
-            // invert the standardisation.
-            Ok(flat_out
+            let horizon = select_horizon(shape, flat_out).map_err(|message| ModelError::Onnx {
+                model: "TinyTimeMixer R2 (int8)",
+                message,
+            })?;
+            // Invert the standardisation.
+            Ok(horizon
                 .iter()
-                .take(TTM_HORIZON)
-                .map(|v| (*v as f64) * sd + mean)
+                .map(|v| *v as f64 * sd + mean)
                 .collect::<Vec<f64>>())
         })?;
         ensure_finite("TinyTimeMixer R2 (int8)", &predictions)?;
@@ -272,6 +341,57 @@ impl TtmEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The real R2 graphs emit [1, 96, 8]; the last column is the series.
+    #[test]
+    fn the_patch_axis_is_respected_not_ignored() {
+        let channels = 8;
+        let horizon = TTM_HORIZON;
+        // Distinct values per (step, channel) so a wrong read is visible.
+        let flat: Vec<f32> = (0..horizon * channels)
+            .map(|i| (i / channels) as f32 * 100.0 + (i % channels) as f32)
+            .collect();
+        let got = select_horizon(&[1, horizon as i64, channels as i64], &flat).unwrap();
+        assert_eq!(got.len(), TTM_HORIZON);
+        for (step, v) in got.iter().enumerate() {
+            assert_eq!(
+                *v,
+                step as f32 * 100.0 + (channels - 1) as f32,
+                "step {step}"
+            );
+        }
+        // The naive reading would have returned 7.0 at step 1; prove it is not.
+        assert_ne!(got[1], 7.0);
+    }
+
+    #[test]
+    fn a_single_channel_output_is_taken_as_is() {
+        let flat: Vec<f32> = (0..TTM_HORIZON).map(|i| i as f32).collect();
+        let got = select_horizon(&[1, TTM_HORIZON as i64, 1], &flat).unwrap();
+        assert_eq!(got.len(), TTM_HORIZON);
+        assert_eq!(got[5], 5.0);
+    }
+
+    /// A shape that disagrees with the buffer is a bug, not something to guess at.
+    #[test]
+    fn inconsistent_shapes_are_rejected() {
+        let flat = vec![0.0f32; 100];
+        assert!(
+            select_horizon(&[1, 96, 8], &flat).is_err(),
+            "buffer too short"
+        );
+        assert!(select_horizon(&[96], &flat).is_err(), "rank 1");
+        assert!(select_horizon(&[96, 1], &flat).is_err(), "rank 2");
+        let short = vec![0.0f32; 16];
+        assert!(
+            select_horizon(&[1, 16, 1], &short).is_err(),
+            "short horizon"
+        );
+        assert!(
+            select_horizon(&[-1, 96, 1], &vec![0.0f32; 96]).is_err(),
+            "negative dim"
+        );
+    }
 
     #[test]
     fn a_short_window_is_reported_not_panicked() {

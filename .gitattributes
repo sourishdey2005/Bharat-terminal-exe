@@ -1,4 +1,7 @@
-# Model weights are stored with Git LFS: SmolLM2-135M-Instruct.Q4_K_M.gguf is
-# 105,454,144 bytes, past GitHub's 104,857,600-byte per-file limit, so a plain
-# blob would be rejected outright.
-*.gguf filter=lfs diff=lfs merge=lfs -text
+# Only the oversized weight goes through LFS. A blanket *.gguf rule would also
+# capture ttm-q8.gguf, which is already committed as a plain 917 KB blob and
+# would then be rejected as "should have been a pointer".
+#
+# SmolLM2-135M-Instruct.Q4_K_M.gguf is 105,454,144 bytes, past GitHub's
+# 104,857,600-byte per-file limit, so a plain blob would be refused outright.
+bharat-terminal/models/SmolLM2-135M-Instruct.Q4_K_M.gguf filter=lfs diff=lfs merge=lfs -text
