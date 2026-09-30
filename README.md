@@ -66,7 +66,7 @@
 
 | | | | |
 |:--|:--|:--|:--|
-| 📈 163 Interactive Tabs | 📊 200+ Visualizations | 🇮🇳 India-Specific | 🔴 Live Mode |
+| 📈 185 Interactive Tabs | 📊 200+ Visualizations | 🇮🇳 India-Specific | 🔴 Live Mode |
 | 📉 Technical Analysis | 📋 F&O Chain Analytics | 💰 G-Sec & Money Market | 🏦 RBI Policy |
 | 🌍 Global Markets | ₿ Crypto | 📊 Portfolio Risk | 🔬 Quantitative |
 | 📰 News & Research | 🏦 Banking Indicators | 📋 IPO Pipeline | 💹 GST/Budget |
@@ -841,7 +841,8 @@ BharatTerminal/
 | Metric | Count |
 |:-------|:------:|
 | Rust source files (bt-viz) | 203 |
-| GUI tabs | 163 |
+| GUI tabs | 185 |
+| 3D / surface views | 20 |
 | CLI visualizations | 25 |
 | Technical indicators | 30+ |
 | Candlestick overlay variants | 30+ |
@@ -861,12 +862,51 @@ which engine actually ran.
 
 | Order | Engine | Needs | Context / Horizon |
 |------:|--------|-------|:-----------------:|
-| 1 | IBM Granite TTM R2 | `models/ttm-q8.gguf` + `models/config.json` + `zsfm` CLI on `PATH` | 512 / 96 |
-| 2 | NanoForecast v0.5 | `models/nanoforecast.onnx` (+ ONNX Runtime for `ort` to dlopen) | 512 / 48 |
-| 3 | Auto bench | nothing — pure Rust | any / any |
-| 4 | ARIMA(1,1,1) | nothing | any / any |
-| 5 | Exp. smoothing (0.3) | nothing | any / any |
-| 6 | Moving average (5) | nothing | any / any |
+| 1 | Chronos-Bolt Tiny (int8) | `models/chronos_bolt_tiny_int8.onnx` (+ ONNX Runtime) | 64 / 64 |
+| 2 | DLinear | `models/dlinear.onnx` (+ ONNX Runtime) | 32 / 5 |
+| 3 | N-HiTS (small) | `models/nhits_small.onnx` (+ ONNX Runtime) | 32 / 5 |
+| 4 | IBM Granite TTM R2 | `models/ttm-q8.gguf` + `models/config.json` + `zsfm` CLI on `PATH` | 512 / 96 |
+| 5 | NanoForecast v0.5 | `models/nanoforecast.onnx` (+ ONNX Runtime for `ort` to dlopen) | 512 / 48 |
+| 6 | Auto bench | nothing — pure Rust | any / any |
+| 7 | ARIMA(1,1,1) | nothing | any / any |
+| 8 | Exp. smoothing (0.3) | nothing | any / any |
+| 9 | Moving average (5) | nothing | any / any |
+
+The chain is ordered by expected quality, and it always terminates on the
+pure-Rust bench, so a missing model file degrades to a forecast instead of an
+error. `Auto` starts at the top of the chain; a specific preference starts
+there and falls through the engines below it.
+
+### On-device ONNX inference
+
+`Chronos-Bolt Tiny`, `DLinear`, `N-HiTS` and the WatchSignal classifier all run
+in-process through a pinned ONNX Runtime — no Python, no network, no service.
+The budget for a 2 GB machine drives the configuration:
+
+| Setting | Value | Why |
+|---|---|---|
+| `intra_op_num_threads` / `inter_op_num_threads` | 1 / 1 | ONNX Runtime's own pools are the largest avoidable allocation |
+| Memory pattern planning | disabled | the arena table is sized to the graph and pins large blocks |
+| Graph optimization | `Level1` | Level2+ trades memory for speed this machine cannot spare |
+| Session lifetime | lazy, LRU-capped at 4 | sessions load on first use, so repeat forecasts are ~0.1 ms instead of re-reading weights |
+
+**Normalization is not uniform across the models, and this is the easiest thing
+to get wrong.** DLinear and N-HiTS take a window normalized against its *last
+close* and return forecasts in those units; the untrained weights then predict
+exactly 0, which is the random walk. Chronos carries its own `InstanceNorm`
+inside the graph, so it takes **raw prices** and returns **raw prices**.
+
+`dlinear.onnx` and `nhits_small.onnx` are trained by `train_forecasts.py` on the
+OHLCV in `data/cache.db`, with the untrained state admitted as a candidate
+epoch, so neither is ever worse than a random walk. `chronos_bolt_tiny_int8.onnx`
+is an int8 quantization of the real `amazon/chronos-bolt-tiny` checkpoint, and
+`export_chronos_fixed.py` verifies the exported graph against the PyTorch
+reference (measured relative error 9e-08 for fp32, 6e-04 for int8) before
+shipping it.
+
+`cargo test -p bt-analytics --test model_verification` runs every shipped model
+end to end; `cargo test -p bt-analytics --test forecast_chain` checks that the
+auto chain actually reaches an installed neural engine.
 
 Granite runs through the `zsfm` CLI (`zsfm ttm infer` reading
 `{"context": [...], "horizon": N}` on stdin), resolved from `PATH` with a

@@ -32,6 +32,15 @@ impl StatisticalForecaster {
         horizon: usize,
     ) -> Result<(Vec<f64>, &'static str), ForecastError> {
         let data = history_data(history)?;
+        // The neural engines never reach here: the chain in `forecast::mod`
+        // dispatches them to the ONNX engine and only falls through to this
+        // bench. Reject rather than silently forecasting with the wrong model.
+        if engine.local_model().is_some() {
+            return Err(ForecastError::Statistical(format!(
+                "{} is an ONNX engine, not a statistical bench member",
+                engine.label()
+            )));
+        }
         let (values, name): (Vec<f64>, &'static str) = match engine {
             Engine::Auto => {
                 let (v, model) = auto_select(data, horizon)
@@ -71,7 +80,11 @@ impl StatisticalForecaster {
                     .map_err(|e| ForecastError::Statistical(e.to_string()))?,
                 "MovAvg(5)",
             ),
-            Engine::Granite | Engine::Nano => {
+            // Unreachable by construction: the guard at the top of this function
+            // rejects every `local_model()` engine. Listed explicitly so adding
+            // a new ONNX engine is a compile error here rather than a silent
+            // fall-through to the wrong forecaster.
+            Engine::Granite | Engine::Nano | Engine::Chronos | Engine::DLinear | Engine::NHits => {
                 return Err(ForecastError::Statistical(
                     "not a statistical engine".into(),
                 ));

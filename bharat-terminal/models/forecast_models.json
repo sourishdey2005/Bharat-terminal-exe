@@ -1,0 +1,16 @@
+{
+  "dlinear.onnx": {
+    "lookback": 32,
+    "horizon": 5,
+    "normalization": "last_close_anchored",
+    "val_rmse": 1.0863230228424072,
+    "val_rmse_random_walk": 1.0863230228424072
+  },
+  "nhits_small.onnx": {
+    "lookback": 32,
+    "horizon": 5,
+    "normalization": "last_close_anchored",
+    "val_rmse": 1.0863230228424072,
+    "val_rmse_random_walk": 1.0863230228424072
+  }
+}

@@ -33,6 +33,8 @@ pub enum ForecastError {
     Nano(String),
     #[error("Statistical error: {0}")]
     Statistical(String),
+    #[error("Local ONNX model error: {0}")]
+    Model(String),
     #[error("All models failed: {0}")]
     AllFailed(String),
     #[error("Model file not found: {0}")]
@@ -103,6 +105,9 @@ pub enum Engine {
     Auto,
     Granite,
     Nano,
+    Chronos,
+    DLinear,
+    NHits,
     Arima,
     ExpSmooth,
     MovAvg,
@@ -115,6 +120,9 @@ impl Engine {
             Engine::Auto => "Auto (best available)",
             Engine::Granite => "Granite TTM R2",
             Engine::Nano => "NanoForecast v0.5",
+            Engine::Chronos => "Chronos-Bolt Tiny (int8)",
+            Engine::DLinear => "DLinear",
+            Engine::NHits => "N-HiTS (small)",
             Engine::Arima => "ARIMA(1,1,1)",
             Engine::ExpSmooth => "Exp. smoothing (0.3)",
             Engine::MovAvg => "Moving average (5)",
@@ -122,7 +130,15 @@ impl Engine {
     }
 
     /// Every engine, in fallback order.
-    pub const ALL: [Engine; 6] = [
+    ///
+    /// Ordered by expected quality rather than cost: Chronos leads because it is
+    /// a genuinely pretrained foundation model, then the two small local
+    /// forecasters, then the statistical bench. The bench is pure Rust and
+    /// always available, so it terminates every chain.
+    pub const ALL: [Engine; 9] = [
+        Engine::Chronos,
+        Engine::DLinear,
+        Engine::NHits,
         Engine::Granite,
         Engine::Nano,
         Engine::Auto,
@@ -130,12 +146,23 @@ impl Engine {
         Engine::ExpSmooth,
         Engine::MovAvg,
     ];
+
+    /// The small local ONNX model this engine runs, if it is one.
+    pub fn local_model(&self) -> Option<crate::models::Model> {
+        match self {
+            Engine::Chronos => Some(crate::models::Model::Chronos),
+            Engine::DLinear => Some(crate::models::Model::DLinear),
+            Engine::NHits => Some(crate::models::Model::NHiTS),
+            _ => None,
+        }
+    }
 }
 
 /// Unified forecaster with an automatic fallback chain.
 pub struct Forecaster {
     granite: Option<GraniteForecaster>,
     nano: Option<NanoForecaster>,
+    local: crate::models::BharatModelEngine,
     statistical: StatisticalForecaster,
 }
 
@@ -159,8 +186,28 @@ impl Forecaster {
         Self {
             granite,
             nano,
+            // Cheap to build: no model file is read until one is first used, so
+            // an installation missing the small ONNX models still starts.
+            local: crate::models::BharatModelEngine::with_default_paths(),
             statistical: StatisticalForecaster::new(),
         }
+    }
+
+    /// Create with explicit model directories.
+    ///
+    /// `local_dir` is where the small ONNX forecasters are looked for. It is a
+    /// parameter rather than always [`models_dir`] so a caller (or a test) can
+    /// point at a directory with no models and observe the pure statistical
+    /// fallback, rather than silently picking up whatever happens to be
+    /// installed on the machine running the test.
+    pub fn with_dirs(
+        granite_gguf: Option<&str>,
+        nano_onnx: Option<&str>,
+        local_dir: &std::path::Path,
+    ) -> Self {
+        let mut f = Self::new(granite_gguf, nano_onnx);
+        f.local = crate::models::BharatModelEngine::new(local_dir);
+        f
     }
 
     /// Create from the standard filenames under [`models_dir`].
@@ -203,10 +250,18 @@ impl Forecaster {
             return Ok((Vec::new(), "none"));
         }
 
-        let start = Engine::ALL
-            .iter()
-            .position(|e| *e == preferred)
-            .unwrap_or(0);
+        // `Auto` means "start at the top of the chain", not "jump to the
+        // statistical bench". Resolving it by its index in `ALL` would silently
+        // skip every neural engine above it, which is the opposite of the
+        // documented behaviour and would hide a working model from the user.
+        let start = if preferred == Engine::Auto {
+            0
+        } else {
+            Engine::ALL
+                .iter()
+                .position(|e| *e == preferred)
+                .unwrap_or(0)
+        };
         let mut last_error = String::from("no engine available");
         for engine in &Engine::ALL[start..] {
             let attempt = match engine {
@@ -218,6 +273,28 @@ impl Forecaster {
                     n.predict(history, horizon)
                         .map(|v| (v, "NanoForecast v0.5"))
                 }),
+                // Small local ONNX models. Each declares its own lookback, so a
+                // short history is skipped here and the chain moves on rather
+                // than reporting an error the user can do nothing about.
+                Engine::Chronos | Engine::DLinear | Engine::NHits => {
+                    let model = engine.local_model().expect("local engine");
+                    let name = engine.label();
+                    if history.len() < model.required_history() {
+                        tracing::debug!(
+                            "{name} needs {} bars, got {}",
+                            model.required_history(),
+                            history.len()
+                        );
+                        None
+                    } else {
+                        Some(
+                            self.local
+                                .run(model, history)
+                                .map_err(|e| ForecastError::Model(e.to_string()))
+                                .map(|o| (o.predictions, name)),
+                        )
+                    }
+                }
                 Engine::Auto | Engine::Arima | Engine::ExpSmooth | Engine::MovAvg => {
                     Some(self.statistical.forecast_engine(*engine, history, horizon))
                 }
@@ -290,9 +367,13 @@ mod tests {
 
     #[test]
     fn test_missing_models_fall_back_to_arima() {
-        let f = Forecaster::new(
+        // Point the local ONNX engine at a directory with no models, otherwise
+        // this test would silently pass or fail depending on what happens to be
+        // installed on the machine running it.
+        let f = Forecaster::with_dirs(
             Some("definitely/missing/ttm-q8.gguf"),
             Some("definitely/missing/nanoforecast.onnx"),
+            std::path::Path::new("definitely/missing/models"),
         );
         assert!(!f.has_granite());
         assert!(!f.has_nano());
@@ -346,11 +427,76 @@ mod tests {
 
     #[test]
     fn test_engine_labels_cover_the_chain() {
-        assert_eq!(Engine::ALL.len(), 6);
+        assert_eq!(Engine::ALL.len(), 9);
         for engine in Engine::ALL {
-            assert!(!engine.label().is_empty());
+            assert!(!engine.label().is_empty(), "{engine:?} has no label");
         }
         assert_eq!(Engine::Auto.label(), "Auto (best available)");
+    }
+
+    #[test]
+    fn test_chain_order_prefers_neural_then_ends_on_the_bench() {
+        // The bench members are pure Rust and always available, so exactly one of
+        // them must terminate every chain. If a neural engine were last, a
+        // missing model file would surface as an error instead of a forecast.
+        let last = *Engine::ALL.last().unwrap();
+        assert!(
+            matches!(
+                last,
+                Engine::Auto | Engine::Arima | Engine::ExpSmooth | Engine::MovAvg
+            ),
+            "chain must end on the always-available bench, ended on {last:?}"
+        );
+        // The statistical bench members must come after the ONNX engines.
+        let first_bench = Engine::ALL
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    Engine::Auto | Engine::Arima | Engine::ExpSmooth | Engine::MovAvg
+                )
+            })
+            .unwrap();
+        let last_neural = Engine::ALL
+            .iter()
+            .rposition(|e| e.local_model().is_some() || matches!(e, Engine::Granite | Engine::Nano))
+            .unwrap();
+        assert!(
+            last_neural < first_bench,
+            "neural engines must be tried before the bench"
+        );
+    }
+
+    #[test]
+    fn test_local_engines_map_to_their_model() {
+        assert_eq!(
+            Engine::Chronos.local_model(),
+            Some(crate::models::Model::Chronos)
+        );
+        assert_eq!(
+            Engine::DLinear.local_model(),
+            Some(crate::models::Model::DLinear)
+        );
+        assert_eq!(
+            Engine::NHits.local_model(),
+            Some(crate::models::Model::NHiTS)
+        );
+        // The subprocess and bench engines are not local ONNX models.
+        for engine in [Engine::Auto, Engine::Granite, Engine::Nano, Engine::Arima] {
+            assert!(engine.local_model().is_none(), "{engine:?} should not map");
+        }
+    }
+
+    #[test]
+    fn test_statistical_bench_rejects_onnx_engines() {
+        // Guards against a new engine silently forecasting with the wrong model.
+        let bench = StatisticalForecaster::new();
+        for engine in [Engine::Chronos, Engine::DLinear, Engine::NHits] {
+            assert!(
+                bench.forecast_engine(engine, &trend(60), 5).is_err(),
+                "{engine:?} must not run on the statistical bench"
+            );
+        }
     }
 
     #[test]

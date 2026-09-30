@@ -343,6 +343,8 @@ pub fn adx(series: &OhlcvSeries, period: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>
         out
     };
 
+    // Wilder's smoothing over DM/TR. These seed from index 1 because their
+    // leading entries are real (0.0) rather than NaN.
     let atr_smooth = smooth(&tr);
     let plus_di_smooth = smooth(&plus_dm);
     let minus_di_smooth = smooth(&minus_dm);
@@ -362,8 +364,20 @@ pub fn adx(series: &OhlcvSeries, period: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>
         }
     }
 
-    // ADX is smoothed DX
-    let adx = smooth(&dx);
+    // ADX is a Wilder-smoothed DX, but the smoothing has to start where DX
+    // actually becomes defined. Reusing `smooth` here would seed from
+    // `dx[1..=period]`, and every one of those leading entries is still NaN, so
+    // the seed, and therefore the entire ADX line, would be NaN. Start the
+    // window at the first defined DX instead.
+    let first = period;
+    let mut adx = vec![f64::NAN; n];
+    if n > first + period - 1 {
+        let seed: f64 = dx[first..=first + period - 1].iter().sum();
+        adx[first + period - 1] = seed / period as f64;
+        for i in (first + period)..n {
+            adx[i] = (adx[i - 1] * (period - 1) as f64 + dx[i]) / period as f64;
+        }
+    }
 
     (adx, plus_di, minus_di)
 }

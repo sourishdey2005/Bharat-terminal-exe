@@ -12,12 +12,20 @@
 //! - Risk metrics (VaR, CVaR, Sharpe, Sortino, Max Drawdown)
 //! - Portfolio analytics (Beta, Alpha, Correlation, Efficient Frontier)
 
+pub mod extended;
 pub mod forecast;
 pub mod indicators;
+pub mod models;
 pub mod ort_runtime;
 pub mod risk;
 pub mod signal;
 
+pub use extended::{
+    ad_line, alma, aroon, aroon_osc, coppock, dpo, elder_ray, eom, fib_levels, force_index,
+    high_low_band, hull_ma, kama, keltner_width, kst, log_returns, mass_index, mfi, mfv, multi_ema,
+    multi_sma, pivot_levels, pvt, realized_vol, stoch_rsi, supertrend, trend_intensity, tsi, ulcer,
+    ultimate_osc, vortex, vwap_bands, wma, zscore, PivotLevels,
+};
 pub use forecast::granite::GraniteForecaster;
 pub use forecast::nanoforecast::NanoForecaster;
 pub use forecast::statistical::StatisticalForecaster;
@@ -26,6 +34,7 @@ pub use indicators::{
     adx, atr, bollinger, cci, cmf, donchian, ema, heikin_ashi, keltner, macd, obv, parabolic_sar,
     renko, roc, rsi, sma, stochastic, vwap, williams_r,
 };
+pub use models::{BharatModelEngine, ForecastOutput, Model, ModelError, SlidingBuffer};
 pub use risk::{
     alpha, beta, calmar, correlation, correlation_matrix, covariance_matrix, cvar, drawdown_series,
     efficient_frontier, information_ratio, kurtosis, max_drawdown, rolling_correlation,

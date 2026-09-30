@@ -9,4 +9,4 @@
 pub mod watchsignal;
 
 pub use watchsignal::{Signal, SignalOutput, WatchSignalModel};
-pub use watchsignal::{SIGNAL_N_FEATURES, SIGNAL_SEQ_LEN};
+pub use watchsignal::{SIGNAL_MODEL_FILE, SIGNAL_N_FEATURES, SIGNAL_SEQ_LEN};

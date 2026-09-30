@@ -52,6 +52,7 @@
       <ComponentRef Id="LicenseFile" />
       <ComponentRef Id="ReadmeFile" />
       <ComponentRef Id="ModelFiles" />
+      <ComponentRef Id="SignalModelFiles" />
       <ComponentRef Id="NativeRuntime" />
       <ComponentRef Id="StartMenuShortcuts" />
     </Feature>
@@ -79,15 +80,29 @@
             <Component Id="ReadmeFile" Guid="*">
               <File Id="ReadmeMd" Source="../../README.md" KeyPath="yes" />
             </Component>
-            <!-- Forecast model files. Small (~1 MB total); installing them
-                 means the Granite slot resolves its weights out of the box
-                 and only the ttm-rs CLI remains user-supplied. -->
+            <!-- Forecast model files. The Granite TTM weights are small (~1 MB)
+                 and ship by default; only the ttm-rs CLI remains user-supplied.
+                 The local ONNX forecasters ship too, because the Forecast tab
+                 degrades to the statistical bench without them and Chronos is
+                 the only genuinely pretrained model in the chain. The int8
+                 Chronos graph is 9 MB rather than the 35 MB fp32 one, so the
+                 installer stays small on a 2 GB machine. -->
             <Directory Id="ModelsFolder" Name="models">
-              <Component Id="ModelFiles" Guid="A46E760F-AD4E-4FE6-A2E8-64AB8B0553CD">
-                <File Id="TtmGguf" Source="../models/ttm-q8.gguf" KeyPath="yes" />
-                <File Id="TtmConfig" Source="../models/config.json" />
-              </Component>
-            </Directory>
+                <Component Id="ModelFiles" Guid="A46E760F-AD4E-4FE6-A2E8-64AB8B0553CD">
+                  <File Id="TtmGguf" Source="../models/ttm-q8.gguf" KeyPath="yes" />
+                  <File Id="TtmConfig" Source="../models/config.json" />
+                  <File Id="DLinearOnnx" Source="../models/dlinear.onnx" />
+                  <File Id="NHitsOnnx" Source="../models/nhits_small.onnx" />
+                  <File Id="ChronosInt8Onnx" Source="../models/chronos_bolt_tiny_int8.onnx" />
+                  <File Id="ForecastModelsJson" Source="../models/forecast_models.json" />
+                </Component>
+                <!-- The BUY/HOLD/SELL classifier. It was referenced by the
+                     Forecast tab but never packaged, so an installed app always
+                     reported it missing. -->
+                <Component Id="SignalModelFiles" Guid="7C1D4B92-58E6-4A3F-9D0C-2B6E85F41A73">
+                  <File Id="SignalLstmOnnx" Source="../models/stock_signal_lstm_v1_seed42.onnx" KeyPath="yes" />
+                </Component>
+              </Directory>
           </Directory>
       </Directory>
     </StandardDirectory>

@@ -80,6 +80,8 @@ impl SignalOutput {
 pub const SIGNAL_SEQ_LEN: usize = 30;
 pub const SIGNAL_N_FEATURES: usize = 55;
 pub const SIGNAL_N_CLASSES: usize = 3;
+/// Model filename inside the models directory.
+pub const SIGNAL_MODEL_FILE: &str = "stock_signal_lstm_v1_seed42.onnx";
 
 /// Minimum candles needed to warm up the longest lookback (SMA-50 + margin).
 pub const SIGNAL_MIN_CANDLES: usize = 80;

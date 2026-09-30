@@ -16,3 +16,7 @@ serde_json = { workspace = true }
 ort = { workspace = true }
 oxidiviner = { workspace = true }
 sysinfo = { workspace = true }
+
+[dev-dependencies]
+# Integration tests in tests/ need bt-core directly to build candle fixtures.
+bt-core = { path = "../bt-core" }

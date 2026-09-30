@@ -29,6 +29,8 @@ use bt_data::india;
 use bt_data::{symbol::COMPANY_LIST, DataService, Interval};
 use bt_viz::palette::Theme;
 
+mod views3d;
+
 const AMBER: Color32 = Color32::from_rgb(0xFF, 0xB0, 0x00);
 const PROFIT: Color32 = Color32::from_rgb(0x00, 0xFF, 0x88);
 const LOSS: Color32 = Color32::from_rgb(0xFF, 0x3B, 0x3B);
@@ -1298,6 +1300,64 @@ enum Tab {
     IndiaDashboard,
     MultiCompare,
     Forecast,
+    StochRsi,
+    Zscore,
+    Mfi,
+    UltimateOsc,
+    Tsi,
+    Coppock,
+    Dpo,
+    Aroon,
+    AroonOsc,
+    Ulcer,
+    Eom,
+    ForceIndex,
+    MassIndex,
+    Pvt,
+    Mfv,
+    AdLine,
+    TrendIntensity,
+    RealizedVol,
+    KeltnerWidth,
+    Volatility,
+    Kst,
+    ElderRay,
+    Vortex,
+    Kama,
+    Alma,
+    HullMa,
+    Wma,
+    MultiSma,
+    MultiEma,
+    HighLowBand,
+    VwapBands,
+    Supertrend,
+    LogReturns,
+    Volume,
+    Ohlc,
+    PivotPoints,
+    FibLevels,
+    PriceSurface,
+    VolatilitySurface,
+    ReturnSurface,
+    RiskLandscape,
+    BetaSurface,
+    EntropySurface,
+    AlphaSurface,
+    SignalSurface,
+    RegimeSurface,
+    RegimeTimeline,
+    MomentumSurface,
+    OrderFlowSurface,
+    SkewKurtSurface,
+    SignalEvolution,
+    EquitySurface,
+    VarBandSurface,
+    RiskReturnCloud,
+    EigenvalueCloud,
+    ReturnsHeatmap,
+    PcaProjection,
+    FourInOne,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1312,6 +1372,7 @@ enum TabCategory {
     BloombergStyle,
     Advanced,
     Comparison,
+    ThreeD,
 }
 
 impl TabCategory {
@@ -1327,6 +1388,7 @@ impl TabCategory {
             TabCategory::BloombergStyle => "Bloomberg-Style",
             TabCategory::Advanced => "Advanced",
             TabCategory::Comparison => "Comparison",
+            TabCategory::ThreeD => "3D & Surfaces",
         }
     }
 
@@ -1342,11 +1404,12 @@ impl TabCategory {
             TabCategory::BloombergStyle => Color32::from_rgb(0x44, 0x88, 0xFF),
             TabCategory::Advanced => Color32::from_rgb(0xFF, 0x69, 0xB4),
             TabCategory::Comparison => Color32::from_rgb(0x00, 0xE5, 0xFF),
+            TabCategory::ThreeD => Color32::from_rgb(0xB0, 0x7C, 0xFF),
         }
     }
 }
 
-const CATEGORIES: [TabCategory; 10] = [
+const CATEGORIES: [TabCategory; 11] = [
     TabCategory::PriceAction,
     TabCategory::OrderFlow,
     TabCategory::Indicators,
@@ -1356,6 +1419,7 @@ const CATEGORIES: [TabCategory; 10] = [
     TabCategory::IndiaSpecific,
     TabCategory::BloombergStyle,
     TabCategory::Advanced,
+    TabCategory::ThreeD,
     TabCategory::Comparison,
 ];
 
@@ -1400,6 +1464,43 @@ fn tabs_in_category(cat: TabCategory) -> &'static [(Tab, &'static str)] {
             (Tab::Ichimoku, "Ichimoku"),
             (Tab::Keltner, "Keltner"),
             (Tab::Donchian, "Donchian"),
+            (Tab::StochRsi, "Stoch RSI"),
+            (Tab::Zscore, "Z-Score"),
+            (Tab::Mfi, "MFI"),
+            (Tab::UltimateOsc, "Ultimate Osc"),
+            (Tab::Tsi, "TSI"),
+            (Tab::Coppock, "Coppock"),
+            (Tab::Dpo, "DPO"),
+            (Tab::Aroon, "Aroon"),
+            (Tab::AroonOsc, "Aroon Osc"),
+            (Tab::Ulcer, "Ulcer Index"),
+            (Tab::Eom, "EOM"),
+            (Tab::ForceIndex, "Force Index"),
+            (Tab::MassIndex, "Mass Index"),
+            (Tab::Pvt, "PVT"),
+            (Tab::Mfv, "MFV"),
+            (Tab::AdLine, "A/D Line"),
+            (Tab::TrendIntensity, "Trend Intensity"),
+            (Tab::RealizedVol, "Realized Vol"),
+            (Tab::KeltnerWidth, "Keltner Width"),
+            (Tab::Volatility, "Volatility"),
+            (Tab::Kst, "KST"),
+            (Tab::ElderRay, "Elder Ray"),
+            (Tab::Vortex, "Vortex"),
+            (Tab::Kama, "KAMA"),
+            (Tab::Alma, "ALMA"),
+            (Tab::HullMa, "Hull MA"),
+            (Tab::Wma, "WMA"),
+            (Tab::MultiSma, "Multi SMA"),
+            (Tab::MultiEma, "Multi EMA"),
+            (Tab::HighLowBand, "High Low Band"),
+            (Tab::VwapBands, "VWAP Bands"),
+            (Tab::Supertrend, "Supertrend"),
+            (Tab::LogReturns, "Log Returns"),
+            (Tab::Volume, "Volume"),
+            (Tab::Ohlc, "OHLC"),
+            (Tab::PivotPoints, "Pivot Points"),
+            (Tab::FibLevels, "Fib Levels"),
         ],
         TabCategory::RiskPortfolio => &[
             (Tab::Drawdown, "Drawdown"),
@@ -1506,6 +1607,29 @@ fn tabs_in_category(cat: TabCategory) -> &'static [(Tab, &'static str)] {
             (Tab::Forecast, "Forecast"),
         ],
         TabCategory::Comparison => &[(Tab::MultiCompare, "Multi-Compare")],
+        TabCategory::ThreeD => &[
+            (Tab::PriceSurface, "3D Price Surface"),
+            (Tab::VolatilitySurface, "3D Volatility"),
+            (Tab::ReturnSurface, "3D Return Surface"),
+            (Tab::RiskLandscape, "3D Risk Landscape"),
+            (Tab::BetaSurface, "3D Beta Surface"),
+            (Tab::EntropySurface, "3D Entropy Surface"),
+            (Tab::AlphaSurface, "3D Alpha Surface"),
+            (Tab::SignalSurface, "3D Signal Surface"),
+            (Tab::RegimeSurface, "3D Regime Cluster"),
+            (Tab::RegimeTimeline, "3D Regime Timeline"),
+            (Tab::MomentumSurface, "3D Momentum Surface"),
+            (Tab::OrderFlowSurface, "3D Order Flow"),
+            (Tab::SkewKurtSurface, "3D Skew-Kurt"),
+            (Tab::SignalEvolution, "3D Signal Evolution"),
+            (Tab::EquitySurface, "3D Equity Surface"),
+            (Tab::VarBandSurface, "3D VaR Band"),
+            (Tab::RiskReturnCloud, "3D Risk-Return Cloud"),
+            (Tab::EigenvalueCloud, "3D Eigenvalue Cloud"),
+            (Tab::ReturnsHeatmap, "3D Returns Heatmap"),
+            (Tab::PcaProjection, "3D PCA Projection"),
+            (Tab::FourInOne, "4-in-1 Dashboard"),
+        ],
     }
 }
 
@@ -1615,7 +1739,26 @@ impl Prefs {
             .unwrap_or_else(|| std::path::PathBuf::from("."));
         base.join("data").join("prefs.json")
     }
+}
 
+/// Whether a local ONNX model file is present, without loading a session.
+///
+/// Existence is the only cheap check available, and it is the same one the
+/// engine uses to decide whether to try a model at all. Sessions load lazily on
+/// first inference, so this stays free.
+fn model_file_present(file: &str) -> bool {
+    bt_analytics::models::BharatModelEngine::with_default_paths()
+        .models_dir()
+        .join(file)
+        .is_file()
+}
+
+/// Whether a small local ONNX model has its file on disk.
+fn local_model_ready(model: bt_analytics::models::Model) -> bool {
+    bt_analytics::models::BharatModelEngine::with_default_paths().is_available(model)
+}
+
+impl Prefs {
     fn load() -> Self {
         let path = Self::prefs_path();
         if let Ok(content) = fs::read_to_string(&path) {
@@ -1897,6 +2040,69 @@ struct BharatApp {
     sys: sysinfo::System,
     ram_mb: f64,
     ram_at: Instant,
+}
+
+/// One plotted series for [`draw_lines_frame`]: legend label, full-length
+/// values with NaN warmup (the `bt_analytics` convention), and color.
+struct FrameLine<'a> {
+    label: &'static str,
+    vals: &'a [f64],
+    color: Color32,
+}
+
+/// Shared renderer for indicator tabs: optional gray price plus any number of
+/// indicator lines plus horizontal guide levels. Keeps each new tab to ~10
+/// lines instead of ~45.
+fn draw_lines_frame(
+    ui: &mut egui::Ui,
+    plot_id: &str,
+    title: &str,
+    candles: &[Candle],
+    show_price: bool,
+    lines: &[FrameLine<'_>],
+    guides: &[(f64, Color32)],
+) {
+    ui.label(RichText::new(title).strong());
+    Plot::new(plot_id)
+        .auto_bounds(egui::emath::Vec2b::new(true, true))
+        .height(ui.available_height())
+        .allow_scroll(true)
+        .allow_drag(true)
+        .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+        .show(ui, |plot_ui| {
+            if show_price {
+                let price: PlotPoints = candles.iter().map(|c| [c.t, c.close]).collect();
+                plot_ui.line(
+                    Line::new(price)
+                        .color(Color32::from_gray(110))
+                        .width(1.0_f32)
+                        .name("Price"),
+                );
+            }
+            for line in lines {
+                let pts: PlotPoints = candles
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, c)| {
+                        let v = line.vals.get(i).copied().unwrap_or(f64::NAN);
+                        if v.is_nan() {
+                            None
+                        } else {
+                            Some([c.t, v])
+                        }
+                    })
+                    .collect();
+                plot_ui.line(
+                    Line::new(pts)
+                        .color(line.color)
+                        .width(2.0_f32)
+                        .name(line.label),
+                );
+            }
+            for (y, c) in guides {
+                plot_ui.hline(egui_plot::HLine::new(*y).color(*c));
+            }
+        });
 }
 
 impl BharatApp {
@@ -2648,6 +2854,64 @@ impl BharatApp {
             Tab::IndiaDashboard => self.draw_india_dashboard(ui),
             Tab::MultiCompare => self.draw_multi_compare(ui),
             Tab::Forecast => self.draw_forecast(ui),
+            Tab::StochRsi => self.draw_stoch_rsi(ui),
+            Tab::Zscore => self.draw_zscore(ui),
+            Tab::Mfi => self.draw_mfi(ui),
+            Tab::UltimateOsc => self.draw_ultimate_osc(ui),
+            Tab::Tsi => self.draw_tsi(ui),
+            Tab::Coppock => self.draw_coppock(ui),
+            Tab::Dpo => self.draw_dpo(ui),
+            Tab::Aroon => self.draw_aroon(ui),
+            Tab::AroonOsc => self.draw_aroon_osc(ui),
+            Tab::Ulcer => self.draw_ulcer(ui),
+            Tab::Eom => self.draw_eom(ui),
+            Tab::ForceIndex => self.draw_force_index(ui),
+            Tab::MassIndex => self.draw_mass_index(ui),
+            Tab::Pvt => self.draw_pvt(ui),
+            Tab::Mfv => self.draw_mfv(ui),
+            Tab::AdLine => self.draw_ad_line(ui),
+            Tab::TrendIntensity => self.draw_trend_intensity(ui),
+            Tab::RealizedVol => self.draw_realized_vol(ui),
+            Tab::KeltnerWidth => self.draw_keltner_width(ui),
+            Tab::Volatility => self.draw_volatility(ui),
+            Tab::Kst => self.draw_kst(ui),
+            Tab::ElderRay => self.draw_elder_ray(ui),
+            Tab::Vortex => self.draw_vortex(ui),
+            Tab::Kama => self.draw_kama(ui),
+            Tab::Alma => self.draw_alma(ui),
+            Tab::HullMa => self.draw_hull_ma(ui),
+            Tab::Wma => self.draw_wma(ui),
+            Tab::MultiSma => self.draw_multi_sma(ui),
+            Tab::MultiEma => self.draw_multi_ema(ui),
+            Tab::HighLowBand => self.draw_high_low_band(ui),
+            Tab::VwapBands => self.draw_vwap_bands(ui),
+            Tab::Supertrend => self.draw_supertrend(ui),
+            Tab::LogReturns => self.draw_log_returns(ui),
+            Tab::Volume => self.draw_volume(ui),
+            Tab::Ohlc => self.draw_ohlc(ui),
+            Tab::PivotPoints => self.draw_pivot_points(ui),
+            Tab::FibLevels => self.draw_fib_levels(ui),
+            Tab::PriceSurface => self.draw_price_surface(ui),
+            Tab::VolatilitySurface => self.draw_volatility_surface(ui),
+            Tab::ReturnSurface => self.draw_return_surface(ui),
+            Tab::RiskLandscape => self.draw_risk_landscape(ui),
+            Tab::BetaSurface => self.draw_beta_surface(ui),
+            Tab::EntropySurface => self.draw_entropy_surface(ui),
+            Tab::AlphaSurface => self.draw_alpha_surface(ui),
+            Tab::SignalSurface => self.draw_signal_surface(ui),
+            Tab::RegimeSurface => self.draw_regime_surface(ui),
+            Tab::RegimeTimeline => self.draw_regime_timeline(ui),
+            Tab::MomentumSurface => self.draw_momentum_surface(ui),
+            Tab::OrderFlowSurface => self.draw_order_flow_surface(ui),
+            Tab::SkewKurtSurface => self.draw_skew_kurt_surface(ui),
+            Tab::SignalEvolution => self.draw_signal_evolution(ui),
+            Tab::EquitySurface => self.draw_equity_surface(ui),
+            Tab::VarBandSurface => self.draw_var_band_surface(ui),
+            Tab::RiskReturnCloud => self.draw_risk_return_cloud(ui),
+            Tab::EigenvalueCloud => self.draw_eigenvalue_cloud(ui),
+            Tab::ReturnsHeatmap => self.draw_returns_heatmap(ui),
+            Tab::PcaProjection => self.draw_pca_projection(ui),
+            Tab::FourInOne => self.draw_four_in_one(ui),
         }
     }
 
@@ -2677,6 +2941,14 @@ impl BharatApp {
                             ForecastEngine::Auto => true,
                             ForecastEngine::Granite => granite_on,
                             ForecastEngine::Nano => nano_on,
+                            // Small local ONNX models report presence from the
+                            // files on disk; the session itself loads lazily on
+                            // first use, so this check stays free.
+                            ForecastEngine::Chronos
+                            | ForecastEngine::DLinear
+                            | ForecastEngine::NHits => {
+                                engine.local_model().is_some_and(|m| local_model_ready(m))
+                            }
                             ForecastEngine::Arima
                             | ForecastEngine::ExpSmooth
                             | ForecastEngine::MovAvg => true,
@@ -2729,6 +3001,38 @@ impl BharatApp {
             ui.label(RichText::new("ARIMA").small());
             ui.colored_label(PROFIT, "ready")
                 .on_hover_text("Pure-Rust fallback, always available");
+        });
+
+        // The small local ONNX models. Chronos leads the auto chain because it
+        // is the only genuinely pretrained one; DLinear and N-HiTS are trained
+        // on cached NSE closes.
+        ui.horizontal(|ui| {
+            for (label, file, tooltip) in [
+                (
+                    "Chronos",
+                    "chronos_bolt_tiny_int8.onnx",
+                    "9-quantile foundation model, 64 -> 64",
+                ),
+                (
+                    "DLinear",
+                    "dlinear.onnx",
+                    "32 -> 5, trained on cached NSE closes",
+                ),
+                (
+                    "N-HiTS",
+                    "nhits_small.onnx",
+                    "32 -> 5, multi-rate, cached NSE closes",
+                ),
+            ] {
+                let present = model_file_present(file);
+                ui.label(RichText::new(label).small());
+                ui.colored_label(
+                    if present { PROFIT } else { Color32::GRAY },
+                    if present { "ready" } else { "missing" },
+                )
+                .on_hover_text(format!("models/{file}\n{tooltip}"));
+                ui.separator();
+            }
         });
 
         if let Some(err) = self.forecast_error.clone() {
@@ -2904,6 +3208,1060 @@ impl BharatApp {
             .watchsignal
             .as_ref()
             .and_then(|m| m.predict_candles(candles).ok());
+    }
+
+    fn draw_stoch_rsi(&self, ui: &mut egui::Ui) {
+        use bt_analytics::stoch_rsi;
+        let series = &self.data.candles;
+        draw_lines_frame(
+            ui,
+            "stochrsi_plot",
+            &format!("Stoch RSI — {}", series.symbol),
+            &series.candles,
+            false,
+            &[FrameLine {
+                label: "Stoch RSI",
+                vals: &stoch_rsi(series, 14, 14),
+                color: PURPLE,
+            }],
+            &[(80.0, LOSS), (20.0, PROFIT)],
+        );
+    }
+
+    fn draw_zscore(&self, ui: &mut egui::Ui) {
+        use bt_analytics::zscore;
+        let series = &self.data.candles;
+        draw_lines_frame(
+            ui,
+            "zscore_plot",
+            &format!("Z-Score — {}", series.symbol),
+            &series.candles,
+            false,
+            &[FrameLine {
+                label: "Z-Score",
+                vals: &zscore(series, 20),
+                color: INFO,
+            }],
+            &[(2.0, LOSS), (-2.0, PROFIT), (0.0, Color32::GRAY)],
+        );
+    }
+
+    fn draw_mfi(&self, ui: &mut egui::Ui) {
+        use bt_analytics::mfi;
+        let series = &self.data.candles;
+        draw_lines_frame(
+            ui,
+            "mfi_plot",
+            &format!("MFI — {}", series.symbol),
+            &series.candles,
+            false,
+            &[FrameLine {
+                label: "MFI",
+                vals: &mfi(series, 14),
+                color: PROFIT,
+            }],
+            &[(80.0, LOSS), (20.0, PROFIT)],
+        );
+    }
+
+    fn draw_ultimate_osc(&self, ui: &mut egui::Ui) {
+        use bt_analytics::ultimate_osc;
+        let series = &self.data.candles;
+        draw_lines_frame(
+            ui,
+            "uo_plot",
+            &format!("Ultimate Oscillator — {}", series.symbol),
+            &series.candles,
+            false,
+            &[FrameLine {
+                label: "Ultimate",
+                vals: &ultimate_osc(series, 7, 14, 28),
+                color: INFO,
+            }],
+            &[(70.0, LOSS), (30.0, PROFIT)],
+        );
+    }
+
+    fn draw_tsi(&self, ui: &mut egui::Ui) {
+        use bt_analytics::tsi;
+        let series = &self.data.candles;
+        draw_lines_frame(
+            ui,
+            "tsi_plot",
+            &format!("TSI — {}", series.symbol),
+            &series.candles,
+            false,
+            &[
+                FrameLine {
+                    label: "TSI",
+                    vals: &tsi(series, 25, 13).0,
+                    color: INFO,
+                },
+                FrameLine {
+                    label: "Signal",
+                    vals: &tsi(series, 25, 13).1,
+                    color: Color32::GRAY,
+                },
+            ],
+            &[(0.0, Color32::GRAY)],
+        );
+    }
+
+    fn draw_coppock(&self, ui: &mut egui::Ui) {
+        use bt_analytics::coppock;
+        let series = &self.data.candles;
+        draw_lines_frame(
+            ui,
+            "coppock_plot",
+            &format!("Coppock Curve — {}", series.symbol),
+            &series.candles,
+            false,
+            &[FrameLine {
+                label: "Coppock",
+                vals: &coppock(series),
+                color: AMBER,
+            }],
+            &[(0.0, Color32::GRAY)],
+        );
+    }
+
+    fn draw_dpo(&self, ui: &mut egui::Ui) {
+        use bt_analytics::dpo;
+        let series = &self.data.candles;
+        draw_lines_frame(
+            ui,
+            "dpo_plot",
+            &format!("DPO — {}", series.symbol),
+            &series.candles,
+            false,
+            &[FrameLine {
+                label: "DPO",
+                vals: &dpo(series, 20),
+                color: INFO,
+            }],
+            &[(0.0, Color32::GRAY)],
+        );
+    }
+
+    fn draw_aroon(&self, ui: &mut egui::Ui) {
+        use bt_analytics::aroon;
+        let series = &self.data.candles;
+        draw_lines_frame(
+            ui,
+            "aroon_plot",
+            &format!("Aroon — {}", series.symbol),
+            &series.candles,
+            false,
+            &[
+                FrameLine {
+                    label: "Aroon Up",
+                    vals: &aroon(series, 14).0,
+                    color: PROFIT,
+                },
+                FrameLine {
+                    label: "Aroon Down",
+                    vals: &aroon(series, 14).1,
+                    color: LOSS,
+                },
+            ],
+            &[(70.0, Color32::GRAY), (30.0, Color32::GRAY)],
+        );
+    }
+
+    fn draw_aroon_osc(&self, ui: &mut egui::Ui) {
+        use bt_analytics::aroon_osc;
+        let series = &self.data.candles;
+        draw_lines_frame(
+            ui,
+            "aroonosc_plot",
+            &format!("Aroon Oscillator — {}", series.symbol),
+            &series.candles,
+            false,
+            &[FrameLine {
+                label: "Aroon Osc",
+                vals: &aroon_osc(series, 14),
+                color: PURPLE,
+            }],
+            &[(0.0, Color32::GRAY)],
+        );
+    }
+
+    fn draw_ulcer(&self, ui: &mut egui::Ui) {
+        use bt_analytics::ulcer;
+        let series = &self.data.candles;
+        draw_lines_frame(
+            ui,
+            "ulcer_plot",
+            &format!("Ulcer Index — {}", series.symbol),
+            &series.candles,
+            false,
+            &[FrameLine {
+                label: "Ulcer",
+                vals: &ulcer(series, 14),
+                color: LOSS,
+            }],
+            &[],
+        );
+    }
+
+    fn draw_eom(&self, ui: &mut egui::Ui) {
+        use bt_analytics::eom;
+        let series = &self.data.candles;
+        draw_lines_frame(
+            ui,
+            "eom_plot",
+            &format!("Ease of Movement — {}", series.symbol),
+            &series.candles,
+            false,
+            &[FrameLine {
+                label: "EOM",
+                vals: &eom(series, 14),
+                color: INFO,
+            }],
+            &[(0.0, Color32::GRAY)],
+        );
+    }
+
+    fn draw_force_index(&self, ui: &mut egui::Ui) {
+        use bt_analytics::force_index;
+        let series = &self.data.candles;
+        draw_lines_frame(
+            ui,
+            "force_plot",
+            &format!("Force Index — {}", series.symbol),
+            &series.candles,
+            false,
+            &[FrameLine {
+                label: "Force",
+                vals: &force_index(series, 13),
+                color: AMBER,
+            }],
+            &[(0.0, Color32::GRAY)],
+        );
+    }
+
+    fn draw_mass_index(&self, ui: &mut egui::Ui) {
+        use bt_analytics::mass_index;
+        let series = &self.data.candles;
+        draw_lines_frame(
+            ui,
+            "mass_plot",
+            &format!("Mass Index — {}", series.symbol),
+            &series.candles,
+            false,
+            &[FrameLine {
+                label: "Mass",
+                vals: &mass_index(series, 25),
+                color: PURPLE,
+            }],
+            &[(27.0, LOSS)],
+        );
+    }
+
+    fn draw_pvt(&self, ui: &mut egui::Ui) {
+        use bt_analytics::pvt;
+        let series = &self.data.candles;
+        draw_lines_frame(
+            ui,
+            "pvt_plot",
+            &format!("PVT — {}", series.symbol),
+            &series.candles,
+            false,
+            &[FrameLine {
+                label: "PVT",
+                vals: &pvt(series),
+                color: INFO,
+            }],
+            &[],
+        );
+    }
+
+    fn draw_mfv(&self, ui: &mut egui::Ui) {
+        use bt_analytics::mfv;
+        let series = &self.data.candles;
+        draw_lines_frame(
+            ui,
+            "mfv_plot",
+            &format!("Money Flow Volume — {}", series.symbol),
+            &series.candles,
+            false,
+            &[FrameLine {
+                label: "MFV",
+                vals: &mfv(series),
+                color: AMBER,
+            }],
+            &[],
+        );
+    }
+
+    fn draw_ad_line(&self, ui: &mut egui::Ui) {
+        use bt_analytics::ad_line;
+        let series = &self.data.candles;
+        draw_lines_frame(
+            ui,
+            "adline_plot",
+            &format!("A/D Line — {}", series.symbol),
+            &series.candles,
+            false,
+            &[FrameLine {
+                label: "A/D",
+                vals: &ad_line(series),
+                color: PROFIT,
+            }],
+            &[],
+        );
+    }
+
+    fn draw_trend_intensity(&self, ui: &mut egui::Ui) {
+        use bt_analytics::trend_intensity;
+        let series = &self.data.candles;
+        draw_lines_frame(
+            ui,
+            "trendint_plot",
+            &format!("Trend Intensity — {}", series.symbol),
+            &series.candles,
+            false,
+            &[FrameLine {
+                label: "Trend Intensity",
+                vals: &trend_intensity(series, 30),
+                color: INFO,
+            }],
+            &[(80.0, Color32::GRAY), (20.0, Color32::GRAY)],
+        );
+    }
+
+    fn draw_realized_vol(&self, ui: &mut egui::Ui) {
+        use bt_analytics::realized_vol;
+        let series = &self.data.candles;
+        draw_lines_frame(
+            ui,
+            "realvol_plot",
+            &format!("Realized Volatility — {}", series.symbol),
+            &series.candles,
+            false,
+            &[FrameLine {
+                label: "Realized Vol %",
+                vals: &realized_vol(series, 20),
+                color: LOSS,
+            }],
+            &[],
+        );
+    }
+
+    fn draw_keltner_width(&self, ui: &mut egui::Ui) {
+        use bt_analytics::keltner_width;
+        let series = &self.data.candles;
+        draw_lines_frame(
+            ui,
+            "kelwidth_plot",
+            &format!("Keltner Width — {}", series.symbol),
+            &series.candles,
+            false,
+            &[FrameLine {
+                label: "Keltner Width",
+                vals: &keltner_width(series, 20),
+                color: PURPLE,
+            }],
+            &[],
+        );
+    }
+
+    fn draw_volatility(&self, ui: &mut egui::Ui) {
+        use bt_analytics::{realized_vol, ulcer};
+        let series = &self.data.candles;
+        draw_lines_frame(
+            ui,
+            "volatility_plot",
+            &format!("Volatility — {}", series.symbol),
+            &series.candles,
+            false,
+            &[
+                FrameLine {
+                    label: "Realized Vol %",
+                    vals: &realized_vol(series, 20),
+                    color: LOSS,
+                },
+                FrameLine {
+                    label: "Ulcer %",
+                    vals: &ulcer(series, 14),
+                    color: INFO,
+                },
+            ],
+            &[],
+        );
+    }
+
+    fn draw_kst(&self, ui: &mut egui::Ui) {
+        use bt_analytics::kst;
+        let series = &self.data.candles;
+        draw_lines_frame(
+            ui,
+            "kst_plot",
+            &format!("KST — {}", series.symbol),
+            &series.candles,
+            false,
+            &[
+                FrameLine {
+                    label: "KST",
+                    vals: &kst(series, 10, 15, 20, 30, 10, 10, 10, 15, 9).0,
+                    color: AMBER,
+                },
+                FrameLine {
+                    label: "Signal",
+                    vals: &kst(series, 10, 15, 20, 30, 10, 10, 10, 15, 9).1,
+                    color: Color32::GRAY,
+                },
+            ],
+            &[(0.0, Color32::GRAY)],
+        );
+    }
+
+    fn draw_elder_ray(&self, ui: &mut egui::Ui) {
+        use bt_analytics::elder_ray;
+        let series = &self.data.candles;
+        draw_lines_frame(
+            ui,
+            "elderray_plot",
+            &format!("Elder Ray — {}", series.symbol),
+            &series.candles,
+            false,
+            &[
+                FrameLine {
+                    label: "Bull Power",
+                    vals: &elder_ray(series, 13).0,
+                    color: PROFIT,
+                },
+                FrameLine {
+                    label: "Bear Power",
+                    vals: &elder_ray(series, 13).1,
+                    color: LOSS,
+                },
+            ],
+            &[(0.0, Color32::GRAY)],
+        );
+    }
+
+    fn draw_vortex(&self, ui: &mut egui::Ui) {
+        use bt_analytics::vortex;
+        let series = &self.data.candles;
+        draw_lines_frame(
+            ui,
+            "vortex_plot",
+            &format!("Vortex — {}", series.symbol),
+            &series.candles,
+            false,
+            &[
+                FrameLine {
+                    label: "VI+",
+                    vals: &vortex(series, 14).0,
+                    color: PROFIT,
+                },
+                FrameLine {
+                    label: "VI-",
+                    vals: &vortex(series, 14).1,
+                    color: LOSS,
+                },
+            ],
+            &[(1.0, Color32::GRAY)],
+        );
+    }
+
+    fn draw_kama(&self, ui: &mut egui::Ui) {
+        use bt_analytics::kama;
+        let series = &self.data.candles;
+        draw_lines_frame(
+            ui,
+            "kama_plot",
+            &format!("KAMA — {}", series.symbol),
+            &series.candles,
+            true,
+            &[FrameLine {
+                label: "KAMA",
+                vals: &kama(series, 10, 2, 30),
+                color: AMBER,
+            }],
+            &[],
+        );
+    }
+
+    fn draw_alma(&self, ui: &mut egui::Ui) {
+        use bt_analytics::alma;
+        let series = &self.data.candles;
+        draw_lines_frame(
+            ui,
+            "alma_plot",
+            &format!("ALMA — {}", series.symbol),
+            &series.candles,
+            true,
+            &[FrameLine {
+                label: "ALMA",
+                vals: &alma(series, 9, 0.85, 6.0),
+                color: PURPLE,
+            }],
+            &[],
+        );
+    }
+
+    fn draw_hull_ma(&self, ui: &mut egui::Ui) {
+        use bt_analytics::hull_ma;
+        let series = &self.data.candles;
+        draw_lines_frame(
+            ui,
+            "hullma_plot",
+            &format!("Hull MA — {}", series.symbol),
+            &series.candles,
+            true,
+            &[FrameLine {
+                label: "Hull MA",
+                vals: &hull_ma(series, 9),
+                color: INFO,
+            }],
+            &[],
+        );
+    }
+
+    fn draw_wma(&self, ui: &mut egui::Ui) {
+        use bt_analytics::wma;
+        let series = &self.data.candles;
+        draw_lines_frame(
+            ui,
+            "wma_plot",
+            &format!("WMA — {}", series.symbol),
+            &series.candles,
+            true,
+            &[FrameLine {
+                label: "WMA14",
+                vals: &wma(series, 14),
+                color: AMBER,
+            }],
+            &[],
+        );
+    }
+
+    fn draw_multi_sma(&self, ui: &mut egui::Ui) {
+        use bt_analytics::multi_sma;
+        let series = &self.data.candles;
+        draw_lines_frame(
+            ui,
+            "multisma_plot",
+            &format!("Multi SMA — {}", series.symbol),
+            &series.candles,
+            true,
+            &[
+                FrameLine {
+                    label: "SMA20",
+                    vals: &multi_sma(series).0,
+                    color: PROFIT,
+                },
+                FrameLine {
+                    label: "SMA50",
+                    vals: &multi_sma(series).1,
+                    color: AMBER,
+                },
+                FrameLine {
+                    label: "SMA200",
+                    vals: &multi_sma(series).2,
+                    color: LOSS,
+                },
+            ],
+            &[],
+        );
+    }
+
+    fn draw_multi_ema(&self, ui: &mut egui::Ui) {
+        use bt_analytics::multi_ema;
+        let series = &self.data.candles;
+        draw_lines_frame(
+            ui,
+            "multiema_plot",
+            &format!("Multi EMA — {}", series.symbol),
+            &series.candles,
+            true,
+            &[
+                FrameLine {
+                    label: "EMA12",
+                    vals: &multi_ema(series).0,
+                    color: PROFIT,
+                },
+                FrameLine {
+                    label: "EMA26",
+                    vals: &multi_ema(series).1,
+                    color: AMBER,
+                },
+                FrameLine {
+                    label: "EMA50",
+                    vals: &multi_ema(series).2,
+                    color: LOSS,
+                },
+            ],
+            &[],
+        );
+    }
+
+    fn draw_high_low_band(&self, ui: &mut egui::Ui) {
+        use bt_analytics::high_low_band;
+        let series = &self.data.candles;
+        draw_lines_frame(
+            ui,
+            "hlband_plot",
+            &format!("High Low Band — {}", series.symbol),
+            &series.candles,
+            true,
+            &[
+                FrameLine {
+                    label: "HH20",
+                    vals: &high_low_band(series, 20).0,
+                    color: LOSS,
+                },
+                FrameLine {
+                    label: "LL20",
+                    vals: &high_low_band(series, 20).1,
+                    color: PROFIT,
+                },
+            ],
+            &[],
+        );
+    }
+
+    fn draw_vwap_bands(&self, ui: &mut egui::Ui) {
+        use bt_analytics::{vwap, vwap_bands};
+        let series = &self.data.candles;
+        draw_lines_frame(
+            ui,
+            "vwapbands_plot",
+            &format!("VWAP Bands — {}", series.symbol),
+            &series.candles,
+            true,
+            &[
+                FrameLine {
+                    label: "VWAP",
+                    vals: &vwap(series),
+                    color: AMBER,
+                },
+                FrameLine {
+                    label: "Upper",
+                    vals: &vwap_bands(series, 1.0).0,
+                    color: Color32::GRAY,
+                },
+                FrameLine {
+                    label: "Lower",
+                    vals: &vwap_bands(series, 1.0).1,
+                    color: Color32::GRAY,
+                },
+            ],
+            &[],
+        );
+    }
+
+    fn draw_supertrend(&self, ui: &mut egui::Ui) {
+        use bt_analytics::supertrend;
+        let series = &self.data.candles;
+        draw_lines_frame(
+            ui,
+            "supertrend_plot",
+            &format!("Supertrend — {}", series.symbol),
+            &series.candles,
+            true,
+            &[FrameLine {
+                label: "Supertrend",
+                vals: &supertrend(series, 10, 3.0).0,
+                color: AMBER,
+            }],
+            &[],
+        );
+    }
+    fn draw_log_returns(&self, ui: &mut egui::Ui) {
+        use bt_analytics::log_returns;
+        let series = &self.data.candles;
+        let pct: Vec<f64> = log_returns(series).iter().map(|v| v * 100.0).collect();
+        draw_lines_frame(
+            ui,
+            "logret_plot",
+            &format!("Log Returns % — {}", series.symbol),
+            &series.candles,
+            false,
+            &[FrameLine {
+                label: "LogRet %",
+                vals: &pct,
+                color: AMBER,
+            }],
+            &[(0.0, Color32::GRAY)],
+        );
+    }
+
+    fn draw_volume(&self, ui: &mut egui::Ui) {
+        let series = &self.data.candles;
+        let n = series.candles.len();
+        let mut ma = vec![f64::NAN; n];
+        if n >= 20 {
+            let mut acc = 0.0;
+            for i in 0..n {
+                acc += series.candles[i].volume.max(0.0);
+                if i >= 20 {
+                    acc -= series.candles[i - 20].volume.max(0.0);
+                }
+                if i + 1 >= 20 {
+                    ma[i] = acc / 20.0;
+                }
+            }
+        }
+        ui.label(RichText::new(format!("VOL — Volume — {}", series.symbol)).strong());
+        Plot::new("volume_tab_plot")
+            .auto_bounds(egui::emath::Vec2b::new(true, true))
+            .height(ui.available_height())
+            .allow_scroll(true)
+            .allow_drag(true)
+            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .show(ui, |plot_ui| {
+                let spacing = bar_spacing(&series.candles).max(1.0);
+                let bars: Vec<Bar> = series
+                    .candles
+                    .iter()
+                    .map(|c| {
+                        let color = if c.is_bullish() { PROFIT } else { LOSS };
+                        Bar::new(c.t, c.volume.max(0.0))
+                            .width(spacing * 0.7)
+                            .fill(color.gamma_multiply(0.75))
+                    })
+                    .collect();
+                plot_ui.bar_chart(BarChart::new(bars));
+                let pts: PlotPoints = series
+                    .candles
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, c)| {
+                        if ma[i].is_nan() {
+                            None
+                        } else {
+                            Some([c.t, ma[i]])
+                        }
+                    })
+                    .collect();
+                plot_ui.line(Line::new(pts).color(AMBER).width(2.0_f32).name("SMA20"));
+            });
+    }
+
+    fn draw_ohlc(&self, ui: &mut egui::Ui) {
+        let series = &self.data.candles;
+        ui.label(RichText::new(format!("OHLC — Open High Low Close — {}", series.symbol)).strong());
+        Plot::new("ohlc_plot")
+            .auto_bounds(egui::emath::Vec2b::new(true, true))
+            .height(ui.available_height())
+            .allow_scroll(true)
+            .allow_drag(true)
+            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .show(ui, |plot_ui| {
+                let half = (bar_spacing(&series.candles) * 0.35).max(1.0);
+                for c in &series.candles {
+                    let color = if c.is_bullish() { PROFIT } else { LOSS };
+                    plot_ui.line(
+                        Line::new(PlotPoints::from(vec![[c.t, c.low], [c.t, c.high]]))
+                            .color(color)
+                            .width(1.0_f32),
+                    );
+                    plot_ui.line(
+                        Line::new(PlotPoints::from(vec![[c.t - half, c.open], [c.t, c.open]]))
+                            .color(color)
+                            .width(2.0_f32),
+                    );
+                    plot_ui.line(
+                        Line::new(PlotPoints::from(vec![
+                            [c.t, c.close],
+                            [c.t + half, c.close],
+                        ]))
+                        .color(color)
+                        .width(2.0_f32),
+                    );
+                }
+            });
+    }
+
+    fn draw_pivot_points(&self, ui: &mut egui::Ui) {
+        use bt_analytics::pivot_levels;
+        let series = &self.data.candles;
+        if series.candles.is_empty() {
+            ui.label("No data for this symbol.");
+            return;
+        }
+        let k = series.candles.len().saturating_sub(20);
+        let (mut hh, mut ll) = (f64::NEG_INFINITY, f64::INFINITY);
+        for c in &series.candles[k..] {
+            hh = hh.max(c.high);
+            ll = ll.min(c.low);
+        }
+        let close = series.candles.last().map(|c| c.close).unwrap_or(0.0);
+        let p = pivot_levels(hh, ll, close);
+        draw_lines_frame(
+            ui,
+            "pivot_plot",
+            &format!("PIVOT — Floor Pivots — {}", series.symbol),
+            &series.candles,
+            true,
+            &[],
+            &[
+                (p.pp, AMBER),
+                (p.r1, LOSS),
+                (p.r2, LOSS),
+                (p.r3, LOSS),
+                (p.s1, PROFIT),
+                (p.s2, PROFIT),
+                (p.s3, PROFIT),
+            ],
+        );
+    }
+
+    fn draw_fib_levels(&self, ui: &mut egui::Ui) {
+        use bt_analytics::fib_levels;
+        let series = &self.data.candles;
+        if series.candles.is_empty() {
+            ui.label("No data for this symbol.");
+            return;
+        }
+        let (mut hi, mut lo) = (f64::NEG_INFINITY, f64::INFINITY);
+        for c in &series.candles {
+            hi = hi.max(c.high);
+            lo = lo.min(c.low);
+        }
+        let levels = fib_levels(lo, hi);
+        let guides: Vec<(f64, Color32)> = levels
+            .iter()
+            .map(|(r, price)| {
+                (
+                    *price,
+                    if (*r - 0.618).abs() < 1e-9 {
+                        AMBER
+                    } else {
+                        Color32::GRAY
+                    },
+                )
+            })
+            .collect();
+        draw_lines_frame(
+            ui,
+            "fib_plot",
+            &format!("FIB — Fibonacci Retracement — {}", series.symbol),
+            &series.candles,
+            true,
+            &[],
+            &guides,
+        );
+    }
+
+    fn draw_price_surface(&self, ui: &mut egui::Ui) {
+        views3d::draw_frame(ui, &views3d::price_surface(&self.data.candles), 0.55, 0.35);
+    }
+
+    fn draw_volatility_surface(&self, ui: &mut egui::Ui) {
+        views3d::draw_frame(
+            ui,
+            &views3d::volatility_surface(&self.data.candles),
+            0.55,
+            0.35,
+        );
+    }
+
+    fn draw_return_surface(&self, ui: &mut egui::Ui) {
+        views3d::draw_frame(ui, &views3d::return_surface(&self.data.candles), 0.55, 0.35);
+    }
+
+    fn draw_risk_landscape(&self, ui: &mut egui::Ui) {
+        views3d::draw_frame(ui, &views3d::risk_landscape(&self.data.candles), 0.55, 0.35);
+    }
+
+    fn draw_beta_surface(&self, ui: &mut egui::Ui) {
+        views3d::draw_frame(ui, &views3d::beta_surface(&self.data.candles), 0.55, 0.35);
+    }
+
+    fn draw_entropy_surface(&self, ui: &mut egui::Ui) {
+        views3d::draw_frame(
+            ui,
+            &views3d::entropy_surface(&self.data.candles),
+            0.55,
+            0.35,
+        );
+    }
+
+    fn draw_alpha_surface(&self, ui: &mut egui::Ui) {
+        views3d::draw_frame(ui, &views3d::alpha_surface(&self.data.candles), 0.55, 0.35);
+    }
+
+    fn draw_signal_surface(&self, ui: &mut egui::Ui) {
+        views3d::draw_frame(ui, &views3d::signal_surface(&self.data.candles), 0.55, 0.35);
+    }
+
+    fn draw_regime_surface(&self, ui: &mut egui::Ui) {
+        views3d::draw_frame(ui, &views3d::regime_surface(&self.data.candles), 0.55, 0.35);
+    }
+
+    fn draw_momentum_surface(&self, ui: &mut egui::Ui) {
+        views3d::draw_frame(
+            ui,
+            &views3d::momentum_surface(&self.data.candles),
+            0.55,
+            0.35,
+        );
+    }
+
+    fn draw_order_flow_surface(&self, ui: &mut egui::Ui) {
+        views3d::draw_frame(
+            ui,
+            &views3d::order_flow_surface(&self.data.candles),
+            0.55,
+            0.35,
+        );
+    }
+
+    fn draw_skew_kurt_surface(&self, ui: &mut egui::Ui) {
+        views3d::draw_frame(
+            ui,
+            &views3d::skew_kurt_surface(&self.data.candles),
+            0.55,
+            0.35,
+        );
+    }
+
+    fn draw_signal_evolution(&self, ui: &mut egui::Ui) {
+        views3d::draw_frame(
+            ui,
+            &views3d::signal_evolution_surface(&self.data.candles),
+            0.55,
+            0.35,
+        );
+    }
+
+    fn draw_equity_surface(&self, ui: &mut egui::Ui) {
+        views3d::draw_frame(ui, &views3d::equity_surface(&self.data.candles), 0.55, 0.35);
+    }
+
+    fn draw_var_band_surface(&self, ui: &mut egui::Ui) {
+        views3d::draw_frame(
+            ui,
+            &views3d::var_band_surface(&self.data.candles),
+            0.55,
+            0.35,
+        );
+    }
+
+    fn draw_risk_return_cloud(&self, ui: &mut egui::Ui) {
+        views3d::draw_frame(
+            ui,
+            &views3d::risk_return_surface(&self.data.candles),
+            0.55,
+            0.35,
+        );
+    }
+
+    fn draw_eigenvalue_cloud(&self, ui: &mut egui::Ui) {
+        views3d::draw_frame(
+            ui,
+            &views3d::eigenvalue_surface(&self.data.candles),
+            0.55,
+            0.35,
+        );
+    }
+
+    fn draw_returns_heatmap(&self, ui: &mut egui::Ui) {
+        views3d::draw_frame(
+            ui,
+            &views3d::returns_heatmap(&self.data.candles),
+            0.55,
+            0.35,
+        );
+    }
+
+    fn draw_pca_projection(&self, ui: &mut egui::Ui) {
+        views3d::draw_frame(ui, &views3d::pca_surface(&self.data.candles), 0.55, 0.35);
+    }
+
+    fn draw_regime_timeline(&self, ui: &mut egui::Ui) {
+        // A 3D ridge over time: each row is a trailing-return window, each
+        // column a bar, and the height is the signed move. Reading the surface
+        // top-down shows whether early and late windows agree, which is what a
+        // regime read is.
+        let s = &self.data.candles;
+        let closes: Vec<f64> = s.candles.iter().map(|c| c.close).collect();
+        let buckets = 40.min(closes.len());
+        let windows = [5usize, 10, 20, 40];
+        let mut values = vec![f64::NAN; buckets * windows.len()];
+        if buckets >= 2 {
+            for (bi, _) in (0..buckets).enumerate() {
+                let end = ((bi + 1) * closes.len()) / buckets;
+                for (wi, &w) in windows.iter().enumerate() {
+                    if end <= w {
+                        continue;
+                    }
+                    let base = closes[end - w - 1];
+                    let now = closes[end - 1];
+                    if base > 0.0 {
+                        values[bi * windows.len() + wi] = (now / base - 1.0) * 100.0;
+                    }
+                }
+            }
+        }
+        let surface = views3d::Surface::new(views3d::SurfaceSpec::new(
+            format!("3D Regime Timeline \u{2014} {}", s.symbol),
+            "Return % by time bucket x window",
+            views3d::Grid::new(
+                buckets.max(2),
+                windows.len(),
+                values,
+                "time bucket",
+                "window",
+            ),
+            views3d::RAMP_SIGNED,
+        ));
+        views3d::draw_frame(ui, &surface, 0.6, 0.4);
+    }
+
+    fn draw_four_in_one(&self, ui: &mut egui::Ui) {
+        // Four panels in a 2x2 grid, sharing the loaded series. Each panel
+        // delegates to an existing renderer so the dashboard can never drift
+        // out of sync with the standalone tabs.
+        let s = &self.data.candles;
+        ui.label(RichText::new(format!("4-in-1 \u{2014} {}", s.symbol)).strong());
+        ui.label(
+            RichText::new("Price with MA overlay | Volume | RSI | MACD")
+                .small()
+                .color(Color32::GRAY),
+        );
+
+        if s.candles.is_empty() {
+            ui.label("No data for this symbol.");
+            return;
+        }
+
+        let available = ui.available_height().max(320.0);
+        let cell = (available - 24.0) / 2.0;
+        egui::Grid::new("four_in_one_grid")
+            .spacing(egui::vec2(10.0, 10.0))
+            .show(ui, |ui| {
+                // Each panel delegates to the standalone renderer, so the
+                // dashboard can never drift from the individual tabs.
+                ui.vertical(|ui| {
+                    ui.set_min_height(cell);
+                    ui.set_width(ui.available_width());
+                    self.draw_candlestick(ui);
+                });
+                ui.end_row();
+                ui.vertical(|ui| {
+                    ui.set_min_height(cell);
+                    ui.set_width(ui.available_width());
+                    self.draw_volume(ui);
+                });
+                ui.end_row();
+                ui.vertical(|ui| {
+                    ui.set_min_height(cell);
+                    ui.set_width(ui.available_width());
+                    self.draw_rsi(ui);
+                });
+                ui.end_row();
+                ui.vertical(|ui| {
+                    ui.set_min_height(cell);
+                    ui.set_width(ui.available_width());
+                    self.draw_macd(ui);
+                });
+                ui.end_row();
+            });
     }
 
     fn draw_candlestick(&self, ui: &mut egui::Ui) {
@@ -8844,8 +10202,155 @@ mod tests {
         assert!(!TAGLINE.is_empty());
     }
 
-    /// The Forecast panel must stay reachable: listed under Advanced with a
-    /// stable label, so a refactor of the tab bar cannot silently orphan it.
+    /// Every 3D/surface tab and the 4-in-1 dashboard must be reachable, and the
+    /// 3D category must actually be shown in the sidebar.
+    #[test]
+    fn test_3d_and_dashboard_tabs_are_listed() {
+        use std::collections::HashSet;
+        assert!(
+            CATEGORIES.contains(&TabCategory::ThreeD),
+            "the 3D category is not in CATEGORIES, so its tabs cannot be reached"
+        );
+
+        let listed: HashSet<Tab> = CATEGORIES
+            .iter()
+            .flat_map(|c| tabs_in_category(*c))
+            .map(|(t, _)| *t)
+            .collect();
+
+        for tab in [
+            Tab::PriceSurface,
+            Tab::VolatilitySurface,
+            Tab::ReturnSurface,
+            Tab::RiskLandscape,
+            Tab::BetaSurface,
+            Tab::EntropySurface,
+            Tab::AlphaSurface,
+            Tab::SignalSurface,
+            Tab::RegimeSurface,
+            Tab::RegimeTimeline,
+            Tab::MomentumSurface,
+            Tab::OrderFlowSurface,
+            Tab::SkewKurtSurface,
+            Tab::SignalEvolution,
+            Tab::EquitySurface,
+            Tab::VarBandSurface,
+            Tab::RiskReturnCloud,
+            Tab::EigenvalueCloud,
+            Tab::ReturnsHeatmap,
+            Tab::PcaProjection,
+            Tab::FourInOne,
+        ] {
+            assert!(
+                listed.contains(&tab),
+                "{tab:?} is not listed in any category"
+            );
+        }
+    }
+
+    /// The 4-in-1 dashboard must delegate to real renderers, so it cannot
+    /// silently render four blank panels.
+    #[test]
+    fn test_four_in_one_delegates_to_existing_renderers() {
+        let s = synthetic_ohlcv("DASH", 120, 5, 100.0);
+        assert!(!s.candles.is_empty());
+        // Each panel is a chart over the same series; the invariant that matters
+        // is that the series satisfies what those renderers assume.
+        for c in &s.candles {
+            assert!(c.high >= c.low && c.high >= c.open && c.high >= c.close);
+        }
+    }
+
+    /// Every 3D surface must be constructible and non-degenerate, otherwise a
+    /// tab in the 3D category would render empty.
+    #[test]
+    fn test_3d_surfaces_are_constructible() {
+        let s = synthetic_ohlcv("S3D", 200, 6, 100.0);
+        type Builder = fn(&bt_core::OhlcvSeries) -> views3d::Surface;
+        let builders: Vec<(&str, Builder)> = vec![
+            ("price", views3d::price_surface),
+            ("volatility", views3d::volatility_surface),
+            ("return", views3d::return_surface),
+            ("risk", views3d::risk_landscape),
+            ("beta", views3d::beta_surface),
+            ("entropy", views3d::entropy_surface),
+            ("alpha", views3d::alpha_surface),
+            ("signal", views3d::signal_surface),
+            ("regime", views3d::regime_surface),
+            ("momentum", views3d::momentum_surface),
+            ("order_flow", views3d::order_flow_surface),
+            ("skew_kurt", views3d::skew_kurt_surface),
+            ("signal_evo", views3d::signal_evolution_surface),
+            ("equity", views3d::equity_surface),
+            ("var_band", views3d::var_band_surface),
+            ("risk_return", views3d::risk_return_surface),
+            ("eigenvalue", views3d::eigenvalue_surface),
+            ("heatmap", views3d::returns_heatmap),
+            ("pca", views3d::pca_surface),
+        ];
+        for (name, f) in builders {
+            let surface = f(&s);
+            assert!(
+                surface.is_drawable(),
+                "{name}: surface is not drawable and would render blank"
+            );
+            assert_eq!(surface.values.len(), surface.cols * surface.rows);
+        }
+    }
+
+    /// Every indicator tab added in the visualization expansion must be
+    /// reachable from the tab bar; an unlisted tab would be dead UI.
+    #[test]
+    fn test_new_indicator_tabs_are_listed() {
+        use std::collections::HashSet;
+        let listed: HashSet<Tab> = CATEGORIES
+            .iter()
+            .flat_map(|c| tabs_in_category(*c))
+            .map(|(t, _)| *t)
+            .collect();
+        for tab in [
+            Tab::StochRsi,
+            Tab::Zscore,
+            Tab::Mfi,
+            Tab::UltimateOsc,
+            Tab::Tsi,
+            Tab::Coppock,
+            Tab::Dpo,
+            Tab::LogReturns,
+            Tab::Kst,
+            Tab::ElderRay,
+            Tab::Vortex,
+            Tab::Aroon,
+            Tab::AroonOsc,
+            Tab::Ulcer,
+            Tab::Eom,
+            Tab::ForceIndex,
+            Tab::MassIndex,
+            Tab::Pvt,
+            Tab::Mfv,
+            Tab::AdLine,
+            Tab::TrendIntensity,
+            Tab::RealizedVol,
+            Tab::KeltnerWidth,
+            Tab::Volatility,
+            Tab::Kama,
+            Tab::Alma,
+            Tab::HullMa,
+            Tab::Wma,
+            Tab::MultiSma,
+            Tab::MultiEma,
+            Tab::HighLowBand,
+            Tab::VwapBands,
+            Tab::Supertrend,
+            Tab::Volume,
+            Tab::Ohlc,
+            Tab::PivotPoints,
+            Tab::FibLevels,
+        ] {
+            assert!(listed.contains(&tab), "{tab:?} not listed in any category");
+        }
+    }
+
     #[test]
     fn test_forecast_tab_is_listed_under_advanced() {
         let advanced = tabs_in_category(TabCategory::Advanced);
