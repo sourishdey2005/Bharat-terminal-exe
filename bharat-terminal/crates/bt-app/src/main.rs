@@ -29,6 +29,8 @@ use bt_data::india;
 use bt_data::{symbol::COMPANY_LIST, DataService, Interval};
 use bt_viz::palette::Theme;
 
+#[cfg(test)]
+mod render_tests;
 mod views3d;
 
 const AMBER: Color32 = Color32::from_rgb(0xFF, 0xB0, 0x00);
@@ -2105,6 +2107,31 @@ fn draw_lines_frame(
         });
 }
 
+/// The 2x2 split arithmetic, factored out so it can be tested directly.
+///
+/// The dashboard used `Grid` + `set_min_height`, which does not work: those
+/// renderers size their plots from `ui.available_height()`, and inside a grid
+/// cell that still reports the whole remaining canvas, so the first panel ate
+/// the whole screen. Pinning each cell's rect is what fixes it, and this
+/// guards the rect math.
+fn four_in_one_cells(area: egui::Rect, top_offset: f32, gap: f32) -> [egui::Rect; 4] {
+    let top = area.min.y + top_offset;
+    let full_w = area.width();
+    let full_h = (area.max.y - top).max(240.0);
+    let cell_w = (full_w - gap) / 2.0;
+    let cell_h = (full_h - gap) / 2.0;
+    let at = |col: usize, row: usize| {
+        egui::Rect::from_min_size(
+            egui::pos2(
+                area.min.x + col as f32 * (cell_w + gap),
+                top + row as f32 * (cell_h + gap),
+            ),
+            egui::vec2(cell_w, cell_h),
+        )
+    };
+    [at(0, 0), at(1, 0), at(0, 1), at(1, 1)]
+}
+
 impl BharatApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let (tx, rx) = channel();
@@ -4048,129 +4075,79 @@ impl BharatApp {
     }
 
     fn draw_price_surface(&self, ui: &mut egui::Ui) {
-        views3d::draw_frame(ui, &views3d::price_surface(&self.data.candles), 0.55, 0.35);
+        views3d::draw_frame(ui, &views3d::price_surface(&self.data.candles));
     }
 
     fn draw_volatility_surface(&self, ui: &mut egui::Ui) {
-        views3d::draw_frame(
-            ui,
-            &views3d::volatility_surface(&self.data.candles),
-            0.55,
-            0.35,
-        );
+        views3d::draw_frame(ui, &views3d::volatility_surface(&self.data.candles));
     }
 
     fn draw_return_surface(&self, ui: &mut egui::Ui) {
-        views3d::draw_frame(ui, &views3d::return_surface(&self.data.candles), 0.55, 0.35);
+        views3d::draw_frame(ui, &views3d::return_surface(&self.data.candles));
     }
 
     fn draw_risk_landscape(&self, ui: &mut egui::Ui) {
-        views3d::draw_frame(ui, &views3d::risk_landscape(&self.data.candles), 0.55, 0.35);
+        views3d::draw_frame(ui, &views3d::risk_landscape(&self.data.candles));
     }
 
     fn draw_beta_surface(&self, ui: &mut egui::Ui) {
-        views3d::draw_frame(ui, &views3d::beta_surface(&self.data.candles), 0.55, 0.35);
+        views3d::draw_frame(ui, &views3d::beta_surface(&self.data.candles));
     }
 
     fn draw_entropy_surface(&self, ui: &mut egui::Ui) {
-        views3d::draw_frame(
-            ui,
-            &views3d::entropy_surface(&self.data.candles),
-            0.55,
-            0.35,
-        );
+        views3d::draw_frame(ui, &views3d::entropy_surface(&self.data.candles));
     }
 
     fn draw_alpha_surface(&self, ui: &mut egui::Ui) {
-        views3d::draw_frame(ui, &views3d::alpha_surface(&self.data.candles), 0.55, 0.35);
+        views3d::draw_frame(ui, &views3d::alpha_surface(&self.data.candles));
     }
 
     fn draw_signal_surface(&self, ui: &mut egui::Ui) {
-        views3d::draw_frame(ui, &views3d::signal_surface(&self.data.candles), 0.55, 0.35);
+        views3d::draw_frame(ui, &views3d::signal_surface(&self.data.candles));
     }
 
     fn draw_regime_surface(&self, ui: &mut egui::Ui) {
-        views3d::draw_frame(ui, &views3d::regime_surface(&self.data.candles), 0.55, 0.35);
+        views3d::draw_frame(ui, &views3d::regime_surface(&self.data.candles));
     }
 
     fn draw_momentum_surface(&self, ui: &mut egui::Ui) {
-        views3d::draw_frame(
-            ui,
-            &views3d::momentum_surface(&self.data.candles),
-            0.55,
-            0.35,
-        );
+        views3d::draw_frame(ui, &views3d::momentum_surface(&self.data.candles));
     }
 
     fn draw_order_flow_surface(&self, ui: &mut egui::Ui) {
-        views3d::draw_frame(
-            ui,
-            &views3d::order_flow_surface(&self.data.candles),
-            0.55,
-            0.35,
-        );
+        views3d::draw_frame(ui, &views3d::order_flow_surface(&self.data.candles));
     }
 
     fn draw_skew_kurt_surface(&self, ui: &mut egui::Ui) {
-        views3d::draw_frame(
-            ui,
-            &views3d::skew_kurt_surface(&self.data.candles),
-            0.55,
-            0.35,
-        );
+        views3d::draw_frame(ui, &views3d::skew_kurt_surface(&self.data.candles));
     }
 
     fn draw_signal_evolution(&self, ui: &mut egui::Ui) {
-        views3d::draw_frame(
-            ui,
-            &views3d::signal_evolution_surface(&self.data.candles),
-            0.55,
-            0.35,
-        );
+        views3d::draw_frame(ui, &views3d::signal_evolution_surface(&self.data.candles));
     }
 
     fn draw_equity_surface(&self, ui: &mut egui::Ui) {
-        views3d::draw_frame(ui, &views3d::equity_surface(&self.data.candles), 0.55, 0.35);
+        views3d::draw_frame(ui, &views3d::equity_surface(&self.data.candles));
     }
 
     fn draw_var_band_surface(&self, ui: &mut egui::Ui) {
-        views3d::draw_frame(
-            ui,
-            &views3d::var_band_surface(&self.data.candles),
-            0.55,
-            0.35,
-        );
+        views3d::draw_frame(ui, &views3d::var_band_surface(&self.data.candles));
     }
 
     fn draw_risk_return_cloud(&self, ui: &mut egui::Ui) {
-        views3d::draw_frame(
-            ui,
-            &views3d::risk_return_surface(&self.data.candles),
-            0.55,
-            0.35,
-        );
+        views3d::draw_frame(ui, &views3d::risk_return_surface(&self.data.candles));
     }
 
     fn draw_eigenvalue_cloud(&self, ui: &mut egui::Ui) {
-        views3d::draw_frame(
-            ui,
-            &views3d::eigenvalue_surface(&self.data.candles),
-            0.55,
-            0.35,
-        );
+        views3d::draw_frame(ui, &views3d::eigenvalue_surface(&self.data.candles));
     }
 
     fn draw_returns_heatmap(&self, ui: &mut egui::Ui) {
-        views3d::draw_frame(
-            ui,
-            &views3d::returns_heatmap(&self.data.candles),
-            0.55,
-            0.35,
-        );
+        views3d::draw_frame(ui, &views3d::returns_heatmap(&self.data.candles));
     }
 
     fn draw_pca_projection(&self, ui: &mut egui::Ui) {
-        views3d::draw_frame(ui, &views3d::pca_surface(&self.data.candles), 0.55, 0.35);
+        views3d::draw_frame(ui, &views3d::pca_surface(&self.data.candles));
     }
 
     fn draw_regime_timeline(&self, ui: &mut egui::Ui) {
@@ -4210,17 +4187,24 @@ impl BharatApp {
             ),
             views3d::RAMP_SIGNED,
         ));
-        views3d::draw_frame(ui, &surface, 0.6, 0.4);
+        views3d::draw_frame(ui, &surface);
     }
 
+    /// Four charts in a genuine 2x2 split of the available canvas.
+    ///
+    /// The layout is computed by dividing the available rect in two on each
+    /// axis and giving each cell a child `Ui` with a fixed `max_rect`. Delegating
+    /// to `Grid` + `set_min_height` does not work here: those renderers size
+    /// their plots from `ui.available_height()`, which inside a grid cell still
+    /// reports the whole remaining area, so the first panel consumed the entire
+    /// canvas and the other three were pushed off-screen. Pinning `max_rect`
+    /// makes `available_height()` return the cell height, which is what makes
+    /// the 2x2 split hold.
     fn draw_four_in_one(&self, ui: &mut egui::Ui) {
-        // Four panels in a 2x2 grid, sharing the loaded series. Each panel
-        // delegates to an existing renderer so the dashboard can never drift
-        // out of sync with the standalone tabs.
         let s = &self.data.candles;
         ui.label(RichText::new(format!("4-in-1 \u{2014} {}", s.symbol)).strong());
         ui.label(
-            RichText::new("Price with MA overlay | Volume | RSI | MACD")
+            RichText::new("Price | Volume | RSI | MACD \u{2014} drag to pan, scroll to zoom")
                 .small()
                 .color(Color32::GRAY),
         );
@@ -4230,38 +4214,38 @@ impl BharatApp {
             return;
         }
 
-        let available = ui.available_height().max(320.0);
-        let cell = (available - 24.0) / 2.0;
-        egui::Grid::new("four_in_one_grid")
-            .spacing(egui::vec2(10.0, 10.0))
-            .show(ui, |ui| {
-                // Each panel delegates to the standalone renderer, so the
-                // dashboard can never drift from the individual tabs.
-                ui.vertical(|ui| {
-                    ui.set_min_height(cell);
-                    ui.set_width(ui.available_width());
-                    self.draw_candlestick(ui);
-                });
-                ui.end_row();
-                ui.vertical(|ui| {
-                    ui.set_min_height(cell);
-                    ui.set_width(ui.available_width());
-                    self.draw_volume(ui);
-                });
-                ui.end_row();
-                ui.vertical(|ui| {
-                    ui.set_min_height(cell);
-                    ui.set_width(ui.available_width());
-                    self.draw_rsi(ui);
-                });
-                ui.end_row();
-                ui.vertical(|ui| {
-                    ui.set_min_height(cell);
-                    ui.set_width(ui.available_width());
-                    self.draw_macd(ui);
-                });
-                ui.end_row();
+        const GAP: f32 = 8.0;
+        const TOP_OFFSET: f32 = 40.0;
+        let area = ui.available_rect_before_wrap();
+        let cells = four_in_one_cells(area, TOP_OFFSET, GAP);
+
+        // (cell index, renderer) in reading order: price, volume, RSI, MACD.
+        let renderers: [fn(&Self, &mut egui::Ui); 4] = [
+            Self::draw_candlestick,
+            Self::draw_volume,
+            Self::draw_rsi,
+            Self::draw_macd,
+        ];
+
+        for (cell_rect, render) in cells.iter().zip(renderers) {
+            let cell_rect = *cell_rect;
+            // `allocate_ui_at_rect` pins the child's max rect, so
+            // `available_height()` inside the renderer reports the *cell* height
+            // rather than the whole canvas. That is what keeps the 2x2 split.
+            ui.allocate_ui_at_rect(cell_rect, |child| {
+                // A visible frame makes the four-section split obvious.
+                child.painter().rect_stroke(
+                    cell_rect,
+                    2.0,
+                    Stroke::new(1.0, Color32::from_gray(55)),
+                );
+                render(self, child);
             });
+        }
+
+        // Claim the full area so the parent layout does not reuse it.
+        let full_h = (area.max.y - (area.min.y + TOP_OFFSET)).max(240.0);
+        ui.allocate_space(egui::vec2(area.width(), full_h + TOP_OFFSET));
     }
 
     fn draw_candlestick(&self, ui: &mut egui::Ui) {
@@ -10258,6 +10242,72 @@ mod tests {
         // is that the series satisfies what those renderers assume.
         for c in &s.candles {
             assert!(c.high >= c.low && c.high >= c.open && c.high >= c.close);
+        }
+    }
+
+    #[test]
+    fn test_four_in_one_divides_the_canvas_into_four_non_overlapping_cells() {
+        let area = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1200.0, 800.0));
+        let cells = four_in_one_cells(area, 40.0, 8.0);
+
+        // All four must have real size.
+        for (i, c) in cells.iter().enumerate() {
+            assert!(c.width() > 100.0, "cell {i} is too narrow: {:?}", c.width());
+            assert!(
+                c.height() > 100.0,
+                "cell {i} is too short: {:?}",
+                c.height()
+            );
+        }
+
+        // No two cells may overlap, or a panel would cover another.
+        for i in 0..cells.len() {
+            for j in (i + 1)..cells.len() {
+                assert!(
+                    !cells[i].intersects(cells[j]),
+                    "cells {i} and {j} overlap: {:?} vs {:?}",
+                    cells[i],
+                    cells[j]
+                );
+            }
+        }
+
+        // The 2x2 must use the canvas: left column is left of the right column,
+        // and the top row is above the bottom row.
+        assert!(
+            cells[0].max.x < cells[1].min.x,
+            "top row is not side by side"
+        );
+        assert!(
+            cells[2].max.x < cells[3].min.x,
+            "bottom row is not side by side"
+        );
+        assert!(cells[0].max.y < cells[2].min.y, "rows are not stacked");
+        assert!(cells[1].max.y < cells[3].min.y, "rows are not stacked");
+
+        // Together the four cells must cover the space, minus the gaps.
+        let covered: f32 = cells.iter().map(|c| c.width() * c.height()).sum();
+        let full_h = (area.max.y - (area.min.y + 40.0)).max(240.0);
+        let total = area.width() * full_h;
+        let frac = covered / total;
+        assert!(
+            frac > 0.97,
+            "the four cells only cover {:.0}% of the canvas",
+            frac * 100.0
+        );
+    }
+
+    #[test]
+    fn test_four_in_one_cells_survive_a_tiny_canvas() {
+        // A minimised window must not produce negative or inverted cells.
+        let area = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(40.0, 40.0));
+        let cells = four_in_one_cells(area, 40.0, 8.0);
+        for (i, c) in cells.iter().enumerate() {
+            assert!(
+                c.width().is_finite() && c.height().is_finite(),
+                "cell {i} NaN"
+            );
+            assert!(c.width() > 0.0 && c.height() > 0.0, "cell {i} inverted");
         }
     }
 
