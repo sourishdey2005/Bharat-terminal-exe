@@ -20,10 +20,25 @@
 //!    (developer runs from the project root)
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
-/// Load the pinned ONNX Runtime exactly once per process (repeat calls are
-/// cheap no-ops). Returns the DLL path used, for diagnostics.
+/// The process-wide result of the one-time load.
+///
+/// `load_dynamic::init` is not safe to race: two threads calling
+/// `ort::init_from` concurrently can end up with different libraries bound to
+/// the same global slot, and the loser reports either a bogus version
+/// (`BadVersion 1.17.1`) or a missing `OrtGetApiBase`. Every engine is lazily
+/// loaded and tests run in parallel, so this has to be serialized rather than
+/// merely idempotent.
+static RUNTIME: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+
+/// Load the pinned ONNX Runtime exactly once per process. Returns the DLL path
+/// used, or the same error for every later caller.
 pub fn ensure_initialized() -> Result<PathBuf, String> {
+    RUNTIME.get_or_init(load_pinned).clone()
+}
+
+fn load_pinned() -> Result<PathBuf, String> {
     // Pin the search path *before* touching any ort API.
     //
     // `ort`'s lazy `setup_api` resolves the bare name `onnxruntime.dll` through
@@ -135,6 +150,17 @@ mod tests {
                 p.is_file(),
                 "ORT_DYLIB_PATH points at a missing file: {p:?}"
             );
+        }
+    }
+
+    #[test]
+    fn concurrent_callers_agree() {
+        let handles: Vec<_> = (0..16)
+            .map(|_| std::thread::spawn(|| ensure_initialized().map(|p| p.display().to_string())))
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        for r in &results {
+            assert_eq!(r, &results[0], "callers disagreed: {results:?}");
         }
     }
 }
