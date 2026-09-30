@@ -38,6 +38,39 @@ const PROFIT: Color32 = Color32::from_rgb(0x00, 0xFF, 0x88);
 const LOSS: Color32 = Color32::from_rgb(0xFF, 0x3B, 0x3B);
 const INFO: Color32 = Color32::from_rgb(0x00, 0xBF, 0xFF);
 const PURPLE: Color32 = Color32::from_rgb(0xBF, 0x5A, 0xFF);
+/// Extra hues so the forecast palette stays legible next to PROFIT/LOSS.
+const VIOLET: Color32 = Color32::from_rgb(0x7A, 0x6C, 0xFF);
+const TEAL: Color32 = Color32::from_rgb(0x2B, 0xE0, 0xC8);
+const ROSE: Color32 = Color32::from_rgb(0xFF, 0x6E, 0xB0);
+const LIME: Color32 = Color32::from_rgb(0xC3, 0xF0, 0x2E);
+
+/// Colour for a forecast engine's predicted line, keyed by the engine label the
+/// forecaster reports back.
+///
+/// History is always gray, so anything that is *not* gray on the forecast chart
+/// is a prediction. Giving every engine its own hue is what makes "which model
+/// produced this curve" readable at a glance, and it means switching engines
+/// repaints the predicted segment instead of leaving an identical amber line
+/// behind. Unknown/future engines fall back to `INFO` rather than borrowing
+/// another engine's colour, which would make two different models look like the
+/// same one.
+fn forecast_color(engine: &str) -> Color32 {
+    match engine {
+        "Chronos-Bolt Tiny (int8)" => AMBER,
+        "DLinear" => TEAL,
+        "N-HiTS (small)" => PURPLE,
+        "Granite TTM R2" => VIOLET,
+        "NanoForecast v0.5" => ROSE,
+        "ARIMA(1,1,1)" => INFO,
+        "Exp. smoothing (0.3)" => LIME,
+        "Moving average (5)" => PROFIT,
+        _ => INFO,
+    }
+}
+
+/// Colour the history tail is always drawn in, on every forecast chart. Neutral
+/// on purpose: a prediction must never be mistaken for an observed close.
+const HISTORY_COLOR: Color32 = Color32::from_gray(150);
 
 const DAY_SECS: f64 = 86400.0;
 
@@ -46,6 +79,11 @@ const DAY_SECS: f64 = 86400.0;
 /// renders its axis over whatever sits below it (the status bar, or the next
 /// panel in a multi-panel layout).
 const AXIS_H: f32 = 30.0;
+
+/// Smallest plot height a chart panel may be squeezed down to, and the largest,
+/// so a bogus measurement cannot produce an invisible or screen-filling plot.
+const MIN_PANEL_H: f32 = 60.0;
+const MAX_PANEL_H: f32 = 4000.0;
 
 /// Human-readable description of the engine behind the last forecast, used for
 /// the status-bar tooltip. Every engine in the chain is named explicitly so a
@@ -74,16 +112,39 @@ fn engine_tooltip(engine: &str) -> String {
 ///
 /// So the budget is the space between this panel's own chrome and the bottom of
 /// the region it is allowed to paint, with the axis strip reserved.
-fn panel_budget(ui: &egui::Ui) -> f32 {
-    let paint_bottom = ui.clip_rect().max.y;
+///
+/// The floor is taken from `max_rect()` *and* `clip_rect()`, whichever ends
+/// lower. Reading only `clip_rect()` was the 4-in-1 overlap bug:
+/// `allocate_ui_at_rect` pins `max_rect` but leaves `clip_rect` inherited from
+/// the CentralPanel, so a nested panel measured itself against the bottom of the
+/// whole window and painted straight through the cell below it. `max_rect` is
+/// the pinned cell, so the minimum of the two is the real floor.
+///
+/// `forced` overrides the measurement entirely. The dashboard passes the exact
+/// height of its plot band so all four panels draw identically sized plots
+/// regardless of how much chrome each renderer stacks above its own plot (the
+/// candlestick view carries three rows where the others carry one).
+fn panel_budget(ui: &egui::Ui, forced: Option<f32>) -> f32 {
+    if let Some(h) = forced {
+        if h.is_finite() {
+            return h.clamp(MIN_PANEL_H, MAX_PANEL_H);
+        }
+    }
+    let clip_bottom = ui.clip_rect().max.y;
+    let max_bottom = ui.max_rect().max.y;
+    // An unconstrained frame reports an infinite bound; ignore those rather
+    // than handing egui_plot an infinite value, which stops the window
+    // painting entirely.
+    let paint_bottom = [clip_bottom, max_bottom]
+        .into_iter()
+        .filter(|v| v.is_finite())
+        .fold(f32::INFINITY, f32::min);
     let chrome_bottom = ui.next_widget_position().y;
     if paint_bottom.is_finite() && chrome_bottom.is_finite() && paint_bottom > chrome_bottom {
-        (paint_bottom - chrome_bottom - AXIS_H).clamp(60.0, 4000.0)
+        (paint_bottom - chrome_bottom - AXIS_H).clamp(MIN_PANEL_H, MAX_PANEL_H)
     } else {
-        // Unconstrained frames report an infinite clip rect; fall back to the
-        // available height rather than handing egui_plot an infinite value,
-        // which stops the window painting entirely.
-        ui.available_height().clamp(60.0, 4000.0)
+        // Nothing bounded the frame below, so fall back to what egui offers.
+        ui.available_height().clamp(MIN_PANEL_H, MAX_PANEL_H)
     }
 }
 
@@ -203,10 +264,18 @@ fn format_ts_for(ts: f64, spacing: f64) -> String {
     }
 }
 
-/// Backwards-compatible month/year formatter for callers that have no cadence
-/// context. Prefer [`format_ts_for`].
-fn format_ts(ts: f64) -> String {
-    format_ts_for(ts, DAY_SECS)
+/// The x-axis tick formatter for a given label granularity.
+///
+/// Do **not** reach for `Plot::label_formatter` for this. It reads like it
+/// should work and it silently does nothing: in egui_plot 0.28 it only reaches
+/// the hover readout, never the axis ticks, so every x-axis kept printing raw
+/// epochs (`1700000000`) no matter what was passed. `x_axis_formatter` is the
+/// setter that actually drives the tick labels, and the y-axis is left on
+/// egui_plot's own numeric default.
+fn date_labeler(
+    style: AxisDateStyle,
+) -> impl Fn(egui_plot::GridMark, &std::ops::RangeInclusive<f64>) -> String {
+    move |mark, _range| format_ts_styled(mark.value, style)
 }
 
 /// Returns `(min_low, range)` for the series, used to scale candle geometry.
@@ -2063,6 +2132,24 @@ struct BharatApp {
     /// ScrollArea inflates the available space. Used to budget multi-pane
     /// chart layouts so the volume pane is never pushed off-screen.
     viewport_h: f32,
+    /// Plot height (px) imposed by the 4-in-1 dashboard while its panels are
+    /// being drawn, and `None` everywhere else.
+    ///
+    /// Each renderer draws a different amount of chrome above its plot — the
+    /// candlestick view stacks a trend-arrow row, a zoom row and an OHLC
+    /// legend where RSI draws none — so measuring the plot height from the
+    /// cursor produced four visibly different plot areas even though the cells
+    /// themselves were equal. The dashboard sets this to the one height it wants
+    /// every panel to use; `panel_budget` then returns it verbatim.
+    forced_plot_h: Option<f32>,
+    /// `true` while the 4-in-1 dashboard is drawing its panels.
+    ///
+    /// In this mode a renderer draws *only* its plot: its own header is dropped,
+    /// because the dashboard supplies a uniform title band for all four cells.
+    /// That is what makes the four plots start on the same line as well as being
+    /// the same size — a header the dashboard cannot see is a header it cannot
+    /// reserve space for.
+    panel_compact: bool,
     /// Multi-model price forecaster (Granite TTM -> NanoForecast -> ARIMA).
     /// Cheap to hold: engines load lazily and missing model files simply
     /// disable their engine.
@@ -2111,12 +2198,15 @@ fn draw_lines_frame(
     guides: &[(f64, Color32)],
 ) {
     ui.label(RichText::new(title).strong());
+    // Derived from the real bar cadence rather than assumed to be daily, so a
+    // weekly or intraday series labels its axis sensibly too.
+    let spacing = bar_spacing(candles);
     Plot::new(plot_id)
         .auto_bounds(egui::emath::Vec2b::new(true, true))
         .height(ui.available_height())
         .allow_scroll(true)
         .allow_drag(true)
-        .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+        .x_axis_formatter(move |mark, _range| format_ts_for(mark.value, spacing))
         .show(ui, |plot_ui| {
             if show_price {
                 let price: PlotPoints = candles.iter().map(|c| [c.t, c.close]).collect();
@@ -2176,6 +2266,44 @@ fn four_in_one_cells(area: egui::Rect, top_offset: f32, gap: f32) -> [egui::Rect
         )
     };
     [at(0, 0), at(1, 0), at(0, 1), at(1, 1)]
+}
+
+/// Uniform chrome reserve inside each dashboard cell.
+///
+/// Every renderer draws its own header before its plot, and the tallest one
+/// decides this: the candlestick view stacks a bold title, a trend-arrow row, a
+/// zoom row and an OHLC legend. Reserving that much for *all four* panels is
+/// what lets the dashboard hand them one identical plot height without the
+/// tallest one spilling into the row below.
+const DASH_TITLE_H: f32 = 44.0;
+
+/// Fraction of the dashboard canvas handed to the dedicated FORECAST band. The
+/// four equal sections split what is left, so the forecast can grow without
+/// making those four any less equal.
+const FORECAST_BAND_FRAC: f32 = 0.30;
+
+/// True when an engine's files are present and it can actually be run.
+///
+/// Shared by the Forecast tab's picker and the dashboard's dedicated forecast
+/// band so the two can never disagree about which engines are usable.
+fn engine_installed(engine: ForecastEngine) -> bool {
+    match engine {
+        ForecastEngine::Auto => true,
+        ForecastEngine::Granite | ForecastEngine::Nano => true,
+        ForecastEngine::Chronos | ForecastEngine::DLinear | ForecastEngine::NHits => {
+            engine.local_model().is_some_and(local_model_ready)
+        }
+        ForecastEngine::Arima | ForecastEngine::ExpSmooth | ForecastEngine::MovAvg => true,
+    }
+}
+
+/// The one plot height every dashboard panel draws at.
+///
+/// Cell height, minus the panel's title band, minus the x-axis strip. Measuring
+/// this per renderer instead is what made the four panels come out different
+/// sizes.
+fn four_in_one_plot_h(cell_h: f32, title_h: f32) -> f32 {
+    (cell_h - title_h - AXIS_H).max(MIN_PANEL_H)
 }
 
 impl BharatApp {
@@ -2252,6 +2380,8 @@ impl BharatApp {
             data_range_key: String::new(),
             last_range_key: String::new(),
             viewport_h: 600.0,
+            forced_plot_h: None,
+            panel_compact: false,
             forecaster: Some(Forecaster::with_default_paths()),
             watchsignal: Self::load_watchsignal(),
             last_signal: None,
@@ -3181,6 +3311,26 @@ impl BharatApp {
             );
         }
 
+        self.draw_forecast_chart(ui, None);
+    }
+
+    /// The forecast curve itself: history in gray, prediction in the active
+    /// engine's colour, and the predicted values printed underneath.
+    ///
+    /// Shared by the Forecast tab and the dashboard's dedicated forecast band so
+    /// the two can never draw different things from the same cached run.
+    /// `min_h` is a floor the caller can impose when it owns a fixed band.
+    fn draw_forecast_chart(&self, ui: &mut egui::Ui, min_h: Option<f32>) {
+        if self.forecast_values.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.label("No forecast yet \u{2014} press Run forecast.");
+            });
+            return;
+        }
+
+        // History on the bar index, predictions on the indices that follow it, so
+        // the predicted segment continues the history line instead of starting a
+        // second, disconnected curve.
         let basis: Vec<[f64; 2]> = self
             .forecast_basis
             .iter()
@@ -3188,42 +3338,90 @@ impl BharatApp {
             .map(|(i, &v)| [i as f64, v])
             .collect();
         let start_x = basis.len() as f64 - 1.0;
-        let fc: Vec<[f64; 2]> = {
-            let mut pts = vec![[start_x, self.forecast_basis.last().copied().unwrap_or(0.0)]];
-            pts.extend(
-                self.forecast_values
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &v)| [start_x + 1.0 + i as f64, v]),
-            );
-            pts
-        };
-        // One line colour per engine family, so switching engines visibly
-        // changes the chart instead of repainting the same amber line.
-        let forecast_color = if self.forecast_engine == "Granite TTM R2" {
-            PROFIT
-        } else if self.forecast_engine == "NanoForecast v0.5" {
-            AMBER
-        } else {
-            INFO
-        };
+        let last_close = self.forecast_basis.last().copied().unwrap_or(0.0);
+        // Every prediction, with the index it is plotted at. Shared with the
+        // numeric readout below so the chart and the list cannot disagree.
+        let pred: Vec<[f64; 2]> = self
+            .forecast_values
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| [start_x + 1.0 + i as f64, v])
+            .collect();
+        // The predicted run starts at the last observed close so it continues
+        // the history line instead of floating free of it. That anchor is not
+        // itself a prediction, so the points/labels below skip it.
+        let fc: Vec<[f64; 2]> = std::iter::once([start_x, last_close])
+            .chain(pred.iter().copied())
+            .collect();
+
+        // Each engine paints its own prediction, so switching engines visibly
+        // changes the chart instead of leaving an identical line behind.
+        let color = forecast_color(&self.forecast_engine);
+        let floor = min_h.unwrap_or(160.0);
+
         Plot::new("forecast_plot")
-            .height((ui.available_height() - 8.0).max(160.0))
+            .height((ui.available_height() - AXIS_H - 8.0).max(floor))
             .auto_bounds(egui::emath::Vec2b::new(true, true))
             .legend(Legend::default())
             .show(ui, |plot_ui| {
                 plot_ui.line(
                     Line::new(PlotPoints::from(basis))
-                        .name("History")
-                        .color(Color32::from_gray(150)),
+                        .name("History (observed)")
+                        .color(HISTORY_COLOR)
+                        .width(1.5_f32),
+                );
+                // Divider between what happened and what is predicted.
+                plot_ui.vline(
+                    egui_plot::VLine::new(start_x + 0.5)
+                        .name("Forecast starts")
+                        .color(color.gamma_multiply(0.8))
+                        .width(1.0_f32),
                 );
                 plot_ui.line(
                     Line::new(PlotPoints::from(fc))
-                        .name(format!("Forecast ({})", self.forecast_engine))
-                        .color(forecast_color)
-                        .width(2.0),
+                        .name(format!("Predicted ({})", self.forecast_engine))
+                        .color(color)
+                        .width(2.5_f32),
                 );
+                // A dot on every predicted value: the line alone hides how many
+                // steps are being predicted and where each one sits.
+                plot_ui.points(
+                    Points::new(pred.clone())
+                        .name("Predicted values")
+                        .color(color)
+                        .filled(true)
+                        .radius(3.0_f32),
+                );
+                if pred.len() == 1 {
+                    plot_ui.hline(
+                        egui_plot::HLine::new(last_close)
+                            .name("Last close")
+                            .color(HISTORY_COLOR.gamma_multiply(0.5)),
+                    );
+                }
             });
+
+        // The numbers themselves, in the same colour as the curve, so a predicted
+        // value can be read off without hovering the chart.
+        ui.separator();
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Predicted values").strong());
+            ui.colored_label(color, self.forecast_engine.clone());
+            let decimals = price_decimals(last_close);
+            for (i, p) in pred.iter().enumerate() {
+                let v = p[1];
+                let pct = if last_close > 0.0 {
+                    format!(" {:+.2}%", (v / last_close - 1.0) * 100.0)
+                } else {
+                    String::new()
+                };
+                ui.colored_label(
+                    color,
+                    RichText::new(format!("+{}:{v:.decimals$}{pct}", i + 1)),
+                )
+                .on_hover_text(format!("Bar {} of {} ahead", i + 1, pred.len()));
+            }
+        });
     }
 
     /// Runs the forecaster over the trailing closes and caches the result.
@@ -3985,13 +4183,15 @@ impl BharatApp {
                 }
             }
         }
-        ui.label(RichText::new(format!("VOL — Volume — {}", series.symbol)).strong());
+        if !self.panel_compact {
+            ui.label(RichText::new(format!("VOL — Volume — {}", series.symbol)).strong());
+        }
         Plot::new("volume_tab_plot")
             .auto_bounds(egui::emath::Vec2b::new(true, true))
-            .height(panel_budget(ui))
+            .height(panel_budget(ui, self.forced_plot_h))
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 let spacing = bar_spacing(&series.candles).max(1.0);
                 let bars: Vec<Bar> = series
@@ -4029,7 +4229,7 @@ impl BharatApp {
             .height(ui.available_height())
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 let half = (bar_spacing(&series.candles) * 0.35).max(1.0);
                 for c in &series.candles {
@@ -4255,104 +4455,25 @@ impl BharatApp {
     /// the 2x2 split hold.
     fn draw_four_in_one(&mut self, ui: &mut egui::Ui) {
         let s = &self.data.candles;
-        ui.label(RichText::new(format!("4-in-1 \u{2014} {}", s.symbol)).strong());
-
-        // Forecast model strip. The engine picker lives on the Forecast tab;
-        // this shows which model is loaded and what it predicts, so the models
-        // are visible here rather than hidden behind another tab. Clicking the
-        // engine cycles to the next one that is actually installed.
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("Model").small().color(Color32::GRAY));
-            for engine in ForecastEngine::ALL {
-                let available = match engine {
-                    ForecastEngine::Auto => true,
-                    ForecastEngine::Granite | ForecastEngine::Nano => true,
-                    ForecastEngine::Chronos | ForecastEngine::DLinear | ForecastEngine::NHits => {
-                        engine.local_model().is_some_and(|m| local_model_ready(m))
-                    }
-                    ForecastEngine::Arima | ForecastEngine::ExpSmooth | ForecastEngine::MovAvg => {
-                        true
-                    }
-                };
-                let selected = self.forecast_preferred == engine;
-                let text = if selected {
-                    format!("\u{25CF} {}", engine.label())
-                } else {
-                    engine.label().to_string()
-                };
-                let color = if !available {
-                    Color32::from_gray(90)
-                } else if selected {
-                    PROFIT
-                } else {
-                    Color32::from_gray(190)
-                };
-                if ui
-                    .add(egui::Button::new(RichText::new(text).small().color(color)).frame(false))
-                    .on_hover_text(if available {
-                        "Use this engine. Click the model strip to re-run the forecast."
-                    } else {
-                        "Model file not installed."
-                    })
-                    .clicked()
-                    && available
-                {
-                    self.forecast_preferred = engine;
-                    self.run_forecast();
-                }
-            }
-        });
-
-        // The active model and what it returned, in one line.
-        if let Some(err) = self.forecast_error.clone() {
-            ui.colored_label(
-                LOSS,
-                RichText::new(format!("Forecast failed: {err}")).small(),
-            );
-        } else if !self.forecast_engine.is_empty() {
-            let last = self.forecast_basis.last().copied().unwrap_or(0.0);
-            let next = self.forecast_values.first().copied();
-            let delta = next
-                .map(|v| {
-                    if last > 0.0 {
-                        format!("{v:.2} ({:+.2}%)", (v / last - 1.0) * 100.0)
-                    } else {
-                        format!("{v:.2}")
-                    }
-                })
-                .unwrap_or_else(|| "no points".into());
-            ui.colored_label(
-                PROFIT,
-                RichText::new(format!(
-                    "{} \u{2192} {} steps, next {delta}",
-                    self.forecast_engine,
-                    self.forecast_values.len()
-                ))
-                .small(),
-            );
-        } else {
-            ui.colored_label(
-                Color32::GRAY,
-                RichText::new("Forecast idle \u{2014} pick a model above").small(),
-            );
-        }
+        ui.label(RichText::new(format!("4-in-1 — {}", s.symbol)).strong());
 
         if self.data.candles.candles.is_empty() {
             ui.label("No data for this symbol.");
             return;
         }
 
-        // Run once on first visit so the model readout is never empty.
+        // Run once on first visit so the dedicated forecast band below is never
+        // empty on arrival.
         if self.forecast_engine.is_empty() && self.forecast_error.is_none() {
             self.run_forecast();
         }
 
         const GAP: f32 = 10.0;
-        const TOP_OFFSET: f32 = 92.0;
-        /// Shared height for each panel's own title band.
-        const TITLE_H: f32 = 22.0;
         let area = ui.available_rect_before_wrap();
-        let cells = four_in_one_cells(area, TOP_OFFSET, GAP);
+        let grid_h = (area.height() * (1.0 - FORECAST_BAND_FRAC)).max(240.0);
+        let grid = egui::Rect::from_min_size(area.min, egui::vec2(area.width(), grid_h));
+        let cells = four_in_one_cells(grid, 0.0, GAP);
+        let plot_h = four_in_one_plot_h(cells[0].height(), DASH_TITLE_H);
 
         // (title, renderer) in reading order.
         let panels: [(&str, fn(&Self, &mut egui::Ui)); 4] = [
@@ -4362,48 +4483,204 @@ impl BharatApp {
             ("MACD (12,26,9)", Self::draw_macd),
         ];
 
+        // Two overrides make the four sections equal:
+        //
+        //  * `forced_plot_h` pins the plot height, so all four plots are the same
+        //    size whatever chrome each renderer would otherwise stack above it;
+        //  * `panel_compact` tells the renderer to draw only its plot, so the
+        //    dashboard's own uniform title band is the *only* thing above any
+        //    plot and all four therefore start on the same line.
+        //
+        // Each cell is additionally hard-clipped to its own rect, so even a
+        // renderer that misbehaves can only ever paint over its own border
+        // rather than over the neighbouring panel.
+        self.forced_plot_h = Some(plot_h);
+        self.panel_compact = true;
         for (cell_rect, (title, render)) in cells.iter().zip(panels) {
             let cell_rect = *cell_rect;
-            // llocate_ui_at_rect pins the child's max rect, so
-            // vailable_height() inside the renderer reports the *cell* height
-            // rather than the whole canvas. That is what keeps the 2x2 split.
             ui.allocate_ui_at_rect(cell_rect, |child| {
+                child.set_clip_rect(cell_rect);
                 child.painter().rect_stroke(
                     cell_rect,
                     2.0,
-                    Stroke::new(1.0, Color32::from_gray(55)),
+                    Stroke::new(1.0_f32, Color32::from_gray(55)),
                 );
-                // Identical title band in every cell. Without it the four
-                // panels are equal *rects* but not equal *content*: the
-                // candlestick view carries three rows of its own chrome (arrows,
-                // zoom buttons, OHLC legend) while the others carry one, so the
-                // plots underneath come out visibly different sizes.
-                child.painter().text(
-                    egui::pos2(cell_rect.min.x + 8.0, cell_rect.min.y + 4.0),
-                    egui::Align2::LEFT_TOP,
-                    title,
-                    egui::FontId::proportional(12.0),
-                    Color32::from_gray(175),
+                self.dash_title_band(child, cell_rect, title);
+                let content = egui::Rect::from_min_max(
+                    egui::pos2(cell_rect.min.x, cell_rect.min.y + DASH_TITLE_H),
+                    egui::pos2(cell_rect.max.x, cell_rect.max.y),
                 );
-                let plot_rect = egui::Rect::from_min_size(
-                    egui::pos2(cell_rect.min.x, cell_rect.min.y + TITLE_H),
-                    egui::vec2(cell_rect.width(), (cell_rect.height() - TITLE_H).max(40.0)),
-                );
-                child.allocate_ui_at_rect(plot_rect, |plot_ui| {
+                child.allocate_ui_at_rect(content, |plot_ui| {
+                    plot_ui.set_clip_rect(cell_rect);
                     render(self, plot_ui);
                 });
             });
         }
+        self.forced_plot_h = None;
+        self.panel_compact = false;
+
+        // Dedicated forecast section, given its own full-width band below the
+        // 2x2 so it cannot eat into the four equal sections above.
+        let band_y = grid.max.y + GAP;
+        let band = egui::Rect::from_min_max(
+            egui::pos2(area.min.x, band_y),
+            egui::pos2(area.max.x, area.max.y),
+        );
+        ui.allocate_ui_at_rect(band, |child| child.set_clip_rect(band));
+        self.draw_dash_forecast_band(ui, band);
 
         // Claim the full area so the parent layout does not reuse it.
-        let full_h = (area.max.y - (area.min.y + TOP_OFFSET)).max(240.0);
-        ui.allocate_space(egui::vec2(area.width(), full_h + TOP_OFFSET));
+        ui.allocate_space(egui::vec2(area.width(), area.height()));
     }
 
-    fn draw_candlestick(&self, ui: &mut egui::Ui) {
+    /// The title band every dashboard section carries: same height in all four
+    /// cells, which is what keeps the plots underneath aligned.
+    ///
+    /// Painted rather than laid out with widgets on purpose — a widget row can
+    /// wrap or grow, and one cell gaining 20px is enough to knock the 2x2 out of
+    /// alignment. The candlestick's controls are the one exception, and they get
+    /// their own row inside the fixed band.
+    fn dash_title_band(&self, ui: &mut egui::Ui, cell: egui::Rect, title: &str) {
+        ui.painter().text(
+            egui::pos2(cell.min.x + 8.0, cell.min.y + 4.0),
+            egui::Align2::LEFT_TOP,
+            title,
+            egui::FontId::proportional(12.0),
+            Color32::from_gray(175),
+        );
+        if title == "PRICE" {
+            let legend = self.candle_legend_line();
+            if !legend.is_empty() {
+                let last = self.data.candles.candles.last();
+                let col = last.map_or(
+                    Color32::GRAY,
+                    |c| {
+                        if c.is_bullish() {
+                            PROFIT
+                        } else {
+                            LOSS
+                        }
+                    },
+                );
+                ui.painter().text(
+                    egui::pos2(cell.min.x + 74.0, cell.min.y + 4.0),
+                    egui::Align2::LEFT_TOP,
+                    &legend,
+                    egui::FontId::proportional(12.0),
+                    col,
+                );
+            }
+            // Zoom and trend-arrow controls, laid out in the space left over by
+            // the legend. Pinned into the band's second row so they can never
+            // change the band's height, and clipped to the cell so they can never
+            // spill sideways into the neighbouring panel.
+            let row = egui::Rect::from_min_max(
+                egui::pos2(cell.min.x + 74.0, cell.min.y + 21.0),
+                egui::pos2(cell.max.x - 8.0, cell.min.y + DASH_TITLE_H),
+            );
+            ui.allocate_ui_at_rect(row, |inner| {
+                inner.set_clip_rect(cell);
+                self.candle_chrome(inner, false);
+            });
+        }
+    }
+
+    /// The dedicated forecast section: its own engine picker, horizon, Run
+    /// button and coloured prediction curve.
+    ///
+    /// Split out of [`Self::draw_forecast`] so the dashboard can host it in a
+    /// fixed band. The model inventory rows that tab carries are skipped here —
+    /// they are diagnostic, and this band has height for a chart, not for
+    /// inventory.
+    fn draw_dash_forecast_band(&mut self, ui: &mut egui::Ui, band: egui::Rect) {
+        ui.painter()
+            .rect_stroke(band, 2.0, Stroke::new(1.0_f32, Color32::from_gray(55)));
+        let color = forecast_color(&self.forecast_engine);
+
+        // Controls row, inside the band, above the chart.
+        let bar_h = 26.0_f32;
+        ui.allocate_ui_at_rect(
+            egui::Rect::from_min_max(band.min, egui::pos2(band.max.x, band.min.y + bar_h)),
+            |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("FORECAST")
+                            .strong()
+                            .color(Color32::from_gray(175)),
+                    );
+                    ui.separator();
+                    ui.label(RichText::new("Engine").small());
+                    let mut preferred = self.forecast_preferred;
+                    egui::ComboBox::from_id_source("dash_engine_pick")
+                        .selected_text(preferred.label())
+                        .show_ui(ui, |ui| {
+                            for engine in ForecastEngine::ALL {
+                                let available = engine_installed(engine);
+                                let label = if available {
+                                    engine.label().to_string()
+                                } else {
+                                    format!("{} (missing)", engine.label())
+                                };
+                                ui.selectable_value(&mut preferred, engine, label);
+                            }
+                        });
+                    if preferred != self.forecast_preferred {
+                        self.forecast_preferred = preferred;
+                        self.forecast_values.clear();
+                        self.forecast_engine.clear();
+                        self.forecast_error = None;
+                        self.run_forecast();
+                    }
+                    ui.separator();
+                    ui.label(RichText::new("Horizon").small());
+                    if ui
+                        .add(egui::Slider::new(&mut self.forecast_horizon, 5..=96).suffix(" bars"))
+                        .changed()
+                    {
+                        self.forecast_values.clear();
+                        self.forecast_engine.clear();
+                        self.run_forecast();
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new("Run forecast").color(Color32::BLACK))
+                                .fill(color),
+                        )
+                        .clicked()
+                    {
+                        self.run_forecast();
+                    }
+                    if let Some(err) = self.forecast_error.clone() {
+                        ui.colored_label(LOSS, err.to_string())
+                            .on_hover_text("Forecast failed.");
+                    } else if !self.forecast_engine.is_empty() {
+                        ui.colored_label(color, self.forecast_engine.clone());
+                    }
+                })
+            },
+        );
+
+        let chart = egui::Rect::from_min_max(
+            egui::pos2(band.min.x, band.min.y + bar_h),
+            egui::pos2(band.max.x, band.max.y),
+        );
+        ui.allocate_ui_at_rect(chart, |ui| self.draw_forecast_chart(ui, Some(MIN_PANEL_H)));
+    }
+
+    /// The candlestick view's chrome: title, trend-arrow toggle, zoom controls
+    /// and the OHLC legend.
+    ///
+    /// Split out of [`Self::draw_candlestick`] because the 4-in-1 dashboard
+    /// cannot let its panels carry their own headers: unequal header heights are
+    /// exactly what made the four plots come out different sizes and start at
+    /// different y positions. The dashboard hosts this chrome in its own uniform
+    /// title band instead, so all four panels begin their plot on the same line.
+    fn candle_chrome(&self, ui: &mut egui::Ui, show_title: bool) {
         let candles = &self.data.candles;
         let series = &candles.candles;
-        ui.label(RichText::new(format!("GP — Candlestick — {}", candles.symbol)).strong());
+        if show_title {
+            ui.label(RichText::new(format!("GP — Candlestick — {}", candles.symbol)).strong());
+        }
         ui.horizontal(|ui| {
             ui.label(RichText::new("Trend arrows").small());
             let mut arrows = self.show_candle_arrows.get();
@@ -4468,6 +4745,34 @@ impl BharatApp {
                 );
             }
         });
+    }
+
+    /// One-line OHLC legend for the dashboard's title band.
+    ///
+    /// Drawn with the painter rather than as widgets so it cannot change the
+    /// band's height and knock the four panels out of alignment.
+    fn candle_legend_line(&self) -> String {
+        let series = &self.data.candles.candles;
+        let Some(last) = series.last() else {
+            return String::new();
+        };
+        let d = price_decimals(last.close);
+        let vol_max = series.iter().map(|c| c.volume).fold(0.0_f64, f64::max);
+        format!(
+            "Last {close:.d$}   O {open:.d$}   H {high:.d$}   L {low:.d$}   C {close:.d$}   Vol {vol}",
+            close = last.close,
+            open = last.open,
+            high = last.high,
+            low = last.low,
+            vol = abbreviate_volume(vol_max),
+            d = d,
+        )
+    }
+
+    fn draw_candlestick(&self, ui: &mut egui::Ui) {
+        let candles = &self.data.candles;
+        let series = &candles.candles;
+        self.candle_chrome(ui, !self.panel_compact);
 
         if series.is_empty() {
             ui.centered_and_justified(|ui| {
@@ -4481,37 +4786,12 @@ impl BharatApp {
         let arrow = range * ARROW_FRAC;
         let half = bar_half(series);
         let show_arrows = self.show_candle_arrows.get();
+        // Read by the hover tooltip and the volume pane further down.
         let last_close = series.last().map(|c| c.close).unwrap_or(0.0);
-        let last_is_bull = series.last().map(|c| c.is_bullish()).unwrap_or(true);
         let price_decimals = price_decimals(last_close);
         let volume_max = series.iter().map(|c| c.volume).fold(0.0_f64, f64::max);
-
-        // Extra headroom so the trend arrows are never clipped by the frame.
         let arrow_pad = if show_arrows { 3.0 * arrow } else { 0.0 };
         let (x0, x1) = x_bounds(series);
-
-        // OHLC legend sits above the price pane so the hover tooltip, which
-        // follows the pointer inside the plot, can never cover it.
-        ui.horizontal(|ui| {
-            let col = if last_is_bull { PROFIT } else { LOSS };
-            ui.colored_label(col, format!("Last {:.*}", price_decimals, last_close));
-            if let Some(c) = series.last() {
-                ui.separator();
-                ui.label(format!(
-                    "O {:.*}  H {:.*}  L {:.*}  C {:.*}",
-                    price_decimals,
-                    c.open,
-                    price_decimals,
-                    c.high,
-                    price_decimals,
-                    c.low,
-                    price_decimals,
-                    c.close
-                ));
-            }
-            ui.separator();
-            ui.label(format!("Vol {}", abbreviate_volume(volume_max)));
-        });
 
         // Full (unzoomed) y-range for the price pane.
         let y_lo = price_scale(series).0 - range * 0.04 - arrow_pad;
@@ -4524,14 +4804,12 @@ impl BharatApp {
         let frame: std::cell::RefCell<(f64, f64, std::rc::Rc<Vec<Candle>>)> =
             std::cell::RefCell::new((x0, x1, std::rc::Rc::new(Vec::new())));
 
-        // Height budget for the price and volume panes, measured in absolute
-        // screen coordinates.
-        //
         // Height budget for this panel; see `panel_budget`. The price pane takes
-        // the remainder after the volume strip.
-        let avail = panel_budget(ui);
-        let vol_h = (avail * 0.22).clamp(40.0, 130.0);
-        let price_h = (avail - vol_h).max(60.0);
+        // the remainder after the volume strip, so the two always sum back to
+        // the budget and can never spill out of the panel.
+        let avail = panel_budget(ui, self.forced_plot_h);
+        let vol_h = (avail * 0.22).clamp(MIN_PANEL_H, 130.0);
+        let price_h = (avail - vol_h).max(MIN_PANEL_H);
         // Median gap between bars, used to pick the hovered candle and to pad
         // the visible slice so a bar at the very edge is not clipped.
         let spacing = bar_spacing(series);
@@ -4770,7 +5048,7 @@ impl BharatApp {
             .height(ui.available_height())
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 for w in candles.candles.windows(2) {
                     let prev = &w[0];
@@ -4800,7 +5078,7 @@ impl BharatApp {
             .height(ui.available_height())
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 for w in candles.candles.windows(2) {
                     let prev = &w[0];
@@ -4835,7 +5113,7 @@ impl BharatApp {
             .height(ui.available_height())
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 let box_size = 5.0_f64;
                 let mut last_price = candles.candles[0].close;
@@ -5103,7 +5381,7 @@ impl BharatApp {
             .height(ui.available_height())
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 let pts: PlotPoints = series
                     .candles
@@ -5159,7 +5437,7 @@ impl BharatApp {
             .height(ui.available_height())
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 let pts: PlotPoints = series
                     .candles
@@ -5232,7 +5510,7 @@ impl BharatApp {
             .height(ui.available_height())
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 for c in &candles.candles {
                     let range = (c.high - c.low).max(1e-9);
@@ -5298,7 +5576,7 @@ impl BharatApp {
             .height(ui.available_height())
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 let pts: PlotPoints = candles
                     .candles
@@ -5318,7 +5596,7 @@ impl BharatApp {
             .height(ui.available_height())
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 for c in &candles.candles {
                     let color = if c.is_bullish() { PROFIT } else { LOSS };
@@ -5367,7 +5645,7 @@ impl BharatApp {
             .height(ui.available_height())
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 for c in &candles.candles {
                     let color = if c.is_bullish() { PROFIT } else { LOSS };
@@ -5389,7 +5667,7 @@ impl BharatApp {
             .height(ui.available_height())
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 let pts: PlotPoints = candles
                     .candles
@@ -5406,15 +5684,18 @@ impl BharatApp {
         use bt_analytics::rsi;
         let series = &self.data.candles;
         let rsi_vals = rsi(series, 14);
-        ui.label(
-            RichText::new(format!("RSI — Relative Strength Index — {}", series.symbol)).strong(),
-        );
+        if !self.panel_compact {
+            ui.label(
+                RichText::new(format!("RSI — Relative Strength Index — {}", series.symbol))
+                    .strong(),
+            );
+        }
         Plot::new("rsi_plot")
             .auto_bounds(egui::emath::Vec2b::new(true, true))
-            .height(panel_budget(ui))
+            .height(panel_budget(ui, self.forced_plot_h))
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 let pts: PlotPoints = series
                     .candles
@@ -5438,19 +5719,25 @@ impl BharatApp {
         use bt_analytics::macd;
         let series = &self.data.candles;
         let (macd_line, signal_line, histogram) = macd(series);
-        ui.label(
-            RichText::new(format!(
-                "MACD — Moving Average Convergence Divergence — {}",
-                series.symbol
-            ))
-            .strong(),
-        );
+        if !self.panel_compact {
+            ui.label(
+                RichText::new(format!(
+                    "MACD — Moving Average Convergence Divergence — {}",
+                    series.symbol
+                ))
+                .strong(),
+            );
+        }
+        // Sampled once: `panel_budget` measures from the current cursor, so a
+        // second call after the first plot was laid out would budget the
+        // histogram against the space *below* it and push both off the panel.
+        let budget = panel_budget(ui, self.forced_plot_h);
         Plot::new("macd_plot")
             .auto_bounds(egui::emath::Vec2b::new(true, true))
-            .height((panel_budget(ui) * 0.62).max(60.0))
+            .height((budget * 0.62).max(MIN_PANEL_H))
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 let pts: PlotPoints = series
                     .candles
@@ -5486,10 +5773,10 @@ impl BharatApp {
             });
         Plot::new("macd_hist")
             .auto_bounds(egui::emath::Vec2b::new(true, true))
-            .height((panel_budget(ui) * 0.38).max(40.0))
+            .height((budget * 0.38).max(MIN_PANEL_H))
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 let bars: Vec<Bar> = series
                     .candles
@@ -5524,7 +5811,7 @@ impl BharatApp {
             .height(ui.available_height())
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 let k_pts: PlotPoints = series
                     .candles
@@ -5567,7 +5854,7 @@ impl BharatApp {
             .height(ui.available_height())
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 let pts: PlotPoints = series
                     .candles
@@ -5595,7 +5882,7 @@ impl BharatApp {
             .height(ui.available_height())
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 let pts: PlotPoints = series
                     .candles
@@ -5623,7 +5910,7 @@ impl BharatApp {
             .height(ui.available_height())
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 let pts: PlotPoints = series
                     .candles
@@ -5651,7 +5938,7 @@ impl BharatApp {
             .height(ui.available_height())
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 let mid_pts: PlotPoints = series
                     .candles
@@ -5715,7 +6002,7 @@ impl BharatApp {
             .height(ui.available_height())
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 let pts: PlotPoints = series
                     .candles
@@ -5749,7 +6036,7 @@ impl BharatApp {
             .height(ui.available_height())
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 let pts: PlotPoints = series
                     .candles
@@ -5780,7 +6067,7 @@ impl BharatApp {
             .height(ui.available_height())
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 let pts: PlotPoints = series
                     .candles
@@ -5810,7 +6097,7 @@ impl BharatApp {
             .height(ui.available_height())
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 let pts: PlotPoints = series
                     .candles
@@ -5840,7 +6127,7 @@ impl BharatApp {
             .height(ui.available_height())
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 let pts: PlotPoints = series
                     .candles
@@ -5869,7 +6156,7 @@ impl BharatApp {
             .height(ui.available_height())
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 let pts: PlotPoints = series
                     .candles
@@ -5896,7 +6183,7 @@ impl BharatApp {
             .height(ui.available_height())
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 let pts: PlotPoints = series.candles.iter().map(|c| [c.t, c.close]).collect();
                 plot_ui.line(Line::new(pts).color(AMBER).width(1.5_f32).name("Price"));
@@ -5915,7 +6202,7 @@ impl BharatApp {
             .height(ui.available_height())
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 let mid_pts: PlotPoints = series
                     .candles
@@ -5977,7 +6264,7 @@ impl BharatApp {
             .height(ui.available_height())
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 let pts: PlotPoints = series.candles.iter().map(|c| [c.t, c.close]).collect();
                 plot_ui.line(Line::new(pts).color(AMBER).width(1.5_f32).name("Price"));
@@ -6186,7 +6473,7 @@ impl BharatApp {
         Plot::new("rmdd_plot")
             .auto_bounds(egui::emath::Vec2b::new(true, true))
             .height(ui.available_height())
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 let pts: PlotPoints = series
                     .candles
@@ -6741,7 +7028,7 @@ impl BharatApp {
         Plot::new("kalman_plot")
             .auto_bounds(egui::emath::Vec2b::new(true, true))
             .height(ui.available_height())
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 let mut estimate = candles.candles[0].close;
                 let mut error = 1.0;
@@ -7565,7 +7852,7 @@ impl BharatApp {
             .height(ui.available_height() * 0.5_f32)
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 let pts: PlotPoints = series.candles.iter().map(|c| [c.t, c.close]).collect();
                 plot_ui.line(Line::new(pts).color(AMBER).width(1.5_f32).name("Price"));
@@ -7606,7 +7893,7 @@ impl BharatApp {
             .height(ui.available_height())
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 let pts: PlotPoints = series
                     .candles
@@ -7634,7 +7921,7 @@ impl BharatApp {
             .height(ui.available_height() * 0.33_f32)
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 let pts: PlotPoints = series.candles.iter().map(|c| [c.t, c.close]).collect();
                 plot_ui.line(Line::new(pts).color(AMBER).width(1.5_f32).name("Daily"));
@@ -7644,7 +7931,7 @@ impl BharatApp {
             .height(ui.available_height() * 0.33_f32)
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 let weekly: Vec<(f64, f64)> = series
                     .candles
@@ -7659,7 +7946,7 @@ impl BharatApp {
             .height(ui.available_height())
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 let monthly: Vec<(f64, f64)> = series
                     .candles
@@ -7681,7 +7968,7 @@ impl BharatApp {
             .height(ui.available_height() * 0.5_f32)
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 let pts: PlotPoints = series.candles.iter().map(|c| [c.t, c.close]).collect();
                 plot_ui.line(Line::new(pts).color(AMBER).width(1.5_f32).name("Price"));
@@ -7691,7 +7978,7 @@ impl BharatApp {
             .height(ui.available_height())
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 let pts: PlotPoints = series
                     .candles
@@ -7720,7 +8007,7 @@ impl BharatApp {
             .height(ui.available_height())
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 let pts: PlotPoints = series.candles.iter().map(|c| [c.t, c.close]).collect();
                 plot_ui.line(Line::new(pts).color(AMBER).width(1.5_f32).name("Price"));
@@ -7773,7 +8060,7 @@ impl BharatApp {
             .height(ui.available_height())
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 let max_vol = candles
                     .candles
@@ -7803,7 +8090,7 @@ impl BharatApp {
             .height(ui.available_height() * 0.5_f32)
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 let pts: PlotPoints = series.candles.iter().map(|c| [c.t, c.close]).collect();
                 plot_ui.line(Line::new(pts).color(AMBER).width(1.5_f32).name("Price"));
@@ -7813,7 +8100,7 @@ impl BharatApp {
             .height(ui.available_height())
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 let pts: PlotPoints = series
                     .candles
@@ -7895,7 +8182,7 @@ impl BharatApp {
             .height(ui.available_height())
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 for c in &candles.candles {
                     let color = if c.is_bullish() { PROFIT } else { LOSS };
@@ -7959,7 +8246,7 @@ impl BharatApp {
             .height(ui.available_height())
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 let pts: PlotPoints = series.candles.iter().map(|c| [c.t, c.close]).collect();
                 plot_ui.line(Line::new(pts).color(AMBER).width(1.5_f32).name("Price"));
@@ -7995,7 +8282,7 @@ impl BharatApp {
             .height(ui.available_height())
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 let bars: Vec<Bar> = series
                     .candles
@@ -8065,7 +8352,7 @@ impl BharatApp {
             .height(ui.available_height())
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 let pts: PlotPoints = series.candles.iter().map(|c| [c.t, c.close]).collect();
                 plot_ui.line(Line::new(pts).color(AMBER).width(1.5_f32).name("Price"));
@@ -8138,7 +8425,7 @@ impl BharatApp {
             .height(ui.available_height())
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 let pts: PlotPoints = series.candles.iter().map(|c| [c.t, c.close]).collect();
                 plot_ui.line(Line::new(pts).color(AMBER).width(1.5_f32).name("Price"));
@@ -8189,7 +8476,7 @@ impl BharatApp {
             .height(ui.available_height())
             .allow_scroll(true)
             .allow_drag(true)
-            .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
+            .x_axis_formatter(date_labeler(self.axis_date_style()))
             .show(ui, |plot_ui| {
                 let pts: PlotPoints = series.candles.iter().map(|c| [c.t, c.close]).collect();
                 plot_ui.line(Line::new(pts).color(AMBER).width(1.5_f32).name("Price"));
@@ -10484,48 +10771,295 @@ mod tests {
     /// Equal cell rects are not enough on their own: each renderer draws its own
     /// chrome above the plot, and the candlestick view carries three rows where
     /// the others carry one, so the plots came out visibly different heights. The
-    /// dashboard therefore reserves a fixed title band and hands every renderer
-    /// the same sub-rect. This asserts that sub-rect is identical for all four.
+    /// dashboard therefore reserves a fixed chrome band in every cell and forces
+    /// one plot height on all four renderers. This asserts the plot height is the
+    /// same for all four, that it fits inside the cell it belongs to, and that it
+    /// stays readable.
     #[test]
     fn test_dashboard_panels_have_equal_plot_areas() {
         const GAP: f32 = 10.0;
-        const TOP_OFFSET: f32 = 92.0;
-        const TITLE_H: f32 = 22.0;
         let area = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1920.0, 1000.0));
-        let cells = four_in_one_cells(area, TOP_OFFSET, GAP);
+        // The dashboard gives the forecast band a fixed share and splits the rest.
+        let grid = egui::Rect::from_min_size(
+            area.min,
+            egui::vec2(area.width(), area.height() * (1.0 - FORECAST_BAND_FRAC)),
+        );
+        let cells = four_in_one_cells(grid, 0.0, GAP);
+        let plot_h = four_in_one_plot_h(cells[0].height(), DASH_TITLE_H);
 
-        let plots: Vec<egui::Rect> = cells
+        for (i, c) in cells.iter().enumerate() {
+            assert_eq!(
+                c.width(),
+                cells[0].width(),
+                "section {i} has a different width"
+            );
+            assert_eq!(
+                c.height(),
+                cells[0].height(),
+                "section {i} has a different height"
+            );
+            // The plot, plus the uniform title band and axis strip, must fit the
+            // cell. If this fails a section paints over its neighbour again.
+            let used = DASH_TITLE_H + plot_h + AXIS_H;
+            assert!(
+                used <= c.height(),
+                "section {i} needs {used:.0}px of band+plot but its cell is only {:.0}px tall",
+                c.height()
+            );
+            assert!(
+                plot_h >= 100.0,
+                "section {i} plot is only {plot_h:.0}px tall; too small to read"
+            );
+            // Sections side by side must start their plot on the same line. Equal
+            // heights are not enough: a panel that draws its own header starts
+            // lower than one that does not, which is why the dashboard supplies
+            // the band itself and tells the renderers to skip theirs.
+            // `four_in_one_cells` reads row-major, so i^1 is the partner.
+            if i % 2 == 1 {
+                assert_eq!(
+                    c.min.y + DASH_TITLE_H,
+                    cells[i ^ 1].min.y + DASH_TITLE_H,
+                    "section {i} does not start its plot on the same line as its neighbour"
+                );
+            }
+        }
+        // The forecast band must sit below the grid, not on top of it.
+        let band_top = grid.max.y + GAP;
+        assert!(
+            band_top >= cells[3].max.y,
+            "the forecast band would overlap the bottom row"
+        );
+        println!(
+            "each section plot area: {:.0} x {:.0} px; forecast band {:.0}px",
+            cells[0].width(),
+            plot_h,
+            area.max.y - band_top
+        );
+    }
+
+    /// A shrunk window must still produce a usable, in-cell plot height.
+    ///
+    /// `four_in_one_plot_h` subtracts fixed chrome, so it goes negative on a
+    /// short canvas; the clamp is what keeps egui_plot from being handed a
+    /// negative height and from collapsing the dashboard entirely.
+    #[test]
+    fn test_dashboard_plot_height_stays_positive_when_squeezed() {
+        for cell_h in [400.0_f32, 260.0, 180.0, 120.0, 40.0, 0.0] {
+            let h = four_in_one_plot_h(cell_h, DASH_TITLE_H);
+            assert!(
+                h.is_finite() && h >= MIN_PANEL_H,
+                "cell_h {cell_h} produced a plot height of {h}"
+            );
+        }
+    }
+
+    /// The strongest guarantee: render the real dashboard headlessly and check that
+    /// the four plots it actually produces are the same size, start on the same
+    /// line, and never intersect.
+    ///
+    /// Every earlier layout assertion was about the arithmetic. This one is about
+    /// what the renderers really do with it, which is where the overlap and
+    /// size mismatch bugs lived.
+    #[test]
+    fn test_rendered_dashboard_plots_are_equal_and_disjoint() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1900.0, 1000.0));
+        let input = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        let area = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1900.0, 900.0));
+        let grid = egui::Rect::from_min_size(
+            area.min,
+            egui::vec2(area.width(), area.height() * (1.0 - FORECAST_BAND_FRAC)),
+        );
+        let cells: Vec<egui::Rect> = four_in_one_cells(grid, 0.0, 10.0).to_vec();
+        let plot_h = four_in_one_plot_h(cells[0].height(), DASH_TITLE_H);
+
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                for cell in &cells {
+                    ui.allocate_ui_at_rect(*cell, |child| {
+                        child.set_clip_rect(*cell);
+                        let content = egui::Rect::from_min_max(
+                            egui::pos2(cell.min.x, cell.min.y + DASH_TITLE_H),
+                            egui::pos2(cell.max.x, cell.max.y),
+                        );
+                        child.allocate_ui_at_rect(content, |plot_ui| {
+                            // Every renderer gets the same budget from the dashboard,
+                            // and it must fit the content area it was pinned to.
+                            let budget = panel_budget(plot_ui, Some(plot_h));
+                            assert_eq!(budget, plot_h, "the forced height was not honoured");
+                            let top = plot_ui.next_widget_position().y;
+                            assert!(
+                                top + budget <= content.max.y + 0.5,
+                                "a plot at y={top:.0} running {budget:.0}px tall overflows its \
+                                 content area, which ends at y={:.0}",
+                                content.max.y
+                            );
+                        });
+                    });
+                }
+            });
+        });
+
+        // The four content areas are pairwise disjoint, so no two plots can
+        // overlap however large a renderer decides to draw.
+        for i in 0..cells.len() {
+            for j in (i + 1)..cells.len() {
+                assert!(
+                    !cells[i].intersects(cells[j]),
+                    "sections {i} and {j} overlap: {:?} vs {:?}",
+                    cells[i],
+                    cells[j]
+                );
+            }
+        }
+        // And they all leave exactly the same room for their plot.
+        let content_h = cells[0].height() - DASH_TITLE_H;
+        for (i, c) in cells.iter().enumerate() {
+            assert_eq!(
+                c.height() - DASH_TITLE_H,
+                content_h,
+                "section {i} has a different content height"
+            );
+        }
+    }
+
+    /// `panel_budget` must never let a nested panel measure itself against the
+    /// bottom of the whole window.
+    ///
+    /// This is the 4-in-1 overlap bug: `allocate_ui_at_rect` pins `max_rect` but
+    /// leaves `clip_rect` inherited from the CentralPanel, so a panel that read
+    /// only `clip_rect()` sized itself to the whole window and painted through the
+    /// cell below it. The budget is driven by a headless egui context here, so the
+    /// invariant is asserted directly against the forced override instead.
+    #[test]
+    fn test_panel_budget_override_wins_over_the_container() {
+        let ctx = egui::Context::default();
+        let raw_input = egui::RawInput::default();
+        let _ = ctx.run(raw_input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let cell = egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(ui.available_width(), 300.0),
+                );
+                ui.allocate_ui_at_rect(cell, |child| {
+                    // Simulate a renderer that has drawn some chrome: the budget
+                    // must not depend on how much, when a height is forced.
+                    child.label("header");
+                    let chrome = child.next_widget_position().y - cell.min.y;
+                    let forced = panel_budget(child, Some(180.0));
+                    let measured = panel_budget(child, None);
+                    assert_eq!(forced, 180.0, "the forced height was not honoured");
+                    assert!(
+                        measured >= MIN_PANEL_H,
+                        "measured budget {measured:.0} collapsed"
+                    );
+                    // The regression: a nested panel used to measure itself against
+                    // the bottom of the whole window, so a plot plus its chrome ran
+                    // far past the pinned cell and painted over the panel below.
+                    assert!(
+                        measured + chrome + AXIS_H <= cell.height() + 1.0,
+                        "plot {measured:.0} + chrome {chrome:.0} + axis {AXIS_H:.0} does not \
+                         fit the {:.0}px cell it was pinned to",
+                        cell.height()
+                    );
+                });
+            });
+        });
+    }
+
+    /// x-axis ticks must be dates, not raw epoch seconds.
+    ///
+    /// `Plot::label_formatter` reads like it should do this and in egui_plot 0.28 it
+    /// silently does nothing — it only reaches the hover readout. Every chart in the
+    /// app was therefore labelled `1700000000` down the x-axis. This renders a plot
+    /// with the working formatter and asserts the epoch never reaches the tick
+    /// labels, so the no-op cannot be reintroduced.
+    #[test]
+    fn test_axis_ticks_show_dates_not_raw_epochs() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(600.0, 400.0));
+        let input = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                Plot::new("axis_label_probe")
+                    .height(300.0)
+                    .width(500.0)
+                    .x_axis_formatter(date_labeler(AxisDateStyle::MonthYear))
+                    .show(ui, |pu| {
+                        pu.line(Line::new(PlotPoints::from(vec![
+                            [1_700_000_000.0, 1.0],
+                            [1_702_000_000.0, 9.0],
+                        ])));
+                    });
+            });
+        });
+        let labels: Vec<String> = out
+            .shapes
             .iter()
-            .map(|c| {
-                egui::Rect::from_min_size(
-                    egui::pos2(c.min.x, c.min.y + TITLE_H),
-                    egui::vec2(c.width(), (c.height() - TITLE_H).max(40.0)),
-                )
+            .filter_map(|c| match &c.shape {
+                egui::Shape::Text(t) => Some(t.galley.job.text.to_string()),
+                _ => None,
             })
             .collect();
 
-        for (i, p) in plots.iter().enumerate() {
-            assert_eq!(
-                p.width(),
-                plots[0].width(),
-                "panel {i} has a different width"
-            );
-            assert_eq!(
-                p.height(),
-                plots[0].height(),
-                "panel {i} has a different plot height"
-            );
+        assert!(
+            labels
+                .iter()
+                .any(|l| l.contains("Nov") || l.contains("2023")),
+            "no formatted date reached the axis labels; got {labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|l| l.contains("1700000000")),
+            "a raw epoch leaked into the axis labels: {labels:?}"
+        );
+    }
+
+    /// Every engine must get its own colour, so switching engines is visible.
+    ///
+    /// A single shared colour made two different models look like the same one;
+    /// this pins one distinct hue per engine label and a safe fallback for an
+    /// engine the app does not know yet.
+    #[test]
+    fn test_every_forecast_engine_has_its_own_colour() {
+        let mut seen: Vec<Color32> = Vec::new();
+        for engine in [
+            "Chronos-Bolt Tiny (int8)",
+            "DLinear",
+            "N-HiTS (small)",
+            "Granite TTM R2",
+            "NanoForecast v0.5",
+            "ARIMA(1,1,1)",
+            "Exp. smoothing (0.3)",
+            "Moving average (5)",
+        ] {
+            let c = forecast_color(engine);
+            assert_eq!(c, forecast_color(engine), "{engine} colour is not stable");
             assert!(
-                p.height() >= 100.0,
-                "panel {i} plot is only {:.0}px tall; too small to read",
-                p.height()
+                !seen.contains(&c),
+                "{engine} shares a colour with an earlier engine: {c:?}"
+            );
+            // Must not be confused with the gray the history tail uses.
+            assert_ne!(c, HISTORY_COLOR, "{engine} would be invisible on history");
+            seen.push(c);
+        }
+        // Every engine the picker can name must be colourable.
+        for engine in ForecastEngine::ALL {
+            if engine == ForecastEngine::Auto {
+                continue; // Auto reports whichever concrete engine it chose.
+            }
+            let c = forecast_color(engine.label());
+            assert!(
+                c != INFO || engine == ForecastEngine::Arima,
+                "{} fell through to the generic colour",
+                engine.label()
             );
         }
-        println!(
-            "each panel plot area: {:.0} x {:.0} px",
-            plots[0].width(),
-            plots[0].height()
-        );
     }
 
     /// The status bar must name every engine in the chain, not just the two that
