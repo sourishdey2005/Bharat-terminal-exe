@@ -19,6 +19,73 @@ const BASE_QUOTE: &str = "https://query1.finance.yahoo.com/v7/finance/quote";
 const BASE_SEARCH: &str = "https://query2.finance.yahoo.com/v1/finance/search";
 const BASE_PROFILE: &str = "https://query1.finance.yahoo.com/v10/finance/quoteSummary";
 
+/// Longest span Yahoo will serve at 1-minute granularity (~30 days).
+const MIN1_MAX_DAYS: i64 = 30;
+/// Longest span Yahoo will serve at 5-minute granularity (~60 days).
+const MIN5_MAX_DAYS: i64 = 60;
+/// Longest span Yahoo will serve at 15/30-minute granularity (~60 days).
+const MIN15_MAX_DAYS: i64 = 60;
+/// Longest span Yahoo will serve hourly, and the longest span any intraday
+/// granularity supports at all (~730 days). Beyond this Yahoo answers
+/// "Unsupported granularity" no matter what.
+const HOUR1_MAX_DAYS: i64 = 730;
+
+/// Coarsen an interval to the finest one Yahoo can serve over the requested
+/// span.
+///
+/// Yahoo's chart API pairs each intraday granularity with a maximum history.
+/// Asking for 1-minute bars over five years is not "a long window", it is an
+/// impossible request, and it comes back as HTTP 422
+/// `{"message":"Unsupported granularity"}`. The app hit this whenever a custom
+/// date range crossed years while an intraday interval was selected.
+///
+/// Rather than fail, the interval steps up to daily once the window exceeds
+/// what the requested granularity supports. Daily and coarser intervals are left
+/// untouched, and intraday requests inside their window keep full resolution.
+///
+/// The preset `range` is used when there is no explicit timestamp window; the
+/// longest presets are longer than any intraday window, so those coarsen too.
+fn coarsen_interval(
+    interval: Interval,
+    period1: Option<i64>,
+    period2: Option<i64>,
+    range: &str,
+) -> Interval {
+    let days = match (period1, period2) {
+        (Some(p1), Some(p2)) => ((p2 - p1) / 86_400).max(0),
+        _ => range_days(range),
+    };
+
+    let max_days = match interval {
+        Interval::Min1 => MIN1_MAX_DAYS,
+        Interval::Min5 => MIN5_MAX_DAYS,
+        Interval::Min15 | Interval::Min30 => MIN15_MAX_DAYS,
+        Interval::Hour1 => HOUR1_MAX_DAYS,
+        // Daily and coarser are always available, whatever the span.
+        _ => return interval,
+    };
+
+    if days <= max_days {
+        interval
+    } else {
+        Interval::Day1
+    }
+}
+
+/// Approximate span of a Yahoo preset range string, in days.
+fn range_days(range: &str) -> i64 {
+    match range {
+        "1d" | "5d" => 5,
+        "1mo" => 30,
+        "3mo" => 90,
+        "6mo" => 180,
+        "1y" => 365,
+        "2y" => 730,
+        "5y" | "10y" | "ytd" | "max" => 3650,
+        _ => 365,
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct YahooChartResponse {
     chart: ChartData,
@@ -221,6 +288,18 @@ impl YahooProvider {
         period1: Option<i64>,
         period2: Option<i64>,
     ) -> Result<OhlcvSeries> {
+        // Yahoo rejects an intraday interval combined with a long `range`, and
+        // rejects very long intraday windows outright:
+        //
+        //     interval=1h&range=5y   -> 422 "Unsupported granularity"
+        //     interval=1h&range=60d  -> 200
+        //     interval=1d&range=5y   -> 200
+        //
+        // A custom date range can legitimately ask for hourly bars over years,
+        // which is what produced that error. Rather than surface it, the
+        // granularity is coarsened to the finest one Yahoo will actually serve
+        // for the requested span, so the user gets bars instead of an error.
+        let interval = coarsen_interval(interval, period1, period2, range);
         let url = self.build_chart_url(symbol, interval, range, period1, period2);
         let resp = self.fetch_with_retry(&url).await?;
         let data: YahooChartResponse = resp
@@ -477,5 +556,93 @@ mod tests {
         assert!(results.is_ok());
         let r = results.unwrap();
         assert!(!r.is_empty());
+    }
+
+    /// Yahoo caps each intraday granularity to a maximum history. A custom
+    /// window crossing years with an intraday interval used to come back as
+    /// HTTP 422 "Unsupported granularity"; the interval must be coarsened
+    /// instead of failing.
+    #[test]
+    fn test_intraday_interval_coarsens_past_yahoos_window() {
+        let six_years_days = 2192i64;
+        let p1 = 1_577_836_800i64;
+        let p2 = p1 + six_years_days * 86_400;
+
+        // Reproduces the 422 exactly; all of these must coarsen to daily.
+        for iv in [
+            Interval::Min1,
+            Interval::Min5,
+            Interval::Min15,
+            Interval::Min30,
+            Interval::Hour1,
+        ] {
+            assert_eq!(
+                coarsen_interval(iv, Some(p1), Some(p2), "5y"),
+                Interval::Day1,
+                "{iv:?} over {six_years_days}d should coarsen to daily"
+            );
+        }
+    }
+
+    #[test]
+    fn test_intraday_interval_is_preserved_inside_its_window() {
+        let p1 = 1_700_000_000i64;
+        // 1-minute data is only kept for ~30 days.
+        let within = p1 + 20 * 86_400;
+        assert_eq!(
+            coarsen_interval(Interval::Min1, Some(p1), Some(within), "1mo"),
+            Interval::Min1
+        );
+        // Just past the limit it must coarsen.
+        let beyond = p1 + 45 * 86_400;
+        assert_eq!(
+            coarsen_interval(Interval::Min1, Some(p1), Some(beyond), "1mo"),
+            Interval::Day1
+        );
+    }
+
+    #[test]
+    fn test_hourly_survives_a_years_but_not_longer() {
+        let p1 = 1_577_836_800i64;
+        // Hourly reaches back ~2 years.
+        let one_year = p1 + 365 * 86_400;
+        assert_eq!(
+            coarsen_interval(Interval::Hour1, Some(p1), Some(one_year), "1y"),
+            Interval::Hour1
+        );
+        let three_years = p1 + 1095 * 86_400;
+        assert_eq!(
+            coarsen_interval(Interval::Hour1, Some(p1), Some(three_years), "5y"),
+            Interval::Day1
+        );
+    }
+
+    #[test]
+    fn test_daily_and_coarser_are_never_coarsened() {
+        let p1 = 1_577_836_800i64;
+        let p2 = p1 + 2192 * 86_400;
+        for iv in [Interval::Day1, Interval::Week1, Interval::Month1] {
+            assert_eq!(
+                coarsen_interval(iv, Some(p1), Some(p2), "5y"),
+                iv,
+                "{iv:?} is available at any span"
+            );
+        }
+    }
+
+    #[test]
+    fn test_preset_ranges_are_measured_without_timestamps() {
+        // No explicit window: the preset range still has to coarsen, because
+        // a five-year preset with an intraday interval is a 422 just the same.
+        assert_eq!(
+            coarsen_interval(Interval::Hour1, None, None, "5y"),
+            Interval::Day1
+        );
+        assert_eq!(
+            coarsen_interval(Interval::Min5, None, None, "1d"),
+            Interval::Min5
+        );
+        assert_eq!(range_days("5y"), 3650);
+        assert_eq!(range_days("60d"), 365);
     }
 }

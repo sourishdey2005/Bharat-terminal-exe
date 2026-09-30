@@ -41,6 +41,52 @@ const PURPLE: Color32 = Color32::from_rgb(0xBF, 0x5A, 0xFF);
 
 const DAY_SECS: f64 = 86400.0;
 
+/// Height reserved for egui_plot's x-axis label strip. Those labels are drawn
+/// *outside* the height the plot is given, so a panel that does not reserve this
+/// renders its axis over whatever sits below it (the status bar, or the next
+/// panel in a multi-panel layout).
+const AXIS_H: f32 = 30.0;
+
+/// Human-readable description of the engine behind the last forecast, used for
+/// the status-bar tooltip. Every engine in the chain is named explicitly so a
+/// local ONNX model can never be reported as the statistical bench.
+fn engine_tooltip(engine: &str) -> String {
+    match engine {
+        "" => "No forecast run yet. Open the Forecast tab.".to_string(),
+        "Chronos-Bolt Tiny (int8)" => {
+            "Chronos-Bolt Tiny int8 ONNX: 9-quantile foundation model, 64 -> 64".to_string()
+        }
+        "DLinear" => "DLinear ONNX, trained on cached NSE closes: 32 -> 5".to_string(),
+        "N-HiTS (small)" => "N-HiTS small ONNX, multi-rate, cached NSE closes: 32 -> 5".to_string(),
+        "Granite TTM R2" => "IBM Granite TTM R2 via the zsfm CLI".to_string(),
+        "NanoForecast v0.5" => "NanoForecast v0.5 via ONNX Runtime".to_string(),
+        other => format!("Statistical bench: {other}"),
+    }
+}
+
+/// Vertical space a chart panel may use, in its current container.
+///
+/// `ui.available_height()` is not usable directly for two reasons: it
+/// over-reports by roughly 70px in the full-window layout (the CentralPanel is
+/// laid out before the status bar claims its strip), and inside a multi-panel
+/// cell it reports the whole remaining area rather than the cell, which is what
+/// made one 4-in-1 panel consume the canvas and push the rest off-screen.
+///
+/// So the budget is the space between this panel's own chrome and the bottom of
+/// the region it is allowed to paint, with the axis strip reserved.
+fn panel_budget(ui: &egui::Ui) -> f32 {
+    let paint_bottom = ui.clip_rect().max.y;
+    let chrome_bottom = ui.next_widget_position().y;
+    if paint_bottom.is_finite() && chrome_bottom.is_finite() && paint_bottom > chrome_bottom {
+        (paint_bottom - chrome_bottom - AXIS_H).clamp(60.0, 4000.0)
+    } else {
+        // Unconstrained frames report an infinite clip rect; fall back to the
+        // available height rather than handing egui_plot an infinite value,
+        // which stops the window painting entirely.
+        ui.available_height().clamp(60.0, 4000.0)
+    }
+}
+
 /// Fraction of the gap between consecutive bars occupied by a candle body.
 /// Leaves a visible gap so individual bars stay distinguishable.
 const BAR_FILL: f64 = 0.68;
@@ -2540,20 +2586,27 @@ impl BharatApp {
                     ui.separator();
                     ui.label(format!("RAM: {:.0} MB", self.ram_mb))
                         .on_hover_text("This app's own memory footprint");
-                    // Active forecast engine: green while a neural model runs,
-                    // amber for NanoForecast, grey for the statistical bench.
-                    let (dot, dot_color) = if self.forecast_engine == "Granite TTM R2" {
-                        ("● Granite TTM R2", PROFIT)
-                    } else if self.forecast_engine == "NanoForecast v0.5" {
-                        ("● NanoForecast", AMBER)
-                    } else if self.forecast_engine.is_empty() {
-                        ("○ forecast idle", Color32::GRAY)
+                    // Active forecast engine. This reports the engine that
+                    // actually produced the last forecast, so it has to recognise
+                    // every engine in the chain -- the three local ONNX models
+                    // were falling through to the "bench" label and reporting
+                    // "idle" while a neural model was in fact running.
+                    let (dot, dot_color) = match self.forecast_engine.as_str() {
+                        "" => ("\u{25AB} forecast idle", Color32::GRAY),
+                        "Chronos-Bolt Tiny (int8)" | "Granite TTM R2" => ("\u{25CF} ", PROFIT),
+                        "NanoForecast v0.5" => ("\u{25CF} NanoForecast", AMBER),
+                        "DLinear" | "N-HiTS (small)" => ("\u{25CF} ", PROFIT),
+                        _ => ("\u{25CF} ARIMA bench", Color32::GRAY),
+                    };
+                    let dot = if dot.ends_with(' ') {
+                        format!("{dot}{}", self.forecast_engine)
                     } else {
-                        ("● ARIMA bench", Color32::GRAY)
+                        dot.to_string()
                     };
                     ui.separator();
-                    ui.label(RichText::new(dot).color(dot_color))
-                        .on_hover_text("Engine behind the last forecast run");
+                    let engine_tip = engine_tooltip(self.forecast_engine.as_str());
+                    ui.label(RichText::new(&dot).color(dot_color))
+                        .on_hover_text(engine_tip);
                     // Headline trading signal, when the classifier is loaded.
                     if let Some(output) = &self.last_signal {
                         let headline = output.headline();
@@ -3935,7 +3988,7 @@ impl BharatApp {
         ui.label(RichText::new(format!("VOL — Volume — {}", series.symbol)).strong());
         Plot::new("volume_tab_plot")
             .auto_bounds(egui::emath::Vec2b::new(true, true))
-            .height(ui.available_height())
+            .height(panel_budget(ui))
             .allow_scroll(true)
             .allow_drag(true)
             .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
@@ -4200,46 +4253,145 @@ impl BharatApp {
     /// canvas and the other three were pushed off-screen. Pinning `max_rect`
     /// makes `available_height()` return the cell height, which is what makes
     /// the 2x2 split hold.
-    fn draw_four_in_one(&self, ui: &mut egui::Ui) {
+    fn draw_four_in_one(&mut self, ui: &mut egui::Ui) {
         let s = &self.data.candles;
         ui.label(RichText::new(format!("4-in-1 \u{2014} {}", s.symbol)).strong());
-        ui.label(
-            RichText::new("Price | Volume | RSI | MACD \u{2014} drag to pan, scroll to zoom")
-                .small()
-                .color(Color32::GRAY),
-        );
 
-        if s.candles.is_empty() {
+        // Forecast model strip. The engine picker lives on the Forecast tab;
+        // this shows which model is loaded and what it predicts, so the models
+        // are visible here rather than hidden behind another tab. Clicking the
+        // engine cycles to the next one that is actually installed.
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Model").small().color(Color32::GRAY));
+            for engine in ForecastEngine::ALL {
+                let available = match engine {
+                    ForecastEngine::Auto => true,
+                    ForecastEngine::Granite | ForecastEngine::Nano => true,
+                    ForecastEngine::Chronos | ForecastEngine::DLinear | ForecastEngine::NHits => {
+                        engine.local_model().is_some_and(|m| local_model_ready(m))
+                    }
+                    ForecastEngine::Arima | ForecastEngine::ExpSmooth | ForecastEngine::MovAvg => {
+                        true
+                    }
+                };
+                let selected = self.forecast_preferred == engine;
+                let text = if selected {
+                    format!("\u{25CF} {}", engine.label())
+                } else {
+                    engine.label().to_string()
+                };
+                let color = if !available {
+                    Color32::from_gray(90)
+                } else if selected {
+                    PROFIT
+                } else {
+                    Color32::from_gray(190)
+                };
+                if ui
+                    .add(egui::Button::new(RichText::new(text).small().color(color)).frame(false))
+                    .on_hover_text(if available {
+                        "Use this engine. Click the model strip to re-run the forecast."
+                    } else {
+                        "Model file not installed."
+                    })
+                    .clicked()
+                    && available
+                {
+                    self.forecast_preferred = engine;
+                    self.run_forecast();
+                }
+            }
+        });
+
+        // The active model and what it returned, in one line.
+        if let Some(err) = self.forecast_error.clone() {
+            ui.colored_label(
+                LOSS,
+                RichText::new(format!("Forecast failed: {err}")).small(),
+            );
+        } else if !self.forecast_engine.is_empty() {
+            let last = self.forecast_basis.last().copied().unwrap_or(0.0);
+            let next = self.forecast_values.first().copied();
+            let delta = next
+                .map(|v| {
+                    if last > 0.0 {
+                        format!("{v:.2} ({:+.2}%)", (v / last - 1.0) * 100.0)
+                    } else {
+                        format!("{v:.2}")
+                    }
+                })
+                .unwrap_or_else(|| "no points".into());
+            ui.colored_label(
+                PROFIT,
+                RichText::new(format!(
+                    "{} \u{2192} {} steps, next {delta}",
+                    self.forecast_engine,
+                    self.forecast_values.len()
+                ))
+                .small(),
+            );
+        } else {
+            ui.colored_label(
+                Color32::GRAY,
+                RichText::new("Forecast idle \u{2014} pick a model above").small(),
+            );
+        }
+
+        if self.data.candles.candles.is_empty() {
             ui.label("No data for this symbol.");
             return;
         }
 
-        const GAP: f32 = 8.0;
-        const TOP_OFFSET: f32 = 40.0;
+        // Run once on first visit so the model readout is never empty.
+        if self.forecast_engine.is_empty() && self.forecast_error.is_none() {
+            self.run_forecast();
+        }
+
+        const GAP: f32 = 10.0;
+        const TOP_OFFSET: f32 = 92.0;
+        /// Shared height for each panel's own title band.
+        const TITLE_H: f32 = 22.0;
         let area = ui.available_rect_before_wrap();
         let cells = four_in_one_cells(area, TOP_OFFSET, GAP);
 
-        // (cell index, renderer) in reading order: price, volume, RSI, MACD.
-        let renderers: [fn(&Self, &mut egui::Ui); 4] = [
-            Self::draw_candlestick,
-            Self::draw_volume,
-            Self::draw_rsi,
-            Self::draw_macd,
+        // (title, renderer) in reading order.
+        let panels: [(&str, fn(&Self, &mut egui::Ui)); 4] = [
+            ("PRICE", Self::draw_candlestick),
+            ("VOLUME", Self::draw_volume),
+            ("RSI (14)", Self::draw_rsi),
+            ("MACD (12,26,9)", Self::draw_macd),
         ];
 
-        for (cell_rect, render) in cells.iter().zip(renderers) {
+        for (cell_rect, (title, render)) in cells.iter().zip(panels) {
             let cell_rect = *cell_rect;
-            // `allocate_ui_at_rect` pins the child's max rect, so
-            // `available_height()` inside the renderer reports the *cell* height
+            // llocate_ui_at_rect pins the child's max rect, so
+            // vailable_height() inside the renderer reports the *cell* height
             // rather than the whole canvas. That is what keeps the 2x2 split.
             ui.allocate_ui_at_rect(cell_rect, |child| {
-                // A visible frame makes the four-section split obvious.
                 child.painter().rect_stroke(
                     cell_rect,
                     2.0,
                     Stroke::new(1.0, Color32::from_gray(55)),
                 );
-                render(self, child);
+                // Identical title band in every cell. Without it the four
+                // panels are equal *rects* but not equal *content*: the
+                // candlestick view carries three rows of its own chrome (arrows,
+                // zoom buttons, OHLC legend) while the others carry one, so the
+                // plots underneath come out visibly different sizes.
+                child.painter().text(
+                    egui::pos2(cell_rect.min.x + 8.0, cell_rect.min.y + 4.0),
+                    egui::Align2::LEFT_TOP,
+                    title,
+                    egui::FontId::proportional(12.0),
+                    Color32::from_gray(175),
+                );
+                let plot_rect = egui::Rect::from_min_size(
+                    egui::pos2(cell_rect.min.x, cell_rect.min.y + TITLE_H),
+                    egui::vec2(cell_rect.width(), (cell_rect.height() - TITLE_H).max(40.0)),
+                );
+                child.allocate_ui_at_rect(plot_rect, |plot_ui| {
+                    render(self, plot_ui);
+                });
             });
         }
 
@@ -4375,32 +4527,11 @@ impl BharatApp {
         // Height budget for the price and volume panes, measured in absolute
         // screen coordinates.
         //
-        // `ui.available_height()` over-reports here by roughly 70px: the
-        // CentralPanel is laid out before the status bar has claimed its strip,
-        // so budgeting from it pushed the volume pane's x-axis labels and the
-        // status bar past the bottom of the window, leaving the chart either
-        // clipped or floating above a blank strip.
-        //
-        // Instead, measure the space between this tab's own chrome (which ends
-        // at the next widget position) and the bottom of the region this panel
-        // may paint, then reserve the status bar and the x-axis label strip --
-        // egui_plot draws those labels *outside* the height it is given. The
-        // two panes then land on the bottom edge at any window size.
-        const STATUS_H: f32 = 26.0;
-        const AXIS_H: f32 = 30.0;
-        // `clip_rect()` is infinite on some frames (an unconstrained Ui), which
-        // would hand egui_plot an infinite height and stop the window painting
-        // at all, so fall back to a default and clamp both ends.
-        const FALLBACK_H: f32 = 620.0;
-        let paint_bottom = ui.clip_rect().max.y;
-        let chrome_bottom = ui.next_widget_position().y;
-        let avail = if paint_bottom.is_finite() && chrome_bottom.is_finite() {
-            (paint_bottom - chrome_bottom - STATUS_H - AXIS_H).clamp(180.0, 4000.0)
-        } else {
-            FALLBACK_H
-        };
-        let vol_h = (avail * 0.22).clamp(60.0, 130.0);
-        let price_h = (avail - vol_h).max(140.0);
+        // Height budget for this panel; see `panel_budget`. The price pane takes
+        // the remainder after the volume strip.
+        let avail = panel_budget(ui);
+        let vol_h = (avail * 0.22).clamp(40.0, 130.0);
+        let price_h = (avail - vol_h).max(60.0);
         // Median gap between bars, used to pick the hovered candle and to pad
         // the visible slice so a bar at the very edge is not clipped.
         let spacing = bar_spacing(series);
@@ -5280,7 +5411,7 @@ impl BharatApp {
         );
         Plot::new("rsi_plot")
             .auto_bounds(egui::emath::Vec2b::new(true, true))
-            .height(ui.available_height())
+            .height(panel_budget(ui))
             .allow_scroll(true)
             .allow_drag(true)
             .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
@@ -5316,7 +5447,7 @@ impl BharatApp {
         );
         Plot::new("macd_plot")
             .auto_bounds(egui::emath::Vec2b::new(true, true))
-            .height(ui.available_height() * 0.5_f32)
+            .height((panel_budget(ui) * 0.62).max(60.0))
             .allow_scroll(true)
             .allow_drag(true)
             .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
@@ -5355,7 +5486,7 @@ impl BharatApp {
             });
         Plot::new("macd_hist")
             .auto_bounds(egui::emath::Vec2b::new(true, true))
-            .height(ui.available_height())
+            .height((panel_budget(ui) * 0.38).max(40.0))
             .allow_scroll(true)
             .allow_drag(true)
             .label_formatter(|_axis: &str, p: &egui_plot::PlotPoint| format_ts(p.x))
@@ -10346,6 +10477,76 @@ mod tests {
             );
             assert_eq!(surface.values.len(), surface.cols * surface.rows);
         }
+    }
+
+    /// All four dashboard panels must expose the *same* plot area.
+    ///
+    /// Equal cell rects are not enough on their own: each renderer draws its own
+    /// chrome above the plot, and the candlestick view carries three rows where
+    /// the others carry one, so the plots came out visibly different heights. The
+    /// dashboard therefore reserves a fixed title band and hands every renderer
+    /// the same sub-rect. This asserts that sub-rect is identical for all four.
+    #[test]
+    fn test_dashboard_panels_have_equal_plot_areas() {
+        const GAP: f32 = 10.0;
+        const TOP_OFFSET: f32 = 92.0;
+        const TITLE_H: f32 = 22.0;
+        let area = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1920.0, 1000.0));
+        let cells = four_in_one_cells(area, TOP_OFFSET, GAP);
+
+        let plots: Vec<egui::Rect> = cells
+            .iter()
+            .map(|c| {
+                egui::Rect::from_min_size(
+                    egui::pos2(c.min.x, c.min.y + TITLE_H),
+                    egui::vec2(c.width(), (c.height() - TITLE_H).max(40.0)),
+                )
+            })
+            .collect();
+
+        for (i, p) in plots.iter().enumerate() {
+            assert_eq!(
+                p.width(),
+                plots[0].width(),
+                "panel {i} has a different width"
+            );
+            assert_eq!(
+                p.height(),
+                plots[0].height(),
+                "panel {i} has a different plot height"
+            );
+            assert!(
+                p.height() >= 100.0,
+                "panel {i} plot is only {:.0}px tall; too small to read",
+                p.height()
+            );
+        }
+        println!(
+            "each panel plot area: {:.0} x {:.0} px",
+            plots[0].width(),
+            plots[0].height()
+        );
+    }
+
+    /// The status bar must name every engine in the chain, not just the two that
+    /// existed before the local ONNX models were added.
+    #[test]
+    fn test_status_bar_recognises_every_engine() {
+        for engine in [
+            "Chronos-Bolt Tiny (int8)",
+            "DLinear",
+            "N-HiTS (small)",
+            "Granite TTM R2",
+            "NanoForecast v0.5",
+        ] {
+            let tip = engine_tooltip(engine);
+            assert!(!tip.is_empty(), "{engine} has no tooltip");
+            assert!(!tip.contains("idle"), "{engine} must not report as idle");
+        }
+        // The bench engines are described generically, and the idle state is
+        // distinguished from a real run.
+        assert!(engine_tooltip("ARIMA(1,1,1)").contains("bench"));
+        assert!(engine_tooltip("").contains("No forecast run"));
     }
 
     /// Every indicator tab added in the visualization expansion must be
