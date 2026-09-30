@@ -13,6 +13,8 @@ use std::fs;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
 
+mod api;
+
 use chrono::{Duration as ChronoDuration, Utc};
 use eframe::egui;
 use egui::{pos2, Color32, Id, RichText, Sense, Stroke, Vec2};
@@ -11229,6 +11231,12 @@ impl eframe::App for BharatApp {
 }
 
 fn main() -> eframe::Result<()> {
+    // Opt-in loopback API. Failing to open the socket must never stop the
+    // terminal from drawing charts, so the result is only reported.
+    match api::spawn_if_enabled() {
+        Some(addr) => eprintln!("[api] listening on http://{addr}"),
+        None => {}
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1920.0_f32, 1080.0_f32])

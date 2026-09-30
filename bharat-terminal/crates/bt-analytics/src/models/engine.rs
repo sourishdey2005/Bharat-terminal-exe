@@ -525,7 +525,7 @@ fn poisoned<T>(_: T) -> ModelError {
     ModelError::Runtime("ONNX session cache lock poisoned".into())
 }
 
-fn ensure_finite(model: &'static str, values: &[f64]) -> Result<(), ModelError> {
+pub(crate) fn ensure_finite(model: &'static str, values: &[f64]) -> Result<(), ModelError> {
     if values.iter().all(|v| v.is_finite()) {
         Ok(())
     } else {

@@ -22,16 +22,25 @@
 //! # Ok::<(), bt_analytics::models::ModelError>(())
 //! ```
 
+pub mod contracts;
 pub mod engine;
+pub mod narrative;
 pub mod quantile_engine;
 pub mod skill;
 pub mod sliding_window;
+pub mod ttm_engine;
 
+pub use contracts::{
+    split_quantiles, CHRONOS_FLAT_LEN, CHRONOS_HORIZON as CONTRACTS_CHRONOS_HORIZON,
+    CHRONOS_P10_INDEX, CHRONOS_P50_INDEX, CHRONOS_P90_INDEX, SIGNAL_N_FEATURES,
+};
 pub use engine::{
     BharatModelEngine, ForecastOutput, Model, ModelError, CHRONOS_CONTEXT, CHRONOS_HORIZON,
     CHRONOS_QUANTILES, DLINEAR_HORIZON, DLINEAR_LOOKBACK, FILE_CHRONOS, FILE_CHRONOS_FP32,
     FILE_DLINEAR, FILE_NHITS, MAX_CACHED_SESSIONS, NHITS_HORIZON, NHITS_LOOKBACK, SIGNAL_WINDOW,
 };
+pub use narrative::{MarketCommentary, NarrativeEngine};
 pub use quantile_engine::{QuantileConeOutput, QuantileForecaster};
 pub use skill::{is_degenerate, ModelSkill, SkillBook, MIN_EDGE, SKILL_FILE};
 pub use sliding_window::SlidingBuffer;
+pub use ttm_engine::{TtmEngine, TtmForecastResult, FILE_TTM_R2, TTM_CONTEXT, TTM_HORIZON};

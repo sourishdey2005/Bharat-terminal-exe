@@ -24,6 +24,21 @@ use std::path::PathBuf;
 /// Load the pinned ONNX Runtime exactly once per process (repeat calls are
 /// cheap no-ops). Returns the DLL path used, for diagnostics.
 pub fn ensure_initialized() -> Result<PathBuf, String> {
+    // Pin the search path *before* touching any ort API.
+    //
+    // `ort`'s lazy `setup_api` resolves the bare name `onnxruntime.dll` through
+    // the OS loader, which on this machine finds the 1.17-era inbox copy in
+    // System32 and then `panic!`s on the version check. With `panic = "abort"`
+    // that is a hard process kill, and it fires from whichever code path happens
+    // to be the first to touch the API. `ORT_DYLIB_PATH` is ort's documented
+    // override and is honoured by that lazy path, so setting it here closes the
+    // hole for every engine, including ones added later.
+    if std::env::var_os(ENV_DYLIB_PATH).is_none() {
+        if let Some(best) = candidate_paths().into_iter().find(|p| p.is_file()) {
+            std::env::set_var(ENV_DYLIB_PATH, best);
+        }
+    }
+
     for candidate in candidate_paths() {
         if !candidate.is_file() {
             continue;
@@ -41,6 +56,9 @@ pub fn ensure_initialized() -> Result<PathBuf, String> {
     }
     Err("no usable onnxruntime.dll next to the executable or in native/".into())
 }
+
+/// The override ort's dynamic loader reads.
+const ENV_DYLIB_PATH: &str = "ORT_DYLIB_PATH";
 
 fn candidate_paths() -> Vec<PathBuf> {
     let mut out = Vec::new();
@@ -84,5 +102,39 @@ mod tests {
         let paths = candidate_paths();
         assert!(!paths.is_empty());
         assert!(paths.iter().all(|p| p.ends_with("onnxruntime.dll")));
+    }
+
+    /// The pinned runtime must be 1.28, never the System32 shadow.
+    ///
+    /// This is the invariant that keeps the app off the 1.17-era inbox build
+    /// that `ort` would otherwise pick up by bare name and `panic!` on.
+    #[test]
+    fn the_pinned_runtime_is_the_1_28_build() {
+        if let Ok(path) = ensure_initialized() {
+            let bytes = std::fs::read(&path).unwrap_or_default();
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(
+                text.contains("1.28"),
+                "pinned runtime at {} does not look like 1.28",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn the_dylib_override_points_at_an_absolute_existing_file() {
+        // `ensure_initialized` installs this; re-run to observe the result.
+        let _ = ensure_initialized();
+        if let Some(v) = std::env::var_os(ENV_DYLIB_PATH) {
+            let p = std::path::PathBuf::from(v);
+            assert!(
+                p.is_absolute(),
+                "relative ORT_DYLIB_PATH re-opens the shadow"
+            );
+            assert!(
+                p.is_file(),
+                "ORT_DYLIB_PATH points at a missing file: {p:?}"
+            );
+        }
     }
 }
