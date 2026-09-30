@@ -1,0 +1,6 @@
+﻿=== INPUT SPEC ===
+  name=context, shape=[1, 64]
+=== OUTPUT SPEC ===
+  name=forecast, shape=[1, 9, 64]
+=== METADATA ===
+  onnx.infer = onnxruntime.quant

@@ -1,0 +1,8 @@
+﻿Input name: context
+Input shape: [1, 64]
+Input type: tensor(float)
+[1,512] FAILED: [ONNXRuntimeError] : 2 : INVALID_ARGUMENT : Got invalid dimensions for input: context for the following indices
+ index: 1 Got: 512 Expected: 64
+ Please fix either the inputs/outputs or the model.
+[1,1,512] FAILED: [ONNXRuntimeError] : 2 : INVALID_ARGUMENT : Invalid rank for input: context Got: 3 Expected: 2 Please fix either the inputs/outputs or the model.
+[1,512,1] FAILED: [ONNXRuntimeError] : 2 : INVALID_ARGUMENT : Invalid rank for input: context Got: 3 Expected: 2 Please fix either the inputs/outputs or the model.

@@ -14,10 +14,12 @@
 //! reports availability up front, every failure degrades to the next engine,
 //! and the subprocess path carries a timeout.
 
+pub mod chronos;
 pub mod granite;
 pub mod nanoforecast;
 pub mod statistical;
 
+pub use chronos::ChronosForecaster;
 pub use granite::GraniteForecaster;
 pub use nanoforecast::NanoForecaster;
 pub use statistical::StatisticalForecaster;
@@ -97,8 +99,8 @@ pub fn models_dir() -> PathBuf {
 
 /// A selectable forecasting engine.
 ///
-/// `Auto` runs the statistical auto-selector (ARIMA → exponential smoothing
-/// → moving average) unless a neural engine is loaded, in which case neural
+/// `Auto` runs the statistical auto-selector (ARIMA -> exponential smoothing
+/// -> moving average) unless a neural engine is loaded, in which case neural
 /// engines take precedence. The concrete variants run exactly that model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Engine {
@@ -163,14 +165,33 @@ pub struct Forecaster {
     granite: Option<GraniteForecaster>,
     nano: Option<NanoForecaster>,
     local: crate::models::BharatModelEngine,
+    chronos: Option<ChronosForecaster>,
     statistical: StatisticalForecaster,
 }
 
 impl Forecaster {
-    /// Create with explicit paths to the model files. Either may be `None`.
+    /// Create with explicit paths to the model files. Any may be `None`.
+    ///
     /// Engines whose files are missing are silently disabled; construction
     /// itself never fails.
-    pub fn new(granite_gguf: Option<&str>, nano_onnx: Option<&str>) -> Self {
+    ///
+    /// `chronos_onnx` selects the standalone [`ChronosForecaster`]. Pass `None`
+    /// to let the fallback chain use the shared session-cached engine instead,
+    /// which is the usual choice: it keeps one Chronos session resident rather
+    /// than opening a second one for the same graph.
+    pub fn new(
+        chronos_onnx: Option<&str>,
+        granite_gguf: Option<&str>,
+        nano_onnx: Option<&str>,
+    ) -> Self {
+        let chronos = chronos_onnx.and_then(|p| {
+            ChronosForecaster::from_file(p)
+                .probe()
+                .map_err(|e| tracing::warn!("standalone Chronos unavailable: {e}"))
+                .ok()
+                .map(|_| ChronosForecaster::from_file(p))
+        });
+
         let granite = granite_gguf.and_then(|p| {
             GraniteForecaster::new(p, &models_dir().join(GRANITE_CONFIG).to_string_lossy())
                 .map_err(|e| tracing::warn!("Granite unavailable: {}", e))
@@ -189,6 +210,7 @@ impl Forecaster {
             // Cheap to build: no model file is read until one is first used, so
             // an installation missing the small ONNX models still starts.
             local: crate::models::BharatModelEngine::with_default_paths(),
+            chronos,
             statistical: StatisticalForecaster::new(),
         }
     }
@@ -205,7 +227,9 @@ impl Forecaster {
         nano_onnx: Option<&str>,
         local_dir: &std::path::Path,
     ) -> Self {
-        let mut f = Self::new(granite_gguf, nano_onnx);
+        // No standalone Chronos: the caller is choosing an explicit model
+        // directory for the shared engine, which already serves Chronos.
+        let mut f = Self::new(None, granite_gguf, nano_onnx);
         f.local = crate::models::BharatModelEngine::new(local_dir);
         f
     }
@@ -218,6 +242,7 @@ impl Forecaster {
         let gguf_str = gguf.to_string_lossy().to_string();
         let onnx_str = onnx.to_string_lossy().to_string();
         Self::new(
+            None,
             gguf.exists().then_some(gguf_str.as_str()),
             onnx.exists().then_some(onnx_str.as_str()),
         )
@@ -291,7 +316,26 @@ impl Forecaster {
                             self.local
                                 .run(model, history)
                                 .map_err(|e| ForecastError::Model(e.to_string()))
-                                .map(|o| (o.predictions, name)),
+                                // Chronos emits a fixed 64 steps regardless of the
+                                // requested horizon, so the chain has to clip or
+                                // the UI draws a longer line than the user asked
+                                // for. Clip, never pad: an engine whose window is
+                                // shorter than `horizon` is allowed to return
+                                // fewer points, not zero-filled ones.
+                                .map(|mut o| {
+                                    if o.predictions.len() > horizon {
+                                        o.predictions.truncate(horizon);
+                                        o.lower = o.lower.map(|mut v| {
+                                            v.truncate(horizon);
+                                            v
+                                        });
+                                        o.upper = o.upper.map(|mut v| {
+                                            v.truncate(horizon);
+                                            v
+                                        });
+                                    }
+                                    (o.predictions, name)
+                                }),
                         )
                     }
                 }
@@ -355,15 +399,38 @@ impl Forecaster {
         self.nano.is_some()
     }
 
+    /// Whether the standalone Chronos forecaster is loaded.
+    ///
+    /// Distinct from asking whether Chronos is *reachable*: the fallback chain
+    /// serves Chronos through the shared engine whether or not this is `true`.
+    pub fn has_chronos(&self) -> bool {
+        self.chronos.is_some()
+    }
+
     /// Name of the highest-priority engine currently loaded.
+    ///
+    /// Ordered to match [`Engine::ALL`], which is the order
+    /// [`Self::predict_with_preference`] actually walks. This previously
+    /// reported "ARIMA (statistical)" whenever only the local ONNX engines were
+    /// installed, even though Chronos or DLinear would have run: a label that
+    /// disagrees with the model that produced the line is worse than no label.
     pub fn model_name(&self) -> &'static str {
-        if self.granite.is_some() {
-            "Granite TTM R2"
-        } else if self.nano.is_some() {
-            "NanoForecast v0.5"
-        } else {
-            "ARIMA (statistical)"
+        if self.local.is_available(crate::models::Model::Chronos) {
+            return "Chronos-Bolt Tiny (int8)";
         }
+        if self.local.is_available(crate::models::Model::DLinear) {
+            return "DLinear";
+        }
+        if self.local.is_available(crate::models::Model::NHiTS) {
+            return "N-HiTS (small)";
+        }
+        if self.granite.is_some() {
+            return "Granite TTM R2";
+        }
+        if self.nano.is_some() {
+            return "NanoForecast v0.5";
+        }
+        "ARIMA (statistical)"
     }
 }
 
@@ -375,9 +442,63 @@ mod tests {
         (0..n).map(|i| 100.0 + i as f64 * 0.5).collect()
     }
 
+    /// The goal this wiring exists for: with the models installed, `Auto` must
+    /// choose Chronos and must return a curved path, not the statistical bench.
+    ///
+    /// Asserted against the chain rather than the standalone type, because the
+    /// chain is what the Forecast tab calls, and a chain that silently skipped
+    /// to ARIMA would look like "the model is flat" from the UI.
+    #[test]
+    fn auto_selects_chronos_and_returns_a_curved_path_when_installed() {
+        let f = Forecaster::with_default_paths();
+        if !f.local.is_available(crate::models::Model::Chronos) {
+            return;
+        }
+        let history: Vec<f64> = (0..200)
+            .map(|i| {
+                let t = i as f64;
+                1182.0 + (t * 0.28).sin() * 18.0 + t * 0.09 + (t * 1.7).cos() * 5.0
+            })
+            .collect();
+        let (out, name) = f
+            .predict_with_engine(&history, 20)
+            .expect("Auto chain should succeed with Chronos installed");
+
+        assert_eq!(
+            name, "Chronos-Bolt Tiny (int8)",
+            "Auto did not pick Chronos first"
+        );
+        assert_eq!(out.len(), 20, "horizon was not honoured");
+        assert!(out.iter().all(|v| v.is_finite()), "{out:?}");
+
+        let lo = out.iter().cloned().fold(f64::MAX, f64::min);
+        let hi = out.iter().cloned().fold(f64::MIN, f64::max);
+        assert!(
+            hi - lo > 0.0,
+            "Chronos returned a flat line at {lo}; that is the degenerate case \
+             this test exists to catch"
+        );
+        assert_eq!(
+            f.model_name(),
+            "Chronos-Bolt Tiny (int8)",
+            "model_name disagrees with the engine that actually ran"
+        );
+    }
+
+    /// A short history must fall through the chain rather than erroring, and the
+    /// engine that served it must be reported honestly.
+    #[test]
+    fn the_chain_reports_the_engine_that_actually_ran() {
+        let f = Forecaster::new(None, None, None);
+        let (_, name) = f
+            .predict_with_engine(&trend(120), 5)
+            .expect("the statistical bench always terminates the chain");
+        assert!(!name.is_empty());
+    }
+
     #[test]
     fn test_empty_history_is_rejected() {
-        let f = Forecaster::new(None, None);
+        let f = Forecaster::new(None, None, None);
         assert!(matches!(
             f.predict(&[], 10),
             Err(ForecastError::EmptyHistory)
@@ -386,7 +507,7 @@ mod tests {
 
     #[test]
     fn test_zero_horizon_returns_empty() {
-        let f = Forecaster::new(None, None);
+        let f = Forecaster::new(None, None, None);
         let (v, _) = f.predict_with_engine(&trend(50), 0).unwrap();
         assert!(v.is_empty());
     }
@@ -422,7 +543,7 @@ mod tests {
         let history: Vec<f64> = (0..60)
             .map(|i| 100.0 + i as f64 * 0.5 + 3.0 * ((i as f64 * 0.7).sin()))
             .collect();
-        let f = Forecaster::new(None, None);
+        let f = Forecaster::new(None, None, None);
         for (preferred, expected) in [
             (Engine::Arima, "ARIMA(1,1,1)"),
             (Engine::ExpSmooth, "ExpSmooth(0.3)"),
@@ -438,7 +559,7 @@ mod tests {
     fn test_missing_preferred_engine_falls_down_the_chain() {
         // Granite files are absent, so preferring it must degrade to the
         // statistical bench rather than fail.
-        let f = Forecaster::new(None, None);
+        let f = Forecaster::new(None, None, None);
         let (v, engine) = f
             .predict_with_preference(Engine::Granite, &trend(60), 8)
             .unwrap();
@@ -527,7 +648,7 @@ mod tests {
 
     #[test]
     fn test_arima_continues_a_trend() {
-        let f = Forecaster::new(None, None);
+        let f = Forecaster::new(None, None, None);
         let history = trend(100);
         let v = f.predict(&history, 5).unwrap();
         // A steady +0.5/step trend must forecast forward, not collapse.
@@ -536,7 +657,7 @@ mod tests {
 
     #[test]
     fn test_insufficient_data_is_an_error_not_a_panic() {
-        let f = Forecaster::new(None, None);
+        let f = Forecaster::new(None, None, None);
         assert!(f.predict(&trend(5), 10).is_err());
     }
 
