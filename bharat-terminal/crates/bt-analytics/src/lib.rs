@@ -36,8 +36,8 @@ pub use indicators::{
     renko, roc, rsi, sma, stochastic, vwap, williams_r,
 };
 pub use models::{
-    BharatModelEngine, ForecastOutput, Model, ModelError, QuantileConeOutput, QuantileForecaster,
-    SlidingBuffer,
+    is_degenerate, BharatModelEngine, ForecastOutput, Model, ModelError, ModelSkill,
+    QuantileConeOutput, QuantileForecaster, SkillBook, SlidingBuffer,
 };
 pub use quant_analytics::{
     FftCycleOutput, QuantAnalyticsEngine, QuantError, Regime, RegimeOutput, FFT_MAX_BARS,

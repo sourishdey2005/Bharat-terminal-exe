@@ -262,7 +262,10 @@ def naive_baseline(x, y):
     return float(np.sqrt(np.mean((pred - y.numpy()) ** 2)))
 
 
-def train(model, xtr, ytr, xva, yva, name, epochs=400, batch=256, lr=3e-3):
+MIN_EDGE = 0.005
+
+
+def fit(model, xtr, ytr, xva, yva, name, epochs=400, batch=256, lr=3e-3):
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     steps = epochs * max(1, len(xtr) // batch)
     sched = torch.optim.lr_scheduler.OneCycleLR(
@@ -271,14 +274,26 @@ def train(model, xtr, ytr, xva, yva, name, epochs=400, batch=256, lr=3e-3):
     lossf = nn.MSELoss()
     started = time.time()
 
-    # Epoch 0 is a candidate. The layers initialize near zero, so the untrained
-    # model already predicts ~0, which under last-close anchoring *is* the random
-    # walk. Seeding the search with that state means selection can only ever
-    # improve on the baseline: a model that fails to beat it is never shipped.
-    best_rmse, best_state = evaluate(model, xva, yva)
-    best_state = {k: v.clone() for k, v in model.state_dict().items()}
-    best_epoch = 0
-    log(f"  {name} epoch    0  val RMSE {best_rmse:.4f}  (untrained = random walk)")
+    # Epoch 0 IS the random walk: the layers initialize near zero and, under
+    # last-close anchoring, predicting ~0 *is* "the price does not move".
+    #
+    # The previous version seeded its best-model search with that state and then
+    # only aborted when the final RMSE was strictly *worse* than the baseline.
+    # Equality therefore passed, and the script exported an untrained model whose
+    # val_rmse equalled val_rmse_random_walk to all 16 digits. That model
+    # denormalises to "the last close, repeated", and the app drew it as a
+    # forecast: a confident flat line indistinguishable from a real prediction.
+    #
+    # The seed is kept - it is the right starting point - but it is no longer
+    # counted as success. A model must earn MIN_EDGE over the baseline or it is
+    # a failure, which is the outcome the data deserves to report.
+    walk = naive_baseline(xva, yva)
+    epoch0, _ = evaluate(model, xva, yva)
+    best_rmse = f64_inf = float("inf")
+    best_state = None
+    best_epoch = -1
+    log(f"  {name} epoch    0  val RMSE {epoch0:.4f}  (random walk {walk:.4f}, "
+        f"does NOT count as a result)")
 
     for epoch in range(epochs):
         model.train()
@@ -303,15 +318,25 @@ def train(model, xtr, ytr, xva, yva, name, epochs=400, batch=256, lr=3e-3):
     if best_state is not None:
         model.load_state_dict(best_state)
     rmse, mae = evaluate(model, xva, yva)
-    base = naive_baseline(xva, yva)
+    base = walk
     log(
         f"{name}: val RMSE {rmse:.4f} (random walk {base:.4f}, "
         f"{100*(1-rmse/base):+.1f}%), MAE {mae:.4f}, best epoch {best_epoch}, "
         f"{time.time()-started:.1f}s, {sum(p.numel() for p in model.parameters())} params"
     )
-    if rmse > base:
+    # The gate that was missing. "Not worse than random walk" is not a forecast,
+    # it is the absence of one; shipping it is what produced the flat lines.
+    edge = 1.0 - rmse / base
+    if best_state is None or edge < MIN_EDGE:
         raise SystemExit(
-            f"{name}: no epoch beat the random-walk baseline ({rmse:.4f} > {base:.4f})"
+            f"{name}: REFUSING TO SHIP. Best validation RMSE {rmse:.4f} is only "
+            f"{100*edge:+.2f}% against a random walk of {base:.4f}, below the "
+            f"{100*MIN_EDGE:.1f}% bar this script requires.\n"
+            f"  A model at or near the baseline denormalises to the last close "
+            f"repeated, which the app would draw as a forecast.\n"
+            f"  Either collect more history into data/cache.db and retrain, or "
+            f"use an engine that actually forecasts (Chronos, ARIMA, the FFT "
+            f"cycle extrapolator)."
         )
     return rmse, base
 
@@ -365,6 +390,8 @@ def export(model, path, name, val_rmse, baseline_rmse):
         "normalization": "last_close_anchored",
         "val_rmse": val_rmse,
         "val_rmse_random_walk": baseline_rmse,
+    "min_edge_required": MIN_EDGE,
+    "passed_edge_gate": (1.0 - val_rmse / baseline_rmse) >= MIN_EDGE,
     }
 
 
@@ -379,14 +406,14 @@ def main():
 
     log("training DLinear")
     dl = DLinear(LOOKBACK, HORIZON)
-    rmse, _ = train(dl, xtr, ytr, xva, yva, "dlinear")
+    rmse, _ = fit(dl, xtr, ytr, xva, yva, "dlinear")
     results["dlinear.onnx"] = export(
         dl, os.path.join(MODELS, "dlinear.onnx"), "dlinear", rmse, base
     )
 
     log("training N-HiTS (small)")
     nh = NHiTS(LOOKBACK, HORIZON)
-    rmse, _ = train(nh, xtr, ytr, xva, yva, "nhits", epochs=600, lr=2e-3)
+    rmse, _ = fit(nh, xtr, ytr, xva, yva, "nhits", epochs=600, lr=2e-3)
     results["nhits_small.onnx"] = export(
         nh, os.path.join(MODELS, "nhits_small.onnx"), "nhits_small", rmse, base
     )

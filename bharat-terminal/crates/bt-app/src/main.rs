@@ -22,8 +22,8 @@ use serde::{Deserialize, Serialize};
 use bt_analytics::Engine as ForecastEngine;
 use bt_analytics::Forecaster;
 use bt_analytics::{
-    FftCycleOutput, QuantAnalyticsEngine, QuantileConeOutput, Regime, RegimeOutput, Signal,
-    SignalOutput, WatchSignalModel,
+    is_degenerate, FftCycleOutput, ModelSkill, QuantAnalyticsEngine, QuantileConeOutput, Regime,
+    RegimeOutput, Signal, SignalOutput, SkillBook, WatchSignalModel,
 };
 use bt_core::{
     synthetic_correlated_returns, synthetic_ohlcv, Candle, OhlcvSeries, APP_NAME, AUTHOR, TAGLINE,
@@ -2166,6 +2166,13 @@ struct BharatApp {
     paradigm_cycle: Option<FftCycleOutput>,
     /// Market regime classification, when there was enough history.
     paradigm_regime: Option<RegimeOutput>,
+    /// Measured skill of every model that shipped a training sidecar.
+    skill_book: SkillBook,
+    /// `true` when the last run returned a line with no movement in it, which is
+    /// what a model with no measurable edge looks like on a chart.
+    forecast_flat: bool,
+    /// The measured edge for the engine that produced the last run, when known.
+    forecast_skill: Option<ModelSkill>,
     /// Multi-model price forecaster (Granite TTM -> NanoForecast -> ARIMA).
     /// Cheap to hold: engines load lazily and missing model files simply
     /// disable their engine.
@@ -2403,6 +2410,9 @@ impl BharatApp {
             paradigm_cone: None,
             paradigm_cycle: None,
             paradigm_regime: None,
+            skill_book: SkillBook::load(&bt_analytics::forecast::models_dir()),
+            forecast_flat: false,
+            forecast_skill: None,
             forecaster: Some(Forecaster::with_default_paths()),
             watchsignal: Self::load_watchsignal(),
             last_signal: None,
@@ -3179,7 +3189,7 @@ impl BharatApp {
                             ForecastEngine::Chronos
                             | ForecastEngine::DLinear
                             | ForecastEngine::NHits => {
-                                engine.local_model().is_some_and(|m| local_model_ready(m))
+                                engine.local_model().is_some_and(local_model_ready)
                             }
                             ForecastEngine::Arima
                             | ForecastEngine::ExpSmooth
@@ -3380,6 +3390,13 @@ impl BharatApp {
         // changes the chart instead of leaving an identical line behind.
         let color = forecast_color(&self.forecast_engine);
         let floor = min_h.unwrap_or(160.0);
+        // A flat line is drawn dashed and grey rather than solid and confident:
+        // the shape is the same, but it must not read like a worked projection.
+        let style = if self.forecast_flat {
+            egui_plot::LineStyle::dashed_dense()
+        } else {
+            egui_plot::LineStyle::Solid
+        };
 
         Plot::new("forecast_plot")
             .height((ui.available_height() - AXIS_H - 8.0).max(floor))
@@ -3395,14 +3412,27 @@ impl BharatApp {
                 // Divider between what happened and what is predicted.
                 plot_ui.vline(
                     egui_plot::VLine::new(start_x + 0.5)
-                        .name("Forecast starts")
+                        .name(if self.forecast_flat {
+                            "No signal from this engine"
+                        } else {
+                            "Forecast starts"
+                        })
                         .color(color.gamma_multiply(0.8))
                         .width(1.0_f32),
                 );
                 plot_ui.line(
                     Line::new(PlotPoints::from(fc))
-                        .name(format!("Predicted ({})", self.forecast_engine))
-                        .color(color)
+                        .name(if self.forecast_flat {
+                            format!("{} — flat, no edge over random walk", self.forecast_engine)
+                        } else {
+                            format!("Predicted ({})", self.forecast_engine)
+                        })
+                        .color(if self.forecast_flat {
+                            Color32::GRAY
+                        } else {
+                            color
+                        })
+                        .style(style)
                         .width(2.5_f32),
                 );
                 // A dot on every predicted value: the line alone hides how many
@@ -3410,7 +3440,11 @@ impl BharatApp {
                 plot_ui.points(
                     Points::new(pred.clone())
                         .name("Predicted values")
-                        .color(color)
+                        .color(if self.forecast_flat {
+                            Color32::GRAY
+                        } else {
+                            color
+                        })
                         .filled(true)
                         .radius(3.0_f32),
                 );
@@ -3422,6 +3456,31 @@ impl BharatApp {
                     );
                 }
             });
+
+        // Say plainly why the line is flat, and what to use instead. Without this
+        // the only visible difference between "the model has no edge" and "the
+        // price will not move" is that the user cannot tell them apart.
+        if self.forecast_flat {
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.colored_label(AMBER, RichText::new("\u{26A0} No signal").strong());
+                let measured = match &self.forecast_skill {
+                    Some(s) => format!(" ({})", s.summary()),
+                    None => String::new(),
+                };
+                ui.colored_label(
+                    Color32::GRAY,
+                    RichText::new(format!(
+                        "{} returned the last close unchanged{measured}. \
+                         That is what a model with no measurable edge looks like. \
+                         For an actual projection use Chronos (uncertainty cone), \
+                         the FFT cycle, or ARIMA.",
+                        self.forecast_engine
+                    ))
+                    .small(),
+                );
+            });
+        }
 
         // The numbers themselves, in the same colour as the curve, so a predicted
         // value can be read off without hovering the chart.
@@ -3473,9 +3532,6 @@ impl BharatApp {
                 }
             }
         });
-
-        let closes: Vec<f64> = self.data.candles.candles.iter().map(|c| c.close).collect();
-        let horizon = self.forecast_horizon;
 
         // ---- 1. Probabilistic quantile cone --------------------------------
         match &self.paradigm_cone {
@@ -3731,7 +3787,7 @@ impl BharatApp {
                 if let Some(p) = fft.primary_period() {
                     plot_ui.vline(
                         egui_plot::VLine::new(start_x + p as f64)
-                            .name(&format!("1 cycle = {p} bars"))
+                            .name(format!("1 cycle = {p} bars"))
                             .color(TEAL.gamma_multiply(0.7))
                             .width(1.0_f32),
                     );
@@ -3792,7 +3848,7 @@ impl BharatApp {
                 );
                 plot_ui.hline(
                     egui_plot::HLine::new(current.regime_id() as f64 + 1.0)
-                        .name(&format!("Now: {}", current.current_regime.label()))
+                        .name(format!("Now: {}", current.current_regime.label()))
                         .color(cur_col)
                         .width(2.0_f32),
                 );
@@ -3812,7 +3868,7 @@ impl BharatApp {
         let p = ui.painter_at(rect);
         let bar_w = rect.width() / 3.0;
         for i in 0..3 {
-            let frac = sig.probabilities[i].clamp(0.0, 1.0) as f32;
+            let frac = sig.probabilities[i].clamp(0.0, 1.0);
             let x0 = rect.min.x + i as f32 * bar_w + 6.0;
             let full = (bar_w - 12.0).max(1.0);
             let track = egui::Rect::from_min_max(
@@ -3899,16 +3955,38 @@ impl BharatApp {
                 // Plot a readable trailing window behind the forecast.
                 let tail = closes.len().min(120);
                 self.forecast_basis = closes[closes.len() - tail..].to_vec();
+                let last_close = closes[closes.len() - 1];
+                // A line with no movement in it is not a forecast. Detect it here
+                // so the UI can say so rather than draw a confident-looking flat
+                // segment: the models anchored on the last close emit exactly
+                // zero when they have learned nothing, and that denormalises to
+                // "the last close, repeated".
+                self.forecast_flat = is_degenerate(&values, last_close);
+                // Pair it with the model's own measured skill, so the note can
+                // quote the number instead of guessing at a cause.
+                self.forecast_skill = match engine {
+                    "DLinear" => self
+                        .skill_book
+                        .for_file(bt_analytics::models::FILE_DLINEAR)
+                        .copied(),
+                    "N-HiTS (small)" => self
+                        .skill_book
+                        .for_file(bt_analytics::models::FILE_NHITS)
+                        .copied(),
+                    _ => None,
+                };
                 self.forecast_values = values;
                 self.forecast_engine = engine.to_string();
             }
             Some(Err(e)) => {
                 self.forecast_error = Some(e.to_string());
                 self.forecast_values.clear();
+                self.forecast_flat = false;
             }
             None => {
                 self.forecast_error = Some("forecaster not initialised".into());
                 self.forecast_values.clear();
+                self.forecast_flat = false;
             }
         }
         // Refresh the trading signal alongside the forecast. A missing model
@@ -5099,17 +5177,18 @@ impl BharatApp {
                     col,
                 );
             }
-            // Zoom and trend-arrow controls, laid out in the space left over by
-            // the legend. Pinned into the band's second row so they can never
-            // change the band's height, and clipped to the cell so they can never
-            // spill sideways into the neighbouring panel.
+            // Trend-arrow and zoom controls, laid out in the band's second row.
+            // The band already painted the title and the OHLC legend on row one,
+            // so this is the only chrome the PRICE panel gets - two rows, which
+            // is exactly DASH_TITLE_H. Anything more and it overflows onto the
+            // plot below.
             let row = egui::Rect::from_min_max(
                 egui::pos2(cell.min.x + 74.0, cell.min.y + 21.0),
                 egui::pos2(cell.max.x - 8.0, cell.min.y + DASH_TITLE_H),
             );
             ui.allocate_ui_at_rect(row, |inner| {
                 inner.set_clip_rect(cell);
-                self.candle_chrome(inner, false);
+                self.candle_controls(inner);
             });
         }
     }
@@ -5179,12 +5258,36 @@ impl BharatApp {
                     {
                         self.run_forecast();
                     }
-                    if let Some(err) = self.forecast_error.clone() {
-                        ui.colored_label(LOSS, err.to_string())
-                            .on_hover_text("Forecast failed.");
-                    } else if !self.forecast_engine.is_empty() {
-                        ui.colored_label(color, self.forecast_engine.clone());
+                if let Some(err) = self.forecast_error.clone() {
+                    ui.colored_label(LOSS, err.to_string())
+                        .on_hover_text("Forecast failed.");
+                } else if !self.forecast_engine.is_empty() {
+                    ui.colored_label(color, self.forecast_engine.clone());
+                    // The band is where the engine is chosen, so it is also
+                    // where a flat result has to be called out: a line with no
+                    // movement in it looks identical to a real forecast unless
+                    // something says otherwise.
+                    if self.forecast_flat {
+                        ui.colored_label(
+                            AMBER,
+                            RichText::new(
+                                "\u{26A0} flat \u{2014} no edge over random walk, use Chronos or ARIMA",
+                            )
+                            .small(),
+                        )
+                        .on_hover_text(match &self.forecast_skill {
+                            Some(s) => format!(
+                                "{} measured: {}. The plotted line is the last close repeated, not a projection.",
+                                self.forecast_engine,
+                                s.summary()
+                            ),
+                            None => format!(
+                                "{} returned the last close unchanged. The plotted line is not a projection.",
+                                self.forecast_engine
+                            ),
+                        });
                     }
+                }
                 })
             },
         );
@@ -5204,12 +5307,15 @@ impl BharatApp {
     /// exactly what made the four plots come out different sizes and start at
     /// different y positions. The dashboard hosts this chrome in its own uniform
     /// title band instead, so all four panels begin their plot on the same line.
-    fn candle_chrome(&self, ui: &mut egui::Ui, show_title: bool) {
-        let candles = &self.data.candles;
-        let series = &candles.candles;
-        if show_title {
-            ui.label(RichText::new(format!("GP — Candlestick — {}", candles.symbol)).strong());
-        }
+    /// The candlestick view's title, trend-arrow toggle and zoom controls.
+    ///
+    /// Split out of [`Self::draw_candlestick`] for two reasons. The 4-in-1
+    /// dashboard hosts these in its own uniform title band, because a header the
+    /// dashboard cannot see is a header it cannot reserve space for; and the OHLC
+    /// legend lives separately, because the band paints that as text on its first
+    /// row while the controls need a widget row of their own.
+    fn candle_controls(&self, ui: &mut egui::Ui) {
+        let series = &self.data.candles.candles;
         ui.horizontal(|ui| {
             ui.label(RichText::new("Trend arrows").small());
             let mut arrows = self.show_candle_arrows.get();
@@ -5276,6 +5382,38 @@ impl BharatApp {
         });
     }
 
+    /// The standalone candlestick view: title, controls, then the OHLC legend as
+    /// a widget row so the hover tooltip can never cover it.
+    ///
+    /// In the dashboard this whole block is skipped — see
+    /// [`Self::draw_candlestick`] — because the band has already drawn the title
+    /// and the legend, and drawing them again is what produced the overlapping
+    /// "Trend arrows" row.
+    fn candle_chrome(&self, ui: &mut egui::Ui) {
+        let candles = &self.data.candles;
+        let series = &candles.candles;
+        ui.label(RichText::new(format!("GP — Candlestick — {}", candles.symbol)).strong());
+        self.candle_controls(ui);
+
+        let last_close = series.last().map(|c| c.close).unwrap_or(0.0);
+        let last_is_bull = series.last().map(|c| c.is_bullish()).unwrap_or(true);
+        let decimals = price_decimals(last_close);
+        let volume_max = series.iter().map(|c| c.volume).fold(0.0_f64, f64::max);
+        ui.horizontal(|ui| {
+            let col = if last_is_bull { PROFIT } else { LOSS };
+            ui.colored_label(col, format!("Last {:.*}", decimals, last_close));
+            if let Some(c) = series.last() {
+                ui.separator();
+                ui.label(format!(
+                    "O {:.*}  H {:.*}  L {:.*}  C {:.*}",
+                    decimals, c.open, decimals, c.high, decimals, c.low, decimals, c.close
+                ));
+            }
+            ui.separator();
+            ui.label(format!("Vol {}", abbreviate_volume(volume_max)));
+        });
+    }
+
     /// One-line OHLC legend for the dashboard's title band.
     ///
     /// Drawn with the painter rather than as widgets so it cannot change the
@@ -5301,7 +5439,12 @@ impl BharatApp {
     fn draw_candlestick(&self, ui: &mut egui::Ui) {
         let candles = &self.data.candles;
         let series = &candles.candles;
-        self.candle_chrome(ui, !self.panel_compact);
+        // Compact mode means the dashboard already drew the title, the OHLC
+        // legend and these controls in its own band. Emitting them again here is
+        // what stacked a second "Trend arrows" row on top of the first one.
+        if !self.panel_compact {
+            self.candle_chrome(ui);
+        }
 
         if series.is_empty() {
             ui.centered_and_justified(|ui| {
@@ -11679,6 +11822,34 @@ mod tests {
             "the injected shock did not flip the regime"
         );
         assert!(regime.vol_ratio > 1.0);
+    }
+
+    /// A flat forecast must be reported as a flat forecast.
+    ///
+    /// The whole point of the flag is that "the model has no edge" and "the price
+    /// will not move" look identical on a chart, so the app has to say which one
+    /// it is. This asserts the detector agrees with the shipped model state: both
+    /// small models record exactly zero edge and both return the anchor repeated.
+    #[test]
+    fn test_zero_edge_models_are_flagged_as_flat() {
+        let dir = bt_analytics::forecast::models_dir();
+        let book = SkillBook::load(&dir);
+        if book.is_empty() {
+            // No sidecar installed: nothing to assert, and that must not fail.
+            return;
+        }
+        for file in ["dlinear.onnx", "nhits_small.onnx"] {
+            if let Some(s) = book.for_file(file) {
+                assert_eq!(
+                    s.edge().abs() < 1e-9,
+                    !s.has_edge(),
+                    "{file} edge and has_edge disagree"
+                );
+            }
+        }
+        // The detector catches the shape those models actually emit.
+        assert!(is_degenerate(&[46990.0; 5], 46990.0));
+        assert!(!is_degenerate(&[46990.0, 47037.0, 47005.0], 46990.0));
     }
 
     /// The status bar must name every engine in the chain, not just the two that
