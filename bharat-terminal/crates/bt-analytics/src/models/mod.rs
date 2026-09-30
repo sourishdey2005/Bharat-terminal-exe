@@ -1,12 +1,17 @@
 // crates/bt-analytics/src/models/mod.rs
 // Author: Sourish Dey
 
-//! On-device ONNX inference for the small local models.
+//! On-device inference for the small local models.
 //!
-//! Everything here runs locally through the pinned ONNX Runtime: no network
-//! calls, no Python, no external service. Sessions are loaded lazily and cached
-//! under an LRU cap so the 2 GB memory budget is respected, and each session is
-//! configured for single-threaded, `Level1`, memory-pattern-free execution.
+//! Everything here runs locally: no network calls and no external service. Most
+//! engines go through the pinned ONNX Runtime, with sessions loaded lazily and
+//! cached under an LRU cap so the 2 GB memory budget is respected, and each
+//! session configured for single-threaded, `Level1`, memory-pattern-free
+//! execution.
+//!
+//! The one exception is [`py_bridge`], which shells out to an embedded CPython
+//! (`python_runtime/`) for a statistical cone that is cheap and weightless. It is
+//! still fully local, spawned with `CREATE_NO_WINDOW`, and bounded by a timeout.
 //!
 //! ```no_run
 //! use bt_analytics::models::{BharatModelEngine, Model};
@@ -25,6 +30,8 @@
 pub mod contracts;
 pub mod engine;
 pub mod narrative;
+pub mod patchtst_engine;
+pub mod py_bridge;
 pub mod quantile_engine;
 pub mod skill;
 pub mod sliding_window;
@@ -40,6 +47,11 @@ pub use engine::{
     FILE_DLINEAR, FILE_NHITS, MAX_CACHED_SESSIONS, NHITS_HORIZON, NHITS_LOOKBACK, SIGNAL_WINDOW,
 };
 pub use narrative::{MarketCommentary, NarrativeEngine};
+pub use patchtst_engine::{
+    PatchTstEngine, PatchTstError, PatchTstForecastResult, FILE_PATCHTST, PATCHTST_HORIZON,
+    PATCHTST_LOOKBACK,
+};
+pub use py_bridge::{EmbeddedPyEngine, PyBridgeError, PyStatus, PythonForecastResult, PY_MIN_BARS};
 pub use quantile_engine::{QuantileConeOutput, QuantileForecaster};
 pub use skill::{is_degenerate, ModelSkill, SkillBook, MIN_EDGE, SKILL_FILE};
 pub use sliding_window::SlidingBuffer;

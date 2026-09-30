@@ -37,6 +37,10 @@ use tower_http::cors::{Any, CorsLayer};
 
 use bt_analytics::models::engine::{BharatModelEngine, Model, ModelError};
 use bt_analytics::models::narrative::NarrativeEngine;
+use bt_analytics::models::patchtst_engine::{
+    PatchTstEngine, PatchTstForecastResult, PATCHTST_HORIZON, PATCHTST_LOOKBACK,
+};
+use bt_analytics::models::py_bridge::{EmbeddedPyEngine, PyStatus, PythonForecastResult};
 use bt_analytics::models::quantile_engine::QuantileConeOutput;
 use bt_analytics::models::ttm_engine::{TtmEngine, TtmStatus};
 use bt_analytics::signal::Signal;
@@ -56,6 +60,10 @@ const DEFAULT_LIMIT: usize = 500;
 pub struct ApiState {
     cache: Arc<bt_data::cache::Cache>,
     engine: Arc<BharatModelEngine>,
+    /// Embedded CPython cone. Cheap to clone: it holds no process or session.
+    py: Arc<EmbeddedPyEngine>,
+    /// PatchTST transformer, session created on first use.
+    patchtst: Arc<PatchTstEngine>,
 }
 
 /// Which engine a forecast route should use.
@@ -386,6 +394,47 @@ enum ApiFailure {
     BadEngine(String),
     /// The graph or history rejected the request.
     Engine(ModelError),
+    /// Cached history is real but shorter than the engine's window.
+    ShortHistory { needed: usize, got: usize },
+    /// The caller sent something the engine cannot use. 400.
+    Client(String),
+    /// The engine is not installed, so this deployment cannot serve the request.
+    /// 503, same as an uncached symbol: it resolves once the install or cache
+    /// catches up, without the caller changing anything.
+    Unavailable(String),
+    /// The engine tried and failed. 500.
+    Server(String),
+}
+
+/// Classify a `py_bridge` failure by variant rather than by matching its text.
+///
+/// String matching would silently reclassify a new error variant as a 400, which
+/// is how a "model file is corrupt" ends up reported as a client mistake.
+fn py_failure(e: bt_analytics::models::py_bridge::PyBridgeError) -> ApiFailure {
+    use bt_analytics::models::py_bridge::PyBridgeError as E;
+    match e {
+        E::TooFewBars { .. } | E::NonFinitePrice { .. } | E::NonPositivePrice { .. } => {
+            ApiFailure::Client(e.to_string())
+        }
+        E::RuntimeMissing { .. } | E::ScriptMissing { .. } => {
+            ApiFailure::Unavailable(e.to_string())
+        }
+        E::Spawn(_) | E::Timeout(_) | E::Failed { .. } | E::BadOutput(_) | E::Script(_) => {
+            ApiFailure::Server(e.to_string())
+        }
+    }
+}
+
+/// Classify a `patchtst_engine` failure by variant.
+fn patchtst_failure(e: bt_analytics::models::patchtst_engine::PatchTstError) -> ApiFailure {
+    use bt_analytics::models::patchtst_engine::PatchTstError as E;
+    match e {
+        E::BadWindowLength { .. } | E::NonFinite { .. } => ApiFailure::Client(e.to_string()),
+        E::ModelNotFound { .. } => ApiFailure::Unavailable(e.to_string()),
+        E::Onnx(_) | E::BadOutputShape { .. } | E::NonFiniteOutput => {
+            ApiFailure::Server(e.to_string())
+        }
+    }
 }
 
 impl ApiFailure {
@@ -401,6 +450,15 @@ impl ApiFailure {
                 &format!("unknown engine {name:?}; try dlinear, nhits, chronos or ttm"),
             ),
             ApiFailure::Engine(e) => engine_error(e),
+            ApiFailure::ShortHistory { needed, got } => unavailable(
+                StatusCode::BAD_REQUEST,
+                &format!("need {needed} cached closes, have {got}"),
+            ),
+            ApiFailure::Client(message) => unavailable(StatusCode::BAD_REQUEST, &message),
+            ApiFailure::Unavailable(message) => {
+                unavailable(StatusCode::SERVICE_UNAVAILABLE, &message)
+            }
+            ApiFailure::Server(message) => unavailable(StatusCode::INTERNAL_SERVER_ERROR, &message),
         }
     }
 }
@@ -471,6 +529,78 @@ async fn engines(State(s): State<ApiState>) -> impl IntoResponse {
             available,
             detail,
         });
+
+        // PatchTST: probed rather than assumed. `is_available` only says the file
+        // is there, and a graph that is present but unloadable would otherwise be
+        // advertised and then fail on the user's first request.
+        let (patchtst_available, patchtst_detail) = match &runtime_note {
+            Some(r) => (false, format!("ONNX Runtime unavailable: {r}")),
+            None => {
+                let p = PatchTstEngine::new(bt_analytics::forecast::models_dir());
+                if !p.is_available() {
+                    (false, "graph not installed".to_string())
+                } else {
+                    match p.probe() {
+                        Ok(()) => (
+                            true,
+                            format!(
+                                "PatchTST {} -> {} bars, runs",
+                                PATCHTST_LOOKBACK, PATCHTST_HORIZON
+                            ),
+                        ),
+                        Err(e) => (false, format!("graph does not execute: {e}")),
+                    }
+                }
+            }
+        };
+        v.push(EngineStatus {
+            name: "PatchTST (int8)",
+            available: patchtst_available,
+            detail: patchtst_detail,
+        });
+
+        // The Python bridge needs no ONNX runtime at all, so it is reported
+        // independently of `runtime_note`. Probed rather than assumed: an
+        // embeddable Python resolves imports through the user site directory, so
+        // the runtime can be present and still unable to import numpy.
+        let py = EmbeddedPyEngine::new();
+        let (py_available, py_detail) = match py.probe() {
+            PyStatus::Ready { numpy } => (
+                true,
+                format!(
+                    "{} -> 5 bars with a p10/p90 cone, numpy {numpy} bundled",
+                    bt_analytics::models::py_bridge::PY_MIN_BARS
+                ),
+            ),
+            PyStatus::ReadyButNotBundled { numpy, path } => (
+                true,
+                format!(
+                    "{} -> 5 bars, numpy {numpy} but loaded from {path} \
+                     rather than python_runtime/; this install is not self-contained",
+                    bt_analytics::models::py_bridge::PY_MIN_BARS
+                ),
+            ),
+            PyStatus::RuntimeMissing => (
+                false,
+                format!(
+                    "embedded runtime not found at {}",
+                    py.python_bin().display()
+                ),
+            ),
+            PyStatus::NumpyMissing(why) => (
+                false,
+                format!(
+                    "runtime at {} cannot import numpy: {why}",
+                    py.python_bin().display()
+                ),
+            ),
+        };
+        v.push(EngineStatus {
+            name: "Python drift/volatility cone",
+            available: py_available,
+            detail: py_detail,
+        });
+
         v
     })
     .await;
@@ -500,6 +630,131 @@ async fn health() -> impl IntoResponse {
     })
 }
 
+/// Which forecast a caller wants, for the `/api/ai/*` routes.
+#[derive(Debug, Deserialize)]
+struct SymbolQuery {
+    symbol: String,
+    #[serde(default = "default_interval")]
+    interval: String,
+}
+
+/// Response envelope for the `/api/ai/*` routes.
+#[derive(Serialize)]
+struct AiForecastResponse {
+    symbol: String,
+    interval: String,
+    /// Bars of history the forecast actually consumed.
+    history_used: usize,
+    engine: &'static str,
+    /// Absent only when the request failed.
+    forecast: Option<AiForecastBody>,
+    error: Option<String>,
+}
+
+/// Union of the two AI payloads, so one envelope shape serves both routes and a
+/// client can tell them apart by `engine`.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum AiForecastBody {
+    Python(PythonForecastResult),
+    PatchTst(PatchTstForecastResult),
+}
+
+/// `GET /api/ai/py_forecast` — the embedded Python drift/volatility cone.
+///
+/// Prices come from the cache. A cache miss is a 503 with a reason rather than a
+/// forecast over an invented series, because a number the user cannot trace back
+/// to an instrument is worse than no number at all.
+async fn py_forecast(
+    State(s): State<ApiState>,
+    Query(q): Query<SymbolQuery>,
+) -> axum::response::Response {
+    let cache = s.cache.clone();
+    let py = s.py.clone();
+    let (symbol, interval) = (q.symbol.clone(), q.interval.clone());
+
+    let result = tokio::task::spawn_blocking(move || -> Result<AiForecastResponse, ApiFailure> {
+        let closes = real_closes(&cache, &symbol, &interval)?;
+        // f32 because that is what both consumers take; the sources are f64.
+        let prices: Vec<f32> = closes.iter().map(|&c| c as f32).collect();
+        let body = py.predict(&prices).map_err(py_failure)?;
+        Ok(AiForecastResponse {
+            symbol: symbol.clone(),
+            interval: interval.clone(),
+            history_used: prices.len(),
+            engine: "python-drift-volatility",
+            forecast: Some(AiForecastBody::Python(body)),
+            error: None,
+        })
+    })
+    .await;
+
+    finish_ai(result)
+}
+
+/// `GET /api/ai/patchtst_forecast` — the PatchTST transformer.
+///
+/// Same rule as above: real closes, 503 on a miss.
+async fn patchtst_forecast(
+    State(s): State<ApiState>,
+    Query(q): Query<SymbolQuery>,
+) -> axum::response::Response {
+    let cache = s.cache.clone();
+    let patchtst = s.patchtst.clone();
+    let (symbol, interval) = (q.symbol.clone(), q.interval.clone());
+
+    let result = tokio::task::spawn_blocking(move || -> Result<AiForecastResponse, ApiFailure> {
+        let closes = real_closes(&cache, &symbol, &interval)?;
+        if closes.len() < PATCHTST_LOOKBACK {
+            return Err(ApiFailure::ShortHistory {
+                needed: PATCHTST_LOOKBACK,
+                got: closes.len(),
+            });
+        }
+        // The graph wants exactly 64 bars; feed it the most recent 64.
+        let window: Vec<f32> = closes[closes.len() - PATCHTST_LOOKBACK..]
+            .iter()
+            .map(|&c| c as f32)
+            .collect();
+        let body = patchtst.forecast(&window).map_err(patchtst_failure)?;
+        Ok(AiForecastResponse {
+            symbol: symbol.clone(),
+            interval: interval.clone(),
+            history_used: window.len(),
+            engine: "patchtst-int8",
+            forecast: Some(AiForecastBody::PatchTst(body)),
+            error: None,
+        })
+    })
+    .await;
+
+    finish_ai(result)
+}
+
+/// Flatten an AI handler's outcome into a response.
+fn finish_ai(
+    result: Result<Result<AiForecastResponse, ApiFailure>, tokio::task::JoinError>,
+) -> axum::response::Response {
+    match result {
+        Ok(Ok(body)) => Json(body).into_response(),
+        Ok(Err(e)) => e.into_response(),
+        Err(e) => unavailable(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("task failed: {e}"),
+        ),
+    }
+}
+
+/// Uncached or insufficient real closes. Deliberately never fabricates.
+fn real_closes(
+    cache: &bt_data::cache::Cache,
+    symbol: &str,
+    interval: &str,
+) -> Result<Vec<f64>, ApiFailure> {
+    let rows = cached_closes(cache, symbol, interval).ok_or(ApiFailure::NotCached)?;
+    Ok(rows.into_iter().map(|c| c.close).collect())
+}
+
 /// Build the router. Exposed for tests.
 pub fn router(state: ApiState) -> Router {
     // CORS is permissive, which is only defensible because the listener is
@@ -514,6 +769,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/engines", get(engines))
         .route("/api/candles", get(candles))
         .route("/api/forecast", get(forecast))
+        .route("/api/ai/py_forecast", get(py_forecast))
+        .route("/api/ai/patchtst_forecast", get(patchtst_forecast))
         .layer(cors)
         .with_state(state)
 }
@@ -546,6 +803,8 @@ pub fn spawn(port: u16) -> Option<SocketAddr> {
     let state = ApiState {
         cache: Arc::new(bt_data::cache::Cache::new(bt_data::default_cache_path()).ok()?),
         engine: Arc::new(BharatModelEngine::with_default_paths()),
+        py: Arc::new(EmbeddedPyEngine::new()),
+        patchtst: Arc::new(PatchTstEngine::new(bt_analytics::forecast::models_dir())),
     };
 
     // Bind first, synchronously, so a failure is reported instead of being
@@ -605,6 +864,8 @@ mod tests {
                 bt_data::cache::Cache::new(std::env::temp_dir().join("bt_api_test.db")).unwrap(),
             ),
             engine: Arc::new(BharatModelEngine::with_default_paths()),
+            py: Arc::new(EmbeddedPyEngine::new()),
+            patchtst: Arc::new(PatchTstEngine::new(bt_analytics::forecast::models_dir())),
         }
     }
 
@@ -723,6 +984,59 @@ mod tests {
         // Agreement, and a flat path, are not divergences.
         assert_eq!(divergence(1090.0, 1000.0, Signal::Buy), None);
         assert_eq!(divergence(100.2, 100.0, Signal::Sell), None);
+    }
+
+    // ---- /api/ai/* : the zero-fake-data guarantee ----
+
+    fn query(symbol: &str) -> Query<SymbolQuery> {
+        Query(SymbolQuery {
+            symbol: symbol.to_string(),
+            interval: "1d".to_string(),
+        })
+    }
+
+    /// The single most important property of the two new routes: an uncached
+    /// symbol yields an error, never a forecast over invented prices.
+    #[tokio::test]
+    async fn py_forecast_refuses_to_invent_prices() {
+        let res = py_forecast(State(state()), query("ZZZ_NEVER_CACHED_FOR_AI"))
+            .await
+            .into_response();
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn patchtst_refuses_to_invent_prices() {
+        let res = patchtst_forecast(State(state()), query("ZZZ_NEVER_CACHED_FOR_AI"))
+            .await
+            .into_response();
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// Both AI engines must be advertised, or a client has no way to discover
+    /// they exist.
+    #[tokio::test]
+    async fn both_ai_engines_are_advertised() {
+        use axum::body::to_bytes;
+        let res = engines(State(state())).await.into_response();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        let text = String::from_utf8_lossy(&body).into_owned();
+        assert!(text.contains("PatchTST"), "{text}");
+        assert!(text.contains("Python drift/volatility cone"), "{text}");
+    }
+
+    /// Every advertised engine carries a verdict and a reason.
+    #[tokio::test]
+    async fn every_advertised_engine_has_a_detail() {
+        use axum::body::to_bytes;
+        let res = engines(State(state())).await.into_response();
+        let body = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        let text = String::from_utf8_lossy(&body).into_owned();
+        assert_eq!(
+            text.matches("\"detail\"").count(),
+            text.matches("\"name\"").count()
+        );
     }
 
     #[tokio::test]

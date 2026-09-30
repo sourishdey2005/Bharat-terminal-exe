@@ -129,4 +129,45 @@ fn engine_status_is_always_answered() {
     // Every engine must carry a verdict and a reason, installed or not.
     assert!(body.contains("TinyTimeMixer"), "{body}");
     assert!(body.contains("\"available\""), "{body}");
+    assert!(body.contains("PatchTST"), "{body}");
+    assert!(body.contains("Python drift/volatility cone"), "{body}");
+}
+
+#[test]
+fn an_uncached_symbol_is_refused_by_both_ai_routes() {
+    let addr = start();
+    for path in [
+        "/api/ai/py_forecast?symbol=ZZZ_NEVER_CACHED_FOR_AI&interval=1d",
+        "/api/ai/patchtst_forecast?symbol=ZZZ_NEVER_CACHED_FOR_AI&interval=1d",
+    ] {
+        let (code, body) = get(addr, path);
+        assert_eq!(code, 503, "{path} -> {code}: {body}");
+        assert!(body.contains("error"), "{path}: {body}");
+        // The guarantee that matters: no fabricated series came back.
+        assert!(
+            !body.contains("forecast_p50"),
+            "{path} invented data: {body}"
+        );
+        assert!(
+            !body.contains("\"predictions\""),
+            "{path} invented data: {body}"
+        );
+    }
+}
+
+#[test]
+fn the_ai_routes_are_reachable_over_a_real_socket() {
+    let addr = start();
+    // A miss is the expected outcome on a cold cache, but the route must exist
+    // and answer rather than 404 or hang.
+    for path in [
+        "/api/ai/py_forecast?symbol=RELIANCE.NS&interval=1d",
+        "/api/ai/patchtst_forecast?symbol=RELIANCE.NS&interval=1d",
+    ] {
+        let (code, _body) = get(addr, path);
+        assert!(
+            code == 200 || code == 503 || code == 400,
+            "{path} answered {code}, expected a handled status"
+        );
+    }
 }
