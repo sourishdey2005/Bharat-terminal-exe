@@ -21,6 +21,12 @@ $msiOut = Join-Path $project "releases\BharatTerminal-v3.0.0.msi"
 
 Write-Host "Building Bharat Terminal v3 (release)..." -ForegroundColor Cyan
 cargo build --release --workspace --manifest-path (Join-Path $project "Cargo.toml")
+# PowerShell does not throw when a native command fails, so a compile error - or
+# a running app holding bt-app.exe - would sail through and the MSI would be built
+# from the previous binary while still printing BUILD COMPLETE.
+if ($LASTEXITCODE -ne 0) {
+    throw "cargo build failed (exit $LASTEXITCODE); refusing to package a stale binary"
+}
 
 # Pinned ONNX Runtime 1.28.0 (matches ort-sys; never committed, ~16 MB).
 $ortVersion = "1.28.0"

@@ -3400,6 +3400,10 @@ impl BharatApp {
             egui_plot::LineStyle::Solid
         };
 
+        // Taken before `basis` is moved into the plot, and reused for the y-fit
+        // below.
+        let history_values: Vec<f64> = basis.iter().map(|p| p[1]).collect();
+
         Plot::new("forecast_plot")
             .height((ui.available_height() - AXIS_H - 8.0).max(floor))
             .auto_bounds(egui::emath::Vec2b::new(true, true))
@@ -3457,6 +3461,27 @@ impl BharatApp {
                             .color(HISTORY_COLOR.gamma_multiply(0.5)),
                     );
                 }
+
+                // Fit y to the predicted band, not to the whole history window.
+                // Auto-bounds scale y to all 120 history bars, so a normal-sized
+                // forecast lands in a sliver at the top and reads as flat even
+                // though it is moving several percent.
+                let forecast_values: Vec<f64> = pred.iter().map(|p| p[1]).collect();
+                let (y_lo, y_hi) = forecast_y_bounds(&history_values, &forecast_values);
+                // PlotBounds' fields are crate-private, so the rectangle is
+                // rebuilt from the public surface: take the auto x range from the
+                // centre and width it already computed, and build the new bounds
+                // by extending an empty rect with the two opposite corners.
+                // `include_y` cannot do this: it merges with min/max, so it can
+                // only ever widen the range, never tighten it.
+                let auto = plot_ui.plot_bounds();
+                let half_w = auto.width() / 2.0;
+                let lo_x = auto.center().x - half_w;
+                let hi_x = auto.center().x + half_w;
+                let mut fitted = egui_plot::PlotBounds::NOTHING;
+                fitted.extend_with(&egui_plot::PlotPoint::new(lo_x, y_lo));
+                fitted.extend_with(&egui_plot::PlotPoint::new(hi_x, y_hi));
+                plot_ui.set_plot_bounds(fitted);
             });
 
         // Say plainly why the line is flat, and what to use instead. Without this
@@ -11227,6 +11252,161 @@ impl eframe::App for BharatApp {
         self.error_toast(ctx);
         self.body(ctx);
         ctx.request_repaint_after(Duration::from_millis(100));
+    }
+}
+
+/// Share of the plot's height the predicted band is guaranteed.
+///
+/// The chart plots up to 120 bars of history behind a much shorter forecast, and
+/// `auto_bounds` scales y to fit all of it. For a stock that moved 20% across
+/// that window, a perfectly reasonable 3% forecast occupies well under a tenth
+/// of the height and reads as a flat line - which is exactly how a working
+/// forecaster looks broken. Anything at or above this share is legible.
+const FORECAST_MIN_Y_SHARE: f64 = 0.30;
+
+/// Y-range for the forecast chart.
+///
+/// Returns the full range when the forecast is already a readable share of the
+/// data, and otherwise a range centred on the predicted band so the shape is
+/// visible. History outside that range clips out of view, which is the
+/// deliberate trade: context is useful, but a forecast you cannot read is not.
+fn forecast_y_bounds(history: &[f64], forecast: &[f64]) -> (f64, f64) {
+    let mut all: Vec<f64> = history.iter().copied().collect();
+    all.extend_from_slice(forecast);
+    // The anchor is drawn as the first predicted point, so it belongs in the
+    // forecast's band rather than being left to the history's influence.
+    let anchor = history.last().copied();
+    if let Some(a) = anchor {
+        all.push(a);
+    }
+    if all.is_empty() {
+        return (0.0, 1.0);
+    }
+
+    let mut lo = f64::MAX;
+    let mut hi = f64::MIN;
+    for v in all.iter().copied().chain(anchor) {
+        if v.is_finite() {
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+    }
+    if !lo.is_finite() || !hi.is_finite() {
+        return (0.0, 1.0);
+    }
+
+    // Band the forecast actually occupies, including its anchor.
+    let mut flo = f64::MAX;
+    let mut fhi = f64::MIN;
+    for v in forecast.iter().copied().chain(anchor) {
+        if v.is_finite() {
+            flo = flo.min(v);
+            fhi = fhi.max(v);
+        }
+    }
+    if !flo.is_finite() || !fhi.is_finite() {
+        return (lo, hi);
+    }
+
+    let total = hi - lo;
+    let fc_range = fhi - flo;
+
+    // Degenerate forecast: a zero-height range is not renderable, so fall back
+    // to a narrow band around the anchor. The UI already labels a degenerate
+    // forecast as such, so this only has to be legible, not informative.
+    // Checked before the total-width test, because a constant series makes both
+    // widths zero and would otherwise fall straight through to a 5..5 range.
+    if fc_range <= 0.0 {
+        let pad = (flo.abs() * 0.005).max(1e-6);
+        return (flo - pad, flo + pad);
+    }
+    // Flat history but a moving forecast: fit the forecast, since there is no
+    // history range to preserve.
+    if total <= 0.0 {
+        return (flo, fhi);
+    }
+    if fc_range >= FORECAST_MIN_Y_SHARE * total {
+        return (lo, hi);
+    }
+
+    // Grow the forecast band until it holds the guaranteed share, with a small
+    // margin so the line does not touch the frame.
+    let wanted = fc_range / FORECAST_MIN_Y_SHARE;
+    let margin = wanted * 0.08;
+    (flo - margin, fhi + margin)
+}
+
+#[cfg(test)]
+mod forecast_plot_tests {
+    use super::*;
+
+    /// A forecast that moves 3% behind a history that moved 20% is legible only
+    /// if the axis is fitted to the forecast. Without that it occupies a sliver.
+    #[test]
+    fn a_small_forecast_behind_a_large_history_is_expanded() {
+        let history: Vec<f64> = (0..120).map(|i| 1000.0 + i as f64 * 2.0).collect(); // 1000..1238
+        let last = *history.last().unwrap();
+        let forecast: Vec<f64> = (0..37)
+            .map(|i| last * (1.0 + 0.03 * i as f64 / 36.0))
+            .collect();
+        let fc_lo = forecast.iter().copied().fold(f64::MAX, f64::min);
+        let fc_hi = forecast.iter().copied().fold(f64::MIN, f64::max);
+
+        let (lo, hi) = forecast_y_bounds(&history, &forecast);
+        let share = (fc_hi - fc_lo) / (hi - lo);
+        assert!(
+            share >= FORECAST_MIN_Y_SHARE - 1e-9,
+            "forecast got only {:.1}% of the height ({lo}..{hi})",
+            share * 100.0
+        );
+        // Centred on the forecast, not cropped to one end of it.
+        assert!(lo <= fc_lo, "lo {lo} cropped the forecast low {fc_lo}");
+        assert!(hi >= fc_hi, "hi {hi} cropped the forecast high {fc_hi}");
+    }
+
+    /// When the forecast already dominates the range, nothing is clipped.
+    #[test]
+    fn a_large_forecast_keeps_the_full_range() {
+        let history: Vec<f64> = (0..120).map(|i| 100.0 + i as f64 * 0.1).collect();
+        let last = *history.last().unwrap();
+        let forecast: Vec<f64> = (0..37)
+            .map(|i| last * (1.0 + 0.5 * i as f64 / 36.0))
+            .collect();
+        let fc_hi = forecast.iter().copied().fold(f64::MIN, f64::max);
+
+        let (lo, hi) = forecast_y_bounds(&history, &forecast);
+        assert!(lo <= 100.0, "history low {lo} was clipped away");
+        assert!(
+            hi >= fc_hi,
+            "forecast high {fc_hi} was clipped away (got {hi})"
+        );
+    }
+
+    /// A degenerate flat forecast must still produce a renderable range.
+    #[test]
+    fn a_flat_forecast_yields_a_nonzero_range() {
+        let history: Vec<f64> = (0..120).map(|i| 1000.0 + i as f64).collect();
+        let last = *history.last().unwrap();
+        let forecast = vec![last; 37];
+        let (lo, hi) = forecast_y_bounds(&history, &forecast);
+        assert!(hi > lo, "zero-height range is not renderable: {lo}..{hi}");
+        assert!(
+            (lo + hi) / 2.0 - last < 1.0,
+            "band should sit on the anchor"
+        );
+    }
+
+    /// Degenerate inputs must not produce NaN bounds, which would blank the plot.
+    #[test]
+    fn empty_and_constant_inputs_are_safe() {
+        let (lo, hi) = forecast_y_bounds(&[], &[]);
+        assert!(hi > lo);
+        let (lo, hi) = forecast_y_bounds(&[5.0, 5.0, 5.0], &[5.0, 5.0]);
+        assert!(hi > lo, "{lo}..{hi}");
+        // Non-finite history must not poison the range.
+        let (lo, hi) = forecast_y_bounds(&[f64::NAN, 10.0, 12.0], &[11.0, 13.0]);
+        assert!(lo.is_finite() && hi.is_finite(), "{lo}..{hi}");
+        assert!(hi > lo);
     }
 }
 
