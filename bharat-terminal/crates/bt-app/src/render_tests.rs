@@ -143,6 +143,28 @@ fn ink_for(events: Vec<Event>, f: impl FnOnce(&mut egui::Ui)) -> (usize, f32) {
     ink_of(&out, area.size())
 }
 
+/// [`ink_for`] but using [`paint_of`]'s all-pixel accounting.
+fn paint_for(events: Vec<Event>, f: impl FnOnce(&mut egui::Ui)) -> (usize, f32) {
+    let ctx = Context::default();
+    let area = canvas();
+    let raw = RawInput {
+        screen_rect: Some(area),
+        events,
+        ..Default::default()
+    };
+    let mut called = false;
+    let out = ctx.run(raw, |ctx| {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none())
+            .show(ctx, |ui| {
+                called = true;
+                f(ui);
+            });
+    });
+    assert!(called, "the draw closure never ran");
+    paint_of(&out, area.size())
+}
+
 /// A surface that is a clean ramp, so the renderer must emit a full mesh.
 fn ramp_surface(cols: usize, rows: usize) -> views3d::Surface {
     let mut values = Vec::with_capacity(cols * rows);
@@ -317,4 +339,199 @@ fn test_pointer_over_the_plot_does_not_crash() {
         cover * 100.0
     );
     println!("drag frame: {meshes} meshes, {:.1}% canvas", cover * 100.0);
+}
+
+// ---------------------------------------------------------------------------
+// v4.2 chart and panel render tests.
+//
+// These assert that the panels put *pixels* on the screen, not merely that they
+// return without panicking. A plot that renders an empty plot area looks
+// identical to a working one in a unit test that only checks for absence of
+// panic, which is why the existing ink_of harness is used here.
+// ---------------------------------------------------------------------------
+
+/// Like [`ink_of`] but counts *every* painted pixel, not just saturated ones.
+///
+/// [`ink_of`] deliberately ignores greys so it can isolate the 3D surface cells
+/// from the plot chrome. That is wrong for a line chart, where the whole subject
+/// is a two-pixel stroke, and for a text panel, which is entirely grey. This
+/// variant answers "did anything get drawn at all", which is the right question
+/// for those two.
+fn paint_of(out: &egui::FullOutput, canvas: egui::Vec2) -> (usize, f32) {
+    let mut meshes = 0usize;
+    let mut painted = 0usize;
+    let mut tris = 0usize;
+    let mut tess = egui::epaint::Tessellator::new(
+        out.pixels_per_point,
+        TessellationOptions::default(),
+        [out.textures_delta.set.len(), 32],
+        Vec::new(),
+    );
+    for prim in tess.tessellate_shapes(out.shapes.clone()) {
+        if let Primitive::Mesh(m) = prim.primitive {
+            meshes += 1;
+            // A triangle larger than roughly 400px^2 is plot chrome (background,
+            // panel rect), not the content. Subtracting that keeps "coverage"
+            // meaningful for a chart or a panel of text.
+            for idx in m.indices.chunks(3) {
+                let a = m.vertices[idx[0] as usize].pos;
+                let b = m.vertices[idx[1] as usize].pos;
+                let c = m.vertices[idx[2] as usize].pos;
+                if !(a.x.is_finite() && b.x.is_finite() && c.x.is_finite()) {
+                    continue;
+                }
+                let area = 0.5 * ((b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y)).abs();
+                if area > 400.0 {
+                    continue;
+                }
+                tris += 1;
+                painted += area as usize;
+            }
+        }
+    }
+    let total = (canvas.x * canvas.y) as usize;
+    println!("  paint: {meshes} meshes, {tris} content triangles");
+    (meshes, painted as f32 / total as f32)
+}
+
+/// A close series with a rise, a real drawdown, and a recovery.
+fn volatile_closes(n: usize) -> Vec<f64> {
+    let mut out = Vec::with_capacity(n);
+    let mut p = 100.0;
+    for i in 0..n {
+        // Two cycles of up 4%, down 18%, then a slow recovery.
+        let phase = i % 60;
+        let r = if phase < 30 { 0.004 } else { -0.008 };
+        p *= 1.0 + r;
+        if i == 90 {
+            p *= 0.55; // a sharp, unmistakable crash
+        }
+        out.push(p);
+    }
+    out
+}
+
+fn closes_to_candles(closes: &[f64]) -> Vec<bt_core::Candle> {
+    closes
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| bt_core::Candle::new(i as f64, c, c * 1.002, c * 0.998, c, 1000.0 + i as f64))
+        .collect()
+}
+
+#[test]
+fn the_underwater_plot_renders_a_visible_area() {
+    let closes = volatile_closes(200);
+    let candles = closes_to_candles(&closes);
+    let (meshes, cover) = paint_for(vec![], |ui| {
+        let uw = bt_analytics::drawdown_recovery::from_candles(&candles)
+            .expect("underwater geometry");
+        // The deepest drawdown here is the scripted 45% crash, so the series
+        // must actually reach a large negative value for the chart to be worth
+        // drawing.
+        assert!(uw.max_depth() > 0.4, "fixture too shallow: {}", uw.max_depth());
+        assert!(!uw.episodes.is_empty(), "fixture produced no episodes");
+
+        egui_plot::Plot::new("uw_test")
+            .auto_bounds(egui::emath::Vec2b::new(true, true))
+            .height(300.0)
+            .show(ui, |plot_ui| {
+                let pts: egui_plot::PlotPoints = uw
+                    .series
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, v)| v.is_finite())
+                    .map(|(i, v)| [i as f64, *v * 100.0])
+                    .collect();
+                plot_ui.line(egui_plot::Line::new(pts).color(egui::Color32::RED).width(2.0));
+                plot_ui.hline(egui_plot::HLine::new(0.0).color(egui::Color32::GRAY));
+            });
+    });
+    assert!(meshes > 0, "underwater plot emitted no meshes");
+    // A line chart paints far less than a filled surface; the threshold is
+    // deliberately low and exists to catch "nothing was drawn at all".
+    assert!(cover > 0.0005, "underwater plot drew almost nothing ({:.4}%)", cover * 100.0);
+    println!("underwater plot: {meshes} meshes, {:.4}% painted", cover * 100.0);
+}
+
+#[test]
+fn the_forecast_cone_renders_all_four_bands() {
+    use bt_analytics::forecast_cone as fc;
+    let horizon = 24usize;
+    let median: Vec<f64> = (0..horizon).map(|i| 100.0 + i as f64 * 0.4).collect();
+    let (p10, p25, p50, p75, p90) = fc::synthetic_quantiles(&median, 3.0).expect("quantiles");
+    let cone = fc::build_cone(&p10, &p25, &p50, &p75, &p90).expect("cone");
+    assert_eq!(cone.bands.len(), 4);
+
+    // Count how many distinct shaded polygons actually reach the tessellator.
+    let mut shaded = 0usize;
+    let (meshes, cover) = ink_for(vec![], |ui| {
+        egui_plot::Plot::new("cone_test")
+            .auto_bounds(egui::emath::Vec2b::new(true, true))
+            .height(300.0)
+            .show(ui, |plot_ui| {
+                for (band, alpha) in cone.bands.iter().zip([0.10_f32, 0.16, 0.22, 0.30]) {
+                    // The ring arrives already ordered: lower edge forward,
+                    // upper edge back, then the closing vertex.
+                    let pts: egui_plot::PlotPoints = band
+                        .ring
+                        .iter()
+                        .map(|(x, y)| [*x, *y])
+                        .collect();
+                    plot_ui.polygon(
+                        egui_plot::Polygon::new(pts)
+                            .fill_color(egui::Color32::from_rgb(0, 191, 255).gamma_multiply(alpha)),
+                    );
+                    shaded += 1;
+                }
+                let median_pts: egui_plot::PlotPoints = cone
+                    .median
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| [i as f64, *v])
+                    .collect();
+                plot_ui.line(egui_plot::Line::new(median_pts).color(egui::Color32::WHITE));
+            });
+    });
+    assert_eq!(shaded, 4, "not every band was submitted");
+    assert!(meshes > 0, "cone emitted no meshes");
+    assert!(cover > 0.10, "cone covered only {:.1}%", cover * 100.0);
+    println!("cone: {meshes} meshes, {:.1}% canvas, {shaded} bands", cover * 100.0);
+}
+
+#[test]
+fn the_advisor_panel_renders_on_real_data() {
+    let closes = volatile_closes(150);
+    let candles = closes_to_candles(&closes);
+    let (meshes, cover) = paint_for(vec![], |ui| {
+        let view = crate::panel_advisor::AdvisorView {
+            symbol: "RELIANCE.NS",
+            candles: &candles,
+            forecast_change_pct: Some(1.5),
+            watchsignal: None,
+            capital: crate::panel_advisor::EXAMPLE_CAPITAL,
+        };
+        crate::panel_advisor::draw(ui, &view);
+    });
+    assert!(meshes > 0, "advisor panel emitted no meshes");
+    assert!(cover > 0.0002, "advisor panel drew almost nothing ({:.4}%)", cover * 100.0);
+    println!("advisor panel: {meshes} meshes, {:.4}% painted", cover * 100.0);
+}
+
+#[test]
+fn the_advisor_panel_renders_on_empty_input_without_panicking() {
+    // A chart that has not loaded is the state a user sees first, so it must
+    // render the WAIT verdict rather than dividing by a zero history length.
+    let candles: Vec<bt_core::Candle> = Vec::new();
+    let (meshes, _) = ink_for(vec![], |ui| {
+        let view = crate::panel_advisor::AdvisorView {
+            symbol: "NEW.NS",
+            candles: &candles,
+            forecast_change_pct: None,
+            watchsignal: None,
+            capital: 0.0,
+        };
+        crate::panel_advisor::draw(ui, &view);
+    });
+    assert!(meshes > 0, "empty advisor panel emitted no meshes");
 }

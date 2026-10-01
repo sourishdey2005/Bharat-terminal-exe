@@ -4667,29 +4667,35 @@ impl BharatApp {
     /// The shaded cone: a semi-transparent polygon between p10 and p90, with the
     /// median drawn boldly through the middle.
     fn draw_cone_chart(&self, ui: &mut egui::Ui, cone: &QuantileConeOutput) {
+        use bt_analytics::forecast_cone as fc;
         let basis = &self.forecast_basis;
         if basis.is_empty() || cone.horizon_steps == 0 {
             return;
         }
         let start_x = basis.len() as f64 - 1.0;
-        let upper: Vec<[f64; 2]> = cone
-            .p90_upper
-            .iter()
-            .enumerate()
-            .map(|(i, &v)| [start_x + 1.0 + i as f64, v])
-            .collect();
-        let lower: Vec<[f64; 2]> = cone
-            .p10_lower
-            .iter()
-            .enumerate()
-            .map(|(i, &v)| [start_x + 1.0 + i as f64, v])
-            .collect();
-        let median: Vec<[f64; 2]> = cone
-            .p50_median
-            .iter()
-            .enumerate()
-            .map(|(i, &v)| [start_x + 1.0 + i as f64, v])
-            .collect();
+
+        // The quantile model emits three bands. Derive p25/p75 from them so the
+        // fan has the five levels the chart draws, and let build_cone enforce
+        // the ordering invariant rather than trusting the input blindly.
+        let (p25, p75) = derive_inner_bands(cone);
+        let built = match fc::build_cone(
+            &cone.p10_lower,
+            &p25,
+            &cone.p50_median,
+            &p75,
+            &cone.p90_upper,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                // Crossed quantiles are a model bug. Saying so is better than
+                // drawing an inside-out fan that looks perfectly plausible.
+                ui.label(
+                    RichText::new(format!("Forecast cone unavailable: {e}")).color(LOSS),
+                );
+                return;
+            }
+        };
+
         let history: Vec<[f64; 2]> = basis
             .iter()
             .enumerate()
@@ -4707,24 +4713,54 @@ impl BharatApp {
                         .color(HISTORY_COLOR)
                         .width(1.5_f32),
                 );
-                // Fill between the two bands: upper left-to-right, then lower
-                // right-to-left, so the polygon closes on itself. `fill_color`
-                // and `stroke` are the inherent Polygon setters; `color()` lives
-                // on the PlotItem trait and would need importing.
-                let mut ring: Vec<[f64; 2]> = upper.clone();
-                ring.extend(lower.iter().rev().copied());
-                plot_ui.polygon(
-                    egui_plot::Polygon::new(PlotPoints::from(ring))
-                        .name("p10-p90 corridor")
-                        .fill_color(INFO.gamma_multiply(0.16))
-                        .stroke(Stroke::new(1.0_f32, INFO.gamma_multiply(0.55))),
-                );
+
+                // Four nested bands, widest first, so each narrower band paints
+                // over the last. The shading intensifies toward the median,
+                // which is what makes the fan read as a distribution rather
+                // than as one flat blob.
+                for (band, alpha) in built.bands.iter().zip([0.10_f32, 0.16, 0.22, 0.30]) {
+                    // Shift the ring from cone-local x onto the chart's bar axis.
+                    let ring: Vec<[f64; 2]> = band
+                        .ring
+                        .iter()
+                        .map(|(x, y)| [start_x + *x, *y])
+                        .collect();
+                    plot_ui.polygon(
+                        egui_plot::Polygon::new(PlotPoints::from(ring))
+                            .fill_color(INFO.gamma_multiply(alpha))
+                            .stroke(Stroke::new(
+                                1.0_f32,
+                                INFO.gamma_multiply(alpha + 0.25),
+                            )),
+                    );
+                }
+
+                let median: Vec<[f64; 2]> = built
+                    .median
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &v)| [start_x + 1.0 + i as f64, v])
+                    .collect();
                 plot_ui.line(
                     Line::new(PlotPoints::from(median))
                         .name("p50 median")
                         .color(INFO)
                         .width(2.5_f32),
                 );
+
+                // Label the envelope width at the far edge; a cone with no
+                // number on it cannot be judged against a price.
+                if let Some(&w) = built.envelope.last() {
+                    let last_x = start_x + built.horizon as f64;
+                    let mid_y = built.median[built.horizon - 1];
+                    plot_ui.text(
+                        egui_plot::Text::new(
+                            egui_plot::PlotPoint::new(last_x, mid_y + w),
+                            format!("±{w:.1}"),
+                        )
+                        .color(Color32::GRAY),
+                    );
+                }
             });
     }
 
@@ -10838,35 +10874,87 @@ impl BharatApp {
                 plot_ui.hline(egui_plot::HLine::new(0.0).color(Color32::GRAY));
             });
     }
+fn draw_drawdown_recovery(&self, ui: &mut egui::Ui) {
+        use bt_analytics::drawdown_recovery as ddr;
+        let candles = &self.data.candles.candles;
+        let uw = match ddr::from_candles(candles) {
+            Ok(u) => u,
+            Err(e) => {
+                ui.label(RichText::new(format!("Underwater plot unavailable: {e}")).color(LOSS));
+                return;
+            }
+        };
 
-    fn draw_drawdown_recovery(&self, ui: &mut egui::Ui) {
-        let dd = bt_viz::drawdown::compute_drawdown(&self.data.equity);
-        ui.label(RichText::new("Drawdown & Recovery").strong());
+        ui.label(RichText::new("Drawdown & Recovery — underwater plot").strong());
+        // The header numbers are the reason to look at this chart, so they come
+        // from the tested geometry rather than being recomputed inline.
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!("Max drawdown {:.2}%", uw.max_depth() * 100.0))
+                    .color(LOSS),
+            );
+            if let Some(rate) = uw.recovery_rate() {
+                ui.label(
+                    RichText::new(format!(
+                        "{} of {} episodes recovered ({:.0}%)",
+                        (rate * uw.episodes.len() as f64).round() as usize,
+                        uw.episodes.len(),
+                        rate * 100.0
+                    ))
+                    .color(Color32::GRAY),
+                );
+            }
+            if let Some(bars) = uw.mean_recovery_bars() {
+                ui.label(
+                    RichText::new(format!("mean recovery {bars:.0} bars")).color(Color32::GRAY),
+                );
+            }
+        });
+
         Plot::new("dd_rec_plot")
             .auto_bounds(egui::emath::Vec2b::new(true, true))
-            .height(ui.available_height())
+            .height((ui.available_height() - 60.0_f32).max(120.0_f32))
             .show(ui, |plot_ui| {
-                let pts: PlotPoints = dd.iter().enumerate().map(|(i, &v)| [i as f64, v]).collect();
-                plot_ui.line(Line::new(pts).color(LOSS).width(2.0_f32).name("Drawdown"));
-                let recovery: PlotPoints = dd
+                // A zero line, so "at a new high" is readable rather than inferred.
+                plot_ui.hline(
+                    egui_plot::HLine::new(0.0)
+                        .color(Color32::GRAY)
+                        .name("New high"),
+                );
+
+                // The NaN gaps are filtered: egui_plot renders a NaN y as a
+                // broken segment, which would draw a stray line across a bad bar.
+                let pts: PlotPoints = uw
+                    .series
                     .iter()
                     .enumerate()
-                    .filter_map(|(i, &v)| {
-                        if v == 0.0 {
-                            Some([i as f64, 0.0])
-                        } else {
-                            None
-                        }
-                    })
+                    .filter(|(_, v)| v.is_finite())
+                    .map(|(i, v)| [i as f64, *v * 100.0])
                     .collect();
-                plot_ui.points(
-                    Points::new(recovery)
-                        .color(PROFIT)
-                        .radius(5.0_f32)
-                        .shape(MarkerShape::Circle)
-                        .name("Recovery"),
-                );
+                plot_ui.line(Line::new(pts).color(LOSS).width(2.0_f32).name("Drawdown %"));
+
+                // Mark each trough, and colour it by whether the peak came back.
+                for e in &uw.episodes {
+                    plot_ui.points(
+                        Points::new(vec![[e.trough_index as f64, -e.depth * 100.0]])
+                            .color(if e.recovered() { PROFIT } else { AMBER })
+                            .radius(5.0_f32)
+                            .shape(MarkerShape::Circle),
+                    );
+                }
             });
+
+        // Annotate the deepest episode: which one it was and what it cost.
+        if let Some(idx) = uw.deepest {
+            if let Some(e) = uw.episodes.get(idx) {
+                ui.label(RichText::new(format!("Deepest: {}", e.summary())).small().color(AMBER));
+            }
+        }
+        ui.label(
+            RichText::new("Made by Sourish Dey")
+                .size(10.0)
+                .color(AMBER),
+        );
     }
 
     fn draw_rolling_correlation(&self, ui: &mut egui::Ui) {
@@ -14866,6 +14954,33 @@ fn cached_ohlcv_any(symbol: &str) -> Option<(Vec<f64>, Vec<f64>)> {
         }
     }
     None
+}
+
+/// Interpolate p25 and p75 from a three-band quantile cone.
+///
+/// The Chronos engine emits p10/p50/p90 only. Rather than flatten the fan back
+/// to one band, p25/p75 are placed halfway between the pairs that bracket them,
+/// which is what a two-point linear read of the distribution actually supports.
+/// Drawing them as if they were model output would overstate the model's
+/// resolution; `build_cone` still checks the result is ordered.
+fn derive_inner_bands(cone: &QuantileConeOutput) -> (Vec<f64>, Vec<f64>) {
+    let n = cone.horizon_steps.min(cone.p50_median.len());
+    let mut p25 = Vec::with_capacity(n);
+    let mut p75 = Vec::with_capacity(n);
+    for i in 0..n {
+        let lo = cone.p10_lower.get(i).copied();
+        let mid = cone.p50_median[i];
+        let hi = cone.p90_upper.get(i).copied();
+        p25.push(match lo {
+            Some(l) => 0.5 * (l + mid),
+            None => mid,
+        });
+        p75.push(match hi {
+            Some(h) => 0.5 * (mid + h),
+            None => mid,
+        });
+    }
+    (p25, p75)
 }
 
 /// Colour a relative-date label by whether the event is still ahead.

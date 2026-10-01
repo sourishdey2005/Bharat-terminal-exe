@@ -14,10 +14,12 @@
 
 pub mod advisor;
 pub mod corr_regime;
+pub mod drawdown_recovery;
 pub mod extended;
 pub mod alerts;
 pub mod backtest;
 pub mod forecast;
+pub mod forecast_cone;
 pub mod gap_scanner;
 pub mod indicators;
 pub mod models;
@@ -38,6 +40,8 @@ pub mod volume_anomaly;
 
 pub use advisor::{Action, AdvisorInput, AdvisorOutput, advise};
 pub use corr_regime::{CorrRegime, RegimeScan};
+pub use drawdown_recovery::{DrawdownEpisode, Underwater, from_candles as underwater_plot};
+pub use forecast_cone::{Band, Cone, build_cone, synthetic_quantiles};
 pub use gap_scanner::{GapHit, scan as scan_gaps, scan_default as scan_gaps_default};
 pub use multi_scanner::{ScanRow, advisor_input_for, scan as scan_watchlist};
 pub use rebalance::{RebalanceTrade, TargetWeight, rebalance_to_targets};
