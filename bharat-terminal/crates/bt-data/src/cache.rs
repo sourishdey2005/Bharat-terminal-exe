@@ -38,7 +38,18 @@ pub struct Cache {
 
 impl Cache {
     /// Open or create cache at `path`.
+    ///
+    /// The parent directory is created if missing: `Connection::open` fails
+    /// outright on a nonexistent directory, so a caller passing a path under a
+    /// fresh install's `data/` would otherwise get an error from a cache that
+    /// had no reason not to exist yet.
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| BtError::Database(e.to_string()))?;
+            }
+        }
         let conn = Connection::open(path).map_err(to_bt_err)?;
         conn.execute_batch(SCHEMA).map_err(to_bt_err)?;
         Ok(Self {

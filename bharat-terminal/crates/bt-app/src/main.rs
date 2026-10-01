@@ -15,6 +15,9 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 mod api;
+mod chat_llm;
+
+use crate::chat_llm::{ChatEngineStatus, SmolLM2Engine};
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use eframe::egui;
@@ -1850,7 +1853,7 @@ impl TimeRange {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum AppMessage {
     DataReady(OhlcvSeries),
     FetchError(String),
@@ -1860,6 +1863,14 @@ enum AppMessage {
     OptionsReady(bt_core::OptionChain, OptionsSource),
     OptionsExpiries(Vec<(String, String)>),
     OptionsError(String),
+    /// SmolLM2 finished loading on the worker (Some) or failed (None).
+    ChatLlmLoaded(Option<SmolLM2Engine>),
+    /// One inference finished; the engine travels back with the answer.
+    ChatReply {
+        question: String,
+        answer: String,
+        engine: SmolLM2Engine,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2364,6 +2375,14 @@ struct BharatApp {
     show_chat: bool,
     chat_messages: VecDeque<(String, String)>,
     chat_input: String,
+    /// SmolLM2 engine. `None` until the first chat open triggers a background
+    /// load; the 100MB+ weights must never block startup or a frame.
+    chat_llm: Option<SmolLM2Engine>,
+    /// Badge state for the chat window.
+    chat_llm_status: ChatEngineStatus,
+    /// An inference run is on the worker; extra sends fall back to intents
+    /// rather than queueing behind a multi-second generation.
+    chat_llm_in_flight: bool,
     /// v4.1 voice alerts opt-in (Windows SAPI, off by default).
     voice_alerts: bool,
 }
@@ -2835,6 +2854,9 @@ impl BharatApp {
             show_chat: false,
             chat_messages: VecDeque::new(),
             chat_input: String::new(),
+            chat_llm: None,
+            chat_llm_status: ChatEngineStatus::Unloaded,
+            chat_llm_in_flight: false,
             voice_alerts: prefs.voice_alerts,
         };
         app.next_alert_id = app.alerts.iter().map(|r| r.id).max().unwrap_or(0) + 1;
@@ -3056,6 +3078,33 @@ impl BharatApp {
                 AppMessage::OptionsError(err) => {
                     self.options_in_flight = false;
                     self.options_error = Some(err);
+                }
+                AppMessage::ChatLlmLoaded(engine) => {
+                    match engine {
+                        Some(e) => {
+                            self.chat_llm = Some(e);
+                            self.chat_llm_status = ChatEngineStatus::Ready;
+                        }
+                        None => {
+                            self.chat_llm_status = ChatEngineStatus::Unavailable;
+                        }
+                    }
+                }
+                AppMessage::ChatReply {
+                    question,
+                    answer,
+                    engine,
+                } => {
+                    self.chat_llm = Some(engine);
+                    self.chat_llm_in_flight = false;
+                    // Drop the "thinking…" placeholder for this question.
+                    self.chat_messages.retain(|(qq, aa)| {
+                        !(qq == &question && aa.starts_with("⏳"))
+                    });
+                    self.chat_messages.push_back((question, answer));
+                    while self.chat_messages.len() > 50 {
+                        self.chat_messages.pop_front();
+                    }
                 }
             }
         }
@@ -13247,6 +13296,16 @@ impl BharatApp {
         if !self.show_chat {
             return;
         }
+        // Lazy load on first open: the weights must never block startup or a
+        // frame, so loading happens once on a worker thread.
+        if self.chat_llm_status == ChatEngineStatus::Unloaded {
+            self.chat_llm_status = ChatEngineStatus::Loading;
+            let tx = self.tx.clone();
+            self.runtime.spawn(async move {
+                let engine = crate::chat_llm::try_load_default();
+                let _ = tx.send(AppMessage::ChatLlmLoaded(engine));
+            });
+        }
         let mut send: Option<String> = None;
         egui::Window::new("Market Assistant")
             .collapsible(true)
@@ -13254,11 +13313,30 @@ impl BharatApp {
             .default_size([380.0_f32, 420.0_f32])
             .anchor(egui::Align2::RIGHT_TOP, [-16.0_f32, 60.0_f32])
             .show(ctx, |ui| {
-                ui.label(
-                    RichText::new("On-device assistant — answers from live app data, not an LLM.")
-                        .color(Color32::GRAY)
-                        .small(),
-                );
+                let (badge, color) = match self.chat_llm_status {
+                    ChatEngineStatus::Ready => ("SmolLM2-135M", Color32::from_rgb(0, 230, 118)),
+                    ChatEngineStatus::Loading => ("Loading…", Color32::from_rgb(255, 176, 0)),
+                    ChatEngineStatus::Unavailable => {
+                        ("Intent matching", Color32::from_rgb(136, 146, 166))
+                    }
+                    ChatEngineStatus::Unloaded => {
+                        ("Intent matching", Color32::from_rgb(136, 146, 166))
+                    }
+                };
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("● {badge}"))
+                            .color(color)
+                            .size(11.0_f32),
+                    );
+                    if self.chat_llm_status == ChatEngineStatus::Unavailable {
+                        ui.label(
+                            RichText::new("LLM files missing — answering from live data")
+                                .color(Color32::GRAY)
+                                .small(),
+                        );
+                    }
+                });
                 ui.separator();
                 egui::ScrollArea::vertical()
                     .max_height(300.0_f32)
@@ -13290,13 +13368,77 @@ impl BharatApp {
                 });
             });
         if let Some(q) = send {
+            self.answer_chat(q);
+            self.chat_input.clear();
+        }
+    }
+
+    /// Route one question: SmolLM2 on a worker when ready, intents otherwise.
+    ///
+    /// The engine is taken out of `self` for the inference and travels back
+    /// with the reply, so no lock is held across the multi-second generation
+    /// and the UI thread never blocks. A send landing mid-flight falls back to
+    /// intents rather than queueing behind it.
+    fn answer_chat(&mut self, q: String) {
+        let use_llm = self.chat_llm_status == ChatEngineStatus::Ready
+            && !self.chat_llm_in_flight
+            && self.chat_llm.as_ref().is_some_and(|e| e.is_loaded());
+        if !use_llm {
             let a = self.respond_chat(&q);
             self.chat_messages.push_back((q, a));
             while self.chat_messages.len() > 50 {
                 self.chat_messages.pop_front();
             }
-            self.chat_input.clear();
+            return;
         }
+        let mut engine = self.chat_llm.take().expect("guarded by use_llm");
+        self.chat_llm_in_flight = true;
+        // Snapshot everything the prompt needs: the worker must own its data.
+        let symbol = self.selected_company.clone();
+        let last_price = self
+            .data
+            .candles
+            .candles
+            .last()
+            .map(|c| c.close)
+            .unwrap_or(0.0);
+        let forecast = self.forecast_values.clone();
+        let rsi = bt_analytics::rsi(&self.data.candles, 14)
+            .into_iter()
+            .rev()
+            .find(|v| v.is_finite());
+        let prompt = SmolLM2Engine::build_contextual_prompt(
+            &q,
+            &symbol,
+            last_price,
+            if forecast.is_empty() {
+                None
+            } else {
+                Some(&forecast)
+            },
+            rsi,
+        );
+        self.chat_messages
+            .push_back((q.clone(), "⏳ thinking… (SmolLM2 on CPU)".to_string()));
+        while self.chat_messages.len() > 50 {
+            self.chat_messages.pop_front();
+        }
+        let tx = self.tx.clone();
+        self.runtime.spawn(async move {
+            let answer = match engine.generate(&prompt, 96) {
+                Ok(text) if !text.is_empty() => text,
+                Ok(_) => "The model returned nothing — try rephrasing.".to_string(),
+                Err(e) => {
+                    tracing::warn!("SmolLM2 inference failed: {e}");
+                    format!("Model hiccup ({e}). Try again or ask something simpler.")
+                }
+            };
+            let _ = tx.send(AppMessage::ChatReply {
+                question: q,
+                answer,
+                engine,
+            });
+        });
     }
 
     /// Answer one question from live state. Every branch says where its number

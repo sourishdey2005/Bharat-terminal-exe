@@ -1,7 +1,7 @@
 <!-- Bharat Terminal — Windows installer (WiX v5).
      Per-user install: no UAC prompt, lives under %LOCALAPPDATA%\Programs.
      Built with: wix build BharatTerminal.wxs -o <out>.msi
-                 -ext WixToolset.UI.wixext -arch x64 -d AppVersion=4.1.0
+                 -ext WixToolset.UI.wixext -arch x64 -d AppVersion=4.2.0
      Made by Sourish Dey. -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
@@ -54,6 +54,7 @@
       <ComponentRef Id="ModelFiles" />
       <ComponentRef Id="SignalModelFiles" />
       <ComponentRef Id="PatchTstModelFiles" />
+      <ComponentRef Id="SmolLM2Files" />
       <ComponentRef Id="PredictorScript" />
       <ComponentGroupRef Id="PythonRuntimeFiles" />
       <ComponentRef Id="NativeRuntime" />
@@ -118,6 +119,14 @@
                      and [1, 16] output match its quantized weights. -->
                 <Component Id="PatchTstModelFiles" Guid="2D9A6C41-8B7E-4F53-9A16-3C5E7B0D4E82">
                   <File Id="PatchTstOnnx" Source="../models/patchtst_tiny_int8.onnx" KeyPath="yes" />
+                </Component>
+                <!-- SmolLM2-135M-Instruct Q4_K_M (~105 MB) plus its tokenizer.
+                     Without both files beside the executable, the chat window
+                     reports Intent matching instead of SmolLM2 — by design, but
+                     shipping them is what makes the green badge the default. -->
+                <Component Id="SmolLM2Files" Guid="CD9448DE-9164-44F4-86A9-F98C7A3B611A">
+                  <File Id="SmolLM2Gguf" Source="../models/SmolLM2-135M-Instruct.Q4_K_M.gguf" KeyPath="yes" />
+                  <File Id="SmolLM2Tokenizer" Source="../models/tokenizer.json" />
                 </Component>
               </Directory>
               <!-- predictor.py backs the embedded Python cone. It is 1 KB and

@@ -39,6 +39,16 @@ tower-http = { version = "0.6", features = ["cors"] }
 # v4.0: fuzzy symbol search in the header dropdown.
 fuzzy-matcher = { workspace = true }
 
+# v4.2: on-device SmolLM2-135M chat via Candle (pure Rust, no C++ toolchain).
+# CPU-only; the GGUF (~105 MB) and tokenizer.json live in models/ and load
+# lazily on first chat use, never at startup. hf-hub is deliberately absent:
+# the tokenizer ships via scripts/download-tokenizer.ps1, so nothing downloads
+# at build or run time.
+candle-core = { version = "0.9", default-features = false }
+candle-transformers = { version = "0.9", default-features = false }
+candle-nn = { version = "0.9", default-features = false }
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+
 [target.'cfg(windows)'.dependencies]
 # v4.0: native Windows toast notifications for fired alerts. Best-effort:
 # failures are swallowed and the in-app toast is always shown.

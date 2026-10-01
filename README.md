@@ -966,6 +966,33 @@ let (values, engine) = f.predict_with_engine(&closes, 20)?;
 println!("{} forecast {} points", engine, values.len());
 ```
 
+### AI Chat (SmolLM2-135M)
+
+The floating chat window runs **SmolLM2-135M-Instruct** locally via
+[Candle](https://github.com/huggingface/candle), HuggingFace's pure-Rust
+ML framework. No C++ toolchain, no Python, no cloud calls.
+
+The model is a 135M-parameter instruction-tuned LLM quantized to Q4_K_M
+(~105 MB). Inference is CPU-only over the KV cache, and a 96-token reply
+takes ~13 s on this machine's release build (debug builds are ~10x slower —
+measure release only). The weights load lazily on first chat open, never at
+startup, and inference always runs on a worker thread: the UI never blocks.
+
+Each question is wrapped in an instruct prompt carrying whatever the app
+already measured — symbol, last price, Chronos-Bolt forecast, RSI(14) — so
+the model reasons over real numbers. If the model or tokenizer is missing
+at startup, the chat automatically falls back to intent matching against
+live app data — the same behavior as v4.1. The engine status badge in the
+chat window shows which mode is active: **SmolLM2-135M** (green),
+**Loading…** (amber), or **Intent matching** (grey).
+
+Setup: `models/SmolLM2-135M-Instruct.Q4_K_M.gguf` ships in the repo;
+fetch the matching `models/tokenizer.json` once with
+`powershell -ExecutionPolicy Bypass -File scripts/download-tokenizer.ps1`
+(a plain curl from HuggingFace, ~2 MB, no Python needed).
+
+**Made by Sourish Dey**
+
 ## 📂 Where Settings and Cache Live
 
 Both are stored in a `data/` folder **next to the executable**, not in the

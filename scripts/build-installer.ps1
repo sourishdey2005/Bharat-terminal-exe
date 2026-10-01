@@ -17,7 +17,7 @@ $root = Split-Path -Parent $PSScriptRoot
 $project = Join-Path $root "bharat-terminal"
 $installerDir = Join-Path $project "installer"
 $nativeDir = Join-Path $project "native"
-$msiOut = Join-Path $project "releases\BharatTerminal-v4.1.0.msi"
+$msiOut = Join-Path $project "releases\BharatTerminal-v4.2.0.msi"
 
 Write-Host "Building Bharat Terminal v4 (release)..." -ForegroundColor Cyan
 cargo build --release --workspace --manifest-path (Join-Path $project "Cargo.toml")
@@ -36,8 +36,8 @@ $ortDll = Join-Path $nativeDir "onnxruntime.dll"
 # refreshed; a stale binary here means the "download the portable build" path
 # silently ships the previous release.
 $releasesDir = Join-Path $project "releases"
-$portableExe = Join-Path $releasesDir "BharatTerminal-v4.1.0.exe"
-$portableCli = Join-Path $releasesDir "BharatTerminal-v4.1.0-cli.exe"
+$portableExe = Join-Path $releasesDir "BharatTerminal-v4.2.0.exe"
+$portableCli = Join-Path $releasesDir "BharatTerminal-v4.2.0-cli.exe"
 if (-not (Test-Path $ortDll)) {
     Write-Host "Fetching ONNX Runtime $ortVersion..." -ForegroundColor Yellow
     New-Item -ItemType Directory -Path $nativeDir -Force | Out-Null
@@ -120,7 +120,7 @@ try {
         -o $msiOut `
         -ext WixToolset.UI.wixext `
         -arch x64 `
-        -d AppVersion=4.1.0 `
+        -d AppVersion=4.2.0 `
         -d "PayloadDir=$payloadRuntime" 2>&1
     $wixLog | ForEach-Object { Write-Host $_ }
     if ($LASTEXITCODE -ne 0) {
@@ -180,11 +180,59 @@ New-Item -ItemType Directory -Path $releasesDir -Force | Out-Null
 Copy-Item (Join-Path $project "target\release\bt-app.exe") $portableExe -Force
 Copy-Item (Join-Path $project "target\release\bt-cli.exe") $portableCli -Force
 
+# The portable ZIP is what a user without admin rights unpacks and runs, so it
+# has to be self-contained: the same payload the MSI installs. Assembling it
+# here (rather than by hand) is the only reason it cannot drift: a hand-rolled
+# zip silently keeps whatever bt-app.exe existed when it was made, and the
+# 12:43 rebuild above would leave the previous release advertised as current.
+Write-Host "Assembling portable ZIP..." -ForegroundColor Yellow
+$zipStage = Join-Path $project "build\portable"
+if (Test-Path $zipStage) { Remove-Item $zipStage -Recurse -Force }
+New-Item -ItemType Directory -Path $zipStage -Force | Out-Null
+
+Copy-Item $portableExe (Join-Path $zipStage "bt-app.exe") -Force
+Copy-Item $portableCli (Join-Path $zipStage "bt-cli.exe") -Force
+Copy-Item (Join-Path $root "README.md") $zipStage -Force
+Copy-Item $ortDll $zipStage -Force
+Get-ChildItem $nativeDir -Filter "*.dll" | ForEach-Object { Copy-Item $_.FullName $zipStage -Force }
+Copy-Item (Join-Path $project "assets") $zipStage -Recurse -Force
+Copy-Item (Join-Path $project "models") $zipStage -Recurse -Force
+Copy-Item (Join-Path $project "scripts") $zipStage -Recurse -Force
+Copy-Item $payloadRuntime (Join-Path $zipStage "python_runtime") -Recurse -Force
+
+# A zip missing the interpreter or the LLM weights still unpacks and still runs;
+# it just falls back to intent matching and 503s on every Python forecast. The
+# file list is the only honest check.
+$stagedZipFiles = Get-ChildItem $zipStage -Recurse -File
+$zipHas = { param($pattern) @($stagedZipFiles | Where-Object { $_.Name -like $pattern }).Count -ge 1 }
+if (-not (& $zipHas "python.exe")) {
+    throw "portable ZIP has no python interpreter; /api/ai/py_forecast would 503 on every run"
+}
+if (-not (& $zipHas "numpy*")) {
+    throw "portable ZIP has no numpy; the Python route would 503 on every run"
+}
+if (-not (& $zipHas "SmolLM2-135M-Instruct.Q4_K_M.gguf") -or -not (& $zipHas "tokenizer.json")) {
+    throw "portable ZIP is missing the SmolLM2 weights or tokenizer; chat would fall back to intent matching"
+}
+if (-not (& $zipHas "onnxruntime.dll")) {
+    throw "portable ZIP has no onnxruntime.dll; the ONNX engines would be unavailable"
+}
+
+$portableZip = Join-Path $releasesDir "BharatTerminal-v4.2.0-portable.zip"
+if (Test-Path $portableZip) { Remove-Item $portableZip -Force }
+Compress-Archive -Path (Join-Path $zipStage "*") -DestinationPath $portableZip -CompressionLevel Optimal
+if (-not (Test-Path $portableZip)) {
+    throw "Compress-Archive reported success but $portableZip does not exist"
+}
+$zipMb = [math]::Round((Get-Item $portableZip).Length / 1MB, 1)
+Write-Host "  portable ZIP: $zipMb MB, $($stagedZipFiles.Count) files (interpreter + numpy + SmolLM2 + ONNX verified)" -ForegroundColor DarkGray
+
 Write-Host ""
 Write-Host "========================================" -ForegroundColor Green
 Write-Host "BUILD COMPLETE" -ForegroundColor Green
 Write-Host "========================================" -ForegroundColor Green
 Write-Host " Installer: $msiOut"
 Write-Host " Portable:  $portableExe"
+Write-Host " Zip:       $portableZip"
 Write-Host " Made by Sourish Dey" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Green

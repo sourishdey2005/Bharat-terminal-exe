@@ -5,3 +5,12 @@
 # SmolLM2-135M-Instruct.Q4_K_M.gguf is 105,454,144 bytes, past GitHub's
 # 104,857,600-byte per-file limit, so a plain blob would be refused outright.
 bharat-terminal/models/SmolLM2-135M-Instruct.Q4_K_M.gguf filter=lfs diff=lfs merge=lfs -text
+
+# The installer and the portable ZIP only crossed GitHub's 104,857,600-byte
+# per-file limit in v4.2.0, because the MSI now carries the 105 MB SmolLM2
+# weights: 148.9 MB and 159.6 MB respectively. Earlier releases were plain
+# blobs (v4.1.0: 50 MB MSI, 57 MB zip) and pushing them through LFS would
+# report them as "should have been a pointer". Scoped per file rather than
+# bharat-terminal/releases/*.msi so a future small MSI does not get stranded.
+bharat-terminal/releases/*.msi filter=lfs diff=lfs merge=lfs -text
+bharat-terminal/releases/*-portable.zip filter=lfs diff=lfs merge=lfs -text
