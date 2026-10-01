@@ -10,14 +10,20 @@
 //! - Symbol resolution for 50+ major companies
 
 pub mod bhavcopy;
+pub mod binance;
 pub mod cache;
 pub mod coinbase;
 pub mod fmp;
 pub mod india;
+pub mod moneycontrol;
+pub mod news;
 pub mod nse;
 pub mod provider;
+pub mod sec;
 pub mod symbol;
+pub mod worldbank;
 pub mod yahoo;
+pub mod amfi;
 
 pub use provider::{CompanyProfile, DataProvider, Interval, Quote, SymbolInfo};
 pub use symbol::{COMPANY_LIST, DEFAULT_COMPANY};

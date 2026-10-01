@@ -2,25 +2,29 @@
 // crates/bt-app/src/main.rs
 // Author: Sourish Dey
 
-//! bt-app: BHARAT TERMINAL v3 desktop app (egui/eframe). Made by Sourish Dey.
+//! bt-app: BHARAT TERMINAL v4 desktop app (egui/eframe). Made by Sourish Dey.
 //!
 //! Features real market data from Yahoo Finance and Coinbase, with synthetic
 //! fallback. Includes company dropdown, time range selector, live refresh,
 //! 163 interactive tabs with category grouping, auto-focus on chart canvas,
 //! and prefs persistence via serde_json.
 
+use std::collections::VecDeque;
 use std::fs;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 mod api;
 
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use eframe::egui;
 use egui::{pos2, Color32, Id, RichText, Sense, Stroke, Vec2};
 use egui_plot::{Bar, BarChart, Legend, Line, MarkerShape, Plot, PlotPoints, Points};
+use fuzzy_matcher::skim::SkimMatcherV2;
+use fuzzy_matcher::FuzzyMatcher;
 use serde::{Deserialize, Serialize};
 
+use bt_analytics::alerts::{AlertEvent, AlertRule, MarketSnapshot};
 use bt_analytics::Engine as ForecastEngine;
 use bt_analytics::Forecaster;
 use bt_analytics::{
@@ -31,7 +35,7 @@ use bt_core::{
     synthetic_correlated_returns, synthetic_ohlcv, Candle, OhlcvSeries, APP_NAME, AUTHOR, TAGLINE,
 };
 use bt_data::india;
-use bt_data::{symbol::COMPANY_LIST, DataService, Interval};
+use bt_data::{news::NewsArticle, symbol::COMPANY_LIST, DataService, Interval};
 use bt_viz::palette::Theme;
 
 #[cfg(test)]
@@ -1482,6 +1486,11 @@ enum Tab {
     /// All twenty 3D surfaces as five pages of four equally sized panels.
     ThreeD_Gallery,
     FourInOne,
+    /// v4.0 utility tabs: price/indicator triggers, news with sentiment,
+    /// and dated events with countdowns.
+    Alerts,
+    News,
+    Calendar,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1497,6 +1506,9 @@ enum TabCategory {
     Advanced,
     Comparison,
     ThreeD,
+    /// v4.0 utility tabs (alerts, news, calendar). Added as its own group so
+    /// the existing row is untouched.
+    Tools,
 }
 
 impl TabCategory {
@@ -1513,6 +1525,7 @@ impl TabCategory {
             TabCategory::Advanced => "Advanced",
             TabCategory::Comparison => "Comparison",
             TabCategory::ThreeD => "3D & Surfaces",
+            TabCategory::Tools => "Tools",
         }
     }
 
@@ -1529,11 +1542,12 @@ impl TabCategory {
             TabCategory::Advanced => Color32::from_rgb(0xFF, 0x69, 0xB4),
             TabCategory::Comparison => Color32::from_rgb(0x00, 0xE5, 0xFF),
             TabCategory::ThreeD => Color32::from_rgb(0xB0, 0x7C, 0xFF),
+            TabCategory::Tools => Color32::from_rgb(0x7C, 0xFC, 0x00),
         }
     }
 }
 
-const CATEGORIES: [TabCategory; 11] = [
+const CATEGORIES: [TabCategory; 12] = [
     TabCategory::PriceAction,
     TabCategory::OrderFlow,
     TabCategory::Indicators,
@@ -1545,6 +1559,7 @@ const CATEGORIES: [TabCategory; 11] = [
     TabCategory::Advanced,
     TabCategory::ThreeD,
     TabCategory::Comparison,
+    TabCategory::Tools,
 ];
 
 fn tabs_in_category(cat: TabCategory) -> &'static [(Tab, &'static str)] {
@@ -1755,6 +1770,11 @@ fn tabs_in_category(cat: TabCategory) -> &'static [(Tab, &'static str)] {
             (Tab::PcaProjection, "3D PCA Projection"),
             (Tab::FourInOne, "4-in-1 Dashboard"),
         ],
+        TabCategory::Tools => &[
+            (Tab::Alerts, "Alerts"),
+            (Tab::News, "News"),
+            (Tab::Calendar, "Calendar"),
+        ],
     }
 }
 
@@ -1823,6 +1843,8 @@ enum AppMessage {
     DataReady(OhlcvSeries),
     FetchError(String),
     QuoteReady(String),
+    NewsReady(Vec<NewsArticle>),
+    NewsError(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1834,7 +1856,19 @@ struct Prefs {
     /// Custom range bounds as `YYYY-MM-DD`, empty when unused.
     custom_start: String,
     custom_end: String,
+    /// Starred symbols, newest last, capped at [`MAX_WATCHLIST`].
+    /// `default` so prefs.json files written by older builds still load.
+    #[serde(default)]
+    watchlist: Vec<String>,
+    /// Recently viewed symbols, most recent last, capped at [`MAX_RECENT`].
+    #[serde(default)]
+    recent_symbols: Vec<String>,
 }
+
+/// Starred symbols cap (Part 7: "Up to 50 symbols, persisted").
+const MAX_WATCHLIST: usize = 50;
+/// Recent-symbols cap (Part 7: "Last 10 viewed symbols").
+const MAX_RECENT: usize = 10;
 
 impl Default for Prefs {
     fn default() -> Self {
@@ -1845,6 +1879,8 @@ impl Default for Prefs {
             theme: "dark".to_string(),
             custom_start: String::new(),
             custom_end: String::new(),
+            watchlist: Vec::new(),
+            recent_symbols: Vec::new(),
         }
     }
 }
@@ -1902,6 +1938,32 @@ impl Prefs {
         if let Ok(json) = serde_json::to_string_pretty(self) {
             let _ = fs::write(&path, json);
         }
+    }
+}
+
+/// JSON data files beside the executable, same anchoring as [`Prefs`].
+fn app_data_file(name: &str) -> std::path::PathBuf {
+    let base = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    base.join("data").join(name)
+}
+
+fn load_json_file<T: Default + serde::de::DeserializeOwned>(name: &str) -> T {
+    fs::read_to_string(app_data_file(name))
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())
+        .unwrap_or_default()
+}
+
+fn save_json_file<T: Serialize>(name: &str, value: &T) {
+    let path = app_data_file(name);
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(value) {
+        let _ = fs::write(&path, json);
     }
 }
 
@@ -2200,6 +2262,139 @@ struct BharatApp {
     sys: sysinfo::System,
     ram_mb: f64,
     ram_at: Instant,
+    /// Starred symbols (mirrors `Prefs::watchlist`, kept live here so the
+    /// dropdown can toggle without rewriting prefs each frame).
+    watchlist: Vec<String>,
+    /// Recently viewed symbols, most recent last.
+    recent_symbols: Vec<String>,
+    /// Alert rules from `alerts.json`, evaluated against cached closes.
+    alerts: Vec<AlertRule>,
+    /// Next rule id; persisted implicitly as max(existing)+1 on load.
+    next_alert_id: u64,
+    /// Recently fired alert events, newest last, capped.
+    alert_events: VecDeque<AlertEvent>,
+    /// Last alert evaluation, so the 30s live loop evaluates at most once per
+    /// cycle instead of every frame.
+    alerts_last_eval: Option<Instant>,
+    /// In-app toasts (alerts, export confirmations), newest last.
+    toasts: VecDeque<AppToast>,
+    /// `?` shortcuts overlay.
+    show_shortcuts: bool,
+    /// Set when `/` is pressed; the search box grabs focus next frame.
+    focus_company_search: bool,
+    /// Cached news headlines with sentiment, newest first.
+    news_items: Vec<NewsArticle>,
+    /// Last news fetch attempt (success or failure), for throttling.
+    news_at: Option<Instant>,
+    /// Last news fetch error, shown inline on the News tab.
+    news_error: Option<String>,
+    /// News fetch in flight.
+    news_in_flight: bool,
+    /// Saved article links (`reading_list.json`).
+    reading_list: Vec<String>,
+    /// Dismissed calendar event ids (`calendar_cache.json`).
+    calendar_dismissed: Vec<String>,
+    /// One-shot export confirmation, shown inline in the header.
+    export_msg: Option<(String, Instant)>,
+    /// Unsaved new-alert form on the Alerts tab.
+    alert_draft: AlertDraft,
+}
+
+/// One in-app toast: message, severity color, creation time.
+#[derive(Debug, Clone)]
+struct AppToast {
+    message: String,
+    kind: ToastKind,
+    at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToastKind {
+    Info,
+    Success,
+    Warn,
+    Error,
+}
+
+impl ToastKind {
+    fn color(self) -> Color32 {
+        match self {
+            ToastKind::Info => INFO,
+            ToastKind::Success => PROFIT,
+            ToastKind::Warn => AMBER,
+            ToastKind::Error => LOSS,
+        }
+    }
+}
+
+/// New-alert form state. Kept on the app (not in the popup) because text
+/// fields need storage that survives frames.
+#[derive(Debug, Clone)]
+struct AlertDraft {
+    symbol: String,
+    kind_idx: usize,
+    level_text: String,
+    bars_text: String,
+    buy_side: bool,
+}
+
+impl Default for AlertDraft {
+    fn default() -> Self {
+        Self {
+            symbol: String::new(),
+            kind_idx: 0,
+            level_text: String::new(),
+            bars_text: "10".to_string(),
+            buy_side: true,
+        }
+    }
+}
+
+/// Alert kinds offered in the add-rule form, in display order.
+const ALERT_KIND_OPTIONS: &[&str] = &[
+    "Price above",
+    "Price below",
+    "% move over N bars",
+    "Volume spike",
+    "RSI above",
+    "RSI below",
+    "MACD bull cross",
+    "MACD bear cross",
+    "Breaks upper BB",
+    "Breaks lower BB",
+    "Forecast move",
+    "Signal BUY/SELL",
+];
+
+/// Build an [`AlertKind`] from the draft, or an error naming the bad field.
+fn draft_to_kind(d: &AlertDraft) -> Result<bt_analytics::alerts::AlertKind, String> {
+    use bt_analytics::alerts::AlertKind as K;
+    let level: f64 = d.level_text.trim().parse().map_err(|_| {
+        format!("level {:?} is not a number", d.level_text.trim())
+    })?;
+    let bars: usize = d.bars_text.trim().parse().map_err(|_| {
+        format!("bars {:?} is not a whole number", d.bars_text.trim())
+    })?;
+    Ok(match d.kind_idx {
+        0 => K::PriceAbove { level },
+        1 => K::PriceBelow { level },
+        2 => K::PctMove { pct: level, bars },
+        3 => K::VolumeSpike {
+            multiple: level,
+            window: bars,
+        },
+        4 => K::RsiAbove { level },
+        5 => K::RsiBelow { level },
+        6 => K::MacdBullCross,
+        7 => K::MacdBearCross,
+        8 => K::BollingerBreakUpper,
+        9 => K::BollingerBreakLower,
+        10 => K::ForecastMove {
+            pct: level,
+            horizon: bars,
+        },
+        _ => K::SignalIs { buy: d.buy_side },
+    })
 }
 
 /// One plotted series for [`draw_lines_frame`]: legend label, full-length
@@ -2427,7 +2622,25 @@ impl BharatApp {
             sys: sysinfo::System::new(),
             ram_mb: 0.0,
             ram_at: Instant::now() - Duration::from_secs(10),
+            watchlist: prefs.watchlist.clone(),
+            recent_symbols: prefs.recent_symbols.clone(),
+            alerts: load_json_file("alerts.json"),
+            next_alert_id: 1,
+            alert_events: VecDeque::new(),
+            alerts_last_eval: None,
+            toasts: VecDeque::new(),
+            show_shortcuts: false,
+            focus_company_search: false,
+            news_items: Vec::new(),
+            news_at: None,
+            news_error: None,
+            news_in_flight: false,
+            reading_list: load_json_file("reading_list.json"),
+            calendar_dismissed: load_json_file("calendar_cache.json"),
+            export_msg: None,
+            alert_draft: AlertDraft::default(),
         };
+        app.next_alert_id = app.alerts.iter().map(|r| r.id).max().unwrap_or(0) + 1;
 
         app.trigger_fetch();
         app
@@ -2457,6 +2670,8 @@ impl BharatApp {
                 } else {
                     "light".to_string()
                 },
+                watchlist: self.watchlist.clone(),
+                recent_symbols: self.recent_symbols.clone(),
             };
             prefs.save();
             self.prefs_dirty = false;
@@ -2533,6 +2748,10 @@ impl BharatApp {
 
     fn drain_messages(&mut self) {
         let mut completed = false;
+        // Only real fetched data may fire alerts: the FetchError arm swaps in
+        // synthetic fallback candles, and toasting "RELIANCE crossed 1500"
+        // because a random-walk generator happened to cross it would be a lie.
+        let mut fresh_data = false;
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 AppMessage::DataReady(series) => {
@@ -2553,6 +2772,7 @@ impl BharatApp {
                     self.status_last_update = Utc::now().format("%H:%M:%S").to_string();
                     self.status_latency_ms = 0;
                     self.warning_banner = None;
+                    fresh_data = true;
                 }
                 AppMessage::FetchError(err) => {
                     self.fetch_in_flight = false;
@@ -2571,6 +2791,17 @@ impl BharatApp {
                     self.data.candles = synthetic_ohlcv(&self.selected_company, days, 42, 100.0);
                 }
                 AppMessage::QuoteReady(_) => {}
+                AppMessage::NewsReady(items) => {
+                    self.news_in_flight = false;
+                    self.news_at = Some(Instant::now());
+                    self.news_error = None;
+                    self.news_items = items;
+                }
+                AppMessage::NewsError(err) => {
+                    self.news_in_flight = false;
+                    self.news_at = Some(Instant::now());
+                    self.news_error = Some(err);
+                }
             }
         }
         // A range or symbol switch during the fetch was deferred, not dropped.
@@ -2579,6 +2810,10 @@ impl BharatApp {
         if completed && self.fetch_pending {
             self.fetch_pending = false;
             self.trigger_fetch();
+        }
+        if fresh_data {
+            self.alerts_last_eval = Some(Instant::now());
+            self.evaluate_alerts();
         }
     }
 
@@ -2593,29 +2828,146 @@ impl BharatApp {
                     self.company_search.clone()
                 };
                 let mut changed = false;
+                // `/` focuses this box even when the popup is closed: the flag
+                // survives until the box actually holds focus, and requesting
+                // focus on a closed popup is a harmless no-op.
+                if self.focus_company_search {
+                    ui.memory_mut(|m| m.request_focus(Id::new("company_search")));
+                    if ctx.memory(|m| m.has_focus(Id::new("company_search"))) {
+                        self.focus_company_search = false;
+                    }
+                }
+                // A toast queued from inside the popup, applied after it closes:
+                // toasting borrows all of `self` while the popup still holds
+                // field borrows.
+                let mut popup_warn: Option<String> = None;
                 egui::ComboBox::from_label("Company")
                     .selected_text(display_text)
-                    .width(220.0_f32)
+                    .width(260.0_f32)
                     .show_ui(ui, |ui| {
-                        ui.text_edit_singleline(&mut self.company_search);
+                        egui::TextEdit::singleline(&mut self.company_search)
+                            .id(Id::new("company_search"))
+                            .hint_text("Search — fuzzy, top 10 (/ to focus)")
+                            .show(ui);
                         let query = self.company_search.to_lowercase();
-                        for (name, ticker, exchange) in COMPANY_LIST {
-                            let matches = query.is_empty()
-                                || name.to_lowercase().contains(&query)
-                                || ticker.to_lowercase().contains(&query);
-                            if matches {
-                                let label = format!("{} ({}) — {}", name, ticker, exchange);
-                                if ui
-                                    .selectable_label(self.selected_company == *ticker, label)
-                                    .clicked()
+                        // (name, ticker, exchange) in rank order; empty query
+                        // means "everything in list order".
+                        let rows: Vec<(&str, &str, &str)> =
+                            fuzzy_company_matches(&query, 10);
+                        // Actions are collected and applied after the popup
+                        // closes over `ui`, because toasting borrows all of
+                        // `self` while the popup still holds field borrows.
+                        enum DropAction {
+                            Select(String),
+                            ToggleStar(String),
+                        }
+                        let mut action: Option<DropAction> = None;
+                        let mut section = |ui: &mut egui::Ui,
+                                           title: &str,
+                                           tickers: &[String],
+                                           watchlist: &[String],
+                                           selected: &str,
+                                           action: &mut Option<DropAction>| {
+                            let mut shown = false;
+                            for t in tickers {
+                                if let Some((name, ticker, exchange)) =
+                                    rows.iter().find(|r| r.1 == t.as_str())
                                 {
-                                    self.selected_company = ticker.to_string();
-                                    self.company_search.clear();
-                                    changed = true;
+                                    if !shown {
+                                        ui.label(RichText::new(title).weak().small());
+                                        shown = true;
+                                    }
+                                    row(ui, name, ticker, exchange, watchlist, selected, action);
                                 }
                             }
+                        };
+                        fn row(
+                            ui: &mut egui::Ui,
+                            name: &str,
+                            ticker: &str,
+                            exchange: &str,
+                            watchlist: &[String],
+                            selected: &str,
+                            action: &mut Option<DropAction>,
+                        ) {
+                            ui.horizontal(|ui| {
+                                let starred = watchlist.iter().any(|w| w == ticker);
+                                if ui
+                                    .small_button(if starred { "★" } else { "☆" })
+                                    .on_hover_text(if starred {
+                                        "Remove from watchlist"
+                                    } else {
+                                        "Add to watchlist"
+                                    })
+                                    .clicked()
+                                {
+                                    *action = Some(DropAction::ToggleStar(ticker.to_string()));
+                                }
+                                let label = format!("{} ({}) — {}", name, ticker, exchange);
+                                if ui
+                                    .selectable_label(selected == ticker, label)
+                                    .clicked()
+                                {
+                                    *action = Some(DropAction::Select(ticker.to_string()));
+                                }
+                            });
+                        }
+                        if query.is_empty() {
+                            let watch: Vec<String> = self.watchlist.clone();
+                            section(ui, "★ Watchlist", &watch, &self.watchlist.clone(), &self.selected_company.clone(), &mut action);
+                            let recent: Vec<String> = self.recent_symbols.clone();
+                            section(ui, "Recent", &recent, &self.watchlist.clone(), &self.selected_company.clone(), &mut action);
+                            ui.label(RichText::new("All companies").weak().small());
+                        }
+                        for (name, ticker, exchange) in &rows {
+                            // Listed sections already drew these when the query
+                            // is empty; the fuzzy path draws everything here.
+                            if query.is_empty()
+                                && (self.watchlist.iter().any(|w| w == *ticker)
+                                    || self.recent_symbols.iter().any(|r| r == *ticker))
+                            {
+                                continue;
+                            }
+                            row(
+                                ui,
+                                name,
+                                ticker,
+                                exchange,
+                                &self.watchlist.clone(),
+                                &self.selected_company.clone(),
+                                &mut action,
+                            );
+                        }
+                        match action {
+                            Some(DropAction::Select(t)) => {
+                                self.selected_company = t.clone();
+                                self.company_search.clear();
+                                // Most-recent-last, deduplicated, capped.
+                                self.recent_symbols.retain(|r| r != &t);
+                                self.recent_symbols.push(t);
+                                while self.recent_symbols.len() > MAX_RECENT {
+                                    self.recent_symbols.remove(0);
+                                }
+                                changed = true;
+                            }
+                            Some(DropAction::ToggleStar(t)) => {
+                                if self.watchlist.iter().any(|w| w == &t) {
+                                    self.watchlist.retain(|w| w != &t);
+                                } else if self.watchlist.len() >= MAX_WATCHLIST {
+                                    popup_warn = Some(format!(
+                                        "Watchlist is full ({MAX_WATCHLIST} symbols)"
+                                    ));
+                                } else {
+                                    self.watchlist.push(t);
+                                }
+                                self.prefs_dirty = true;
+                            }
+                            None => {}
                         }
                     });
+                if let Some(msg) = popup_warn {
+                    self.push_toast(ToastKind::Warn, msg);
+                }
                 if changed {
                     self.prefs_dirty = true;
                     self.trigger_fetch();
@@ -2661,6 +3013,23 @@ impl BharatApp {
                 }
                 if ui.button("\u{27F3}").clicked() {
                     self.trigger_fetch();
+                }
+                ui.separator();
+                // CSV export of the current symbol's candles, plus clipboard.
+                // PNG/SVG raster export is deliberately absent: egui renders
+                // immediate-mode with no offscreen target in 0.28, so a
+                // screenshot button would either lie or need a second renderer.
+                if ui.button("Export CSV").clicked() {
+                    self.export_csv();
+                }
+                if ui.button("Copy CSV").clicked() {
+                    self.copy_csv_clipboard(ctx);
+                    self.push_toast(ToastKind::Success, "Candles copied to clipboard");
+                }
+                if let Some((msg, at)) = &self.export_msg {
+                    if at.elapsed() < Duration::from_secs(8) {
+                        ui.label(RichText::new(msg).color(PROFIT).small());
+                    }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(RichText::new(format!("Made by {AUTHOR}")).color(AMBER));
@@ -2834,6 +3203,208 @@ impl BharatApp {
                 ui.colored_label(Color32::YELLOW, format!("⚠ {msg}"));
             });
         }
+    }
+
+    /// Queue an in-app toast. Newest last, capped so a rule storm cannot fill
+    /// memory; each toast auto-expires after a few seconds in [`Self::toasts`].
+    fn push_toast(&mut self, kind: ToastKind, message: impl Into<String>) {
+        self.toasts.push_back(AppToast {
+            message: message.into(),
+            kind,
+            at: Instant::now(),
+        });
+        while self.toasts.len() > 8 {
+            self.toasts.pop_front();
+        }
+    }
+
+    /// Render stacked toasts bottom-right, newest on top. Expired toasts are
+    /// dropped; the rest get a dismiss button.
+    fn toasts(&mut self, ctx: &egui::Context) {
+        self.toasts
+            .retain(|t| t.at.elapsed() < Duration::from_secs(6));
+        if self.toasts.is_empty() {
+            return;
+        }
+        let screen = ctx.screen_rect();
+        let mut y = screen.bottom() - 20.0_f32;
+        // Iterate a snapshot: drawing borrows `self` mutably, so dismissal is
+        // collected and applied afterwards.
+        let items: Vec<(usize, AppToast)> = self.toasts.iter().cloned().enumerate().collect();
+        let mut dismiss: Option<usize> = None;
+        for (i, toast) in items.iter().rev() {
+            let h = 54.0_f32;
+            y -= h + 8.0_f32;
+            egui::Window::new(format!("toast_{i}"))
+                .title_bar(false)
+                .fixed_pos(egui::Pos2::new(screen.right() - 370.0_f32, y))
+                .fixed_size([350.0_f32, h])
+                .collapsible(false)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(toast.kind.color(), RichText::new("●").strong());
+                        ui.label(&toast.message);
+                        if ui.small_button("✕").clicked() {
+                            dismiss = Some(*i);
+                        }
+                    });
+                });
+        }
+        if let Some(i) = dismiss {
+            self.toasts.remove(i);
+        }
+    }
+
+    /// Build one [`MarketSnapshot`] from cached data and evaluate every enabled
+    /// rule. Fired events toast in-app, attempt a native Windows toast, and are
+    /// persisted to `alerts.json` so a restart does not re-toast.
+    fn evaluate_alerts(&mut self) {
+        use bt_analytics::{bollinger, macd, rsi};
+        if self.alerts.iter().all(|r| !r.enabled) {
+            return;
+        }
+        let series = &self.data.candles;
+        if series.candles.len() < 30 {
+            return;
+        }
+        let closes = series.closes();
+        let volumes: Vec<f64> = series.candles.iter().map(|c| c.volume).collect();
+        let rsi14 = rsi(series, 14).into_iter().rev().find(|v| v.is_finite());
+        let (ml, sl, _) = macd(series);
+        let n = closes.len();
+        let macd_now = finite_pair(ml.get(n - 1), sl.get(n - 1));
+        let macd_prev = if n >= 2 {
+            finite_pair(ml.get(n - 2), sl.get(n - 2))
+        } else {
+            None
+        };
+        let (mid, upper, lower) = bollinger(series, 20, 2.0);
+        let bb = match (lower.last(), mid.last(), upper.last()) {
+            (Some(&l), Some(&m), Some(&u)) if l.is_finite() && u.is_finite() => Some((l, m, u)),
+            _ => None,
+        };
+        let forecast_pct = match (self.forecast_basis.last(), self.forecast_values.last()) {
+            (Some(&base), Some(&last)) if base.abs() > 1e-12 => {
+                Some((last / base - 1.0) * 100.0)
+            }
+            _ => None,
+        };
+        let signal = self.last_signal.as_ref().map(|s| s.signal.label().to_string());
+        let snap = MarketSnapshot {
+            closes,
+            volumes,
+            rsi14,
+            macd: macd_now,
+            prev_macd: macd_prev,
+            bollinger: bb,
+            forecast_pct,
+            signal,
+        };
+        let now = Utc::now();
+        let mut fired = 0;
+        for rule in self.alerts.iter_mut() {
+            if let Some(ev) = bt_analytics::alerts::evaluate(rule, &snap, now) {
+                self.toasts.push_back(AppToast {
+                    message: ev.message.clone(),
+                    kind: ToastKind::Warn,
+                    at: Instant::now(),
+                });
+                native_toast("Bharat Terminal — Alert", &ev.message);
+                self.alert_events.push_back(ev);
+                fired += 1;
+            }
+        }
+        while self.alert_events.len() > 200 {
+            self.alert_events.pop_front();
+        }
+        if fired > 0 {
+            save_json_file("alerts.json", &self.alerts);
+        }
+    }
+
+    /// Fetch news feeds on a worker thread (15-minute throttle). Sentiment is
+    /// scored before the results cross the channel, so the UI thread never
+    /// touches the lexicon.
+    fn trigger_news_fetch(&mut self) {
+        if self.news_in_flight {
+            return;
+        }
+        if let Some(at) = self.news_at {
+            if at.elapsed() < Duration::from_secs(15 * 60) && !self.news_items.is_empty() {
+                return;
+            }
+        }
+        self.news_in_flight = true;
+        let tx = self.tx.clone();
+        self.runtime.spawn(async move {
+            let provider = bt_data::news::NewsProvider::new();
+            let mut items = provider.fetch_all().await;
+            if items.is_empty() {
+                let _ = tx.send(AppMessage::NewsError(
+                    "all feeds unreachable — check network, or retry".to_string(),
+                ));
+                return;
+            }
+            for a in items.iter_mut() {
+                let (s, _) = bt_analytics::sentiment::score_labeled(&format!(
+                    "{} {}",
+                    a.title, a.summary
+                ));
+                // NaN guard: an empty headline scores 0.0 by contract, but a
+                // corrupt feed must never poison the list.
+                a.sentiment = Some(if s.is_finite() { s as f32 } else { 0.0 });
+            }
+            let _ = tx.send(AppMessage::NewsReady(items));
+        });
+    }
+
+    /// Write the current symbol's candles to `exports/<SYMBOL>_<range>.csv`
+    /// next to the executable and toast the path.
+    fn export_csv(&mut self) {
+        let symbol = self.selected_company.clone();
+        let range = self.time_range.label().to_string();
+        let stamp = Utc::now().format("%Y%m%d_%H%M%S");
+        let name = format!(
+            "{}_{}_{}.csv",
+            sanitize_filename(&symbol),
+            sanitize_filename(&range),
+            stamp
+        );
+        let mut csv = String::from("t,open,high,low,close,volume\n");
+        for c in &self.data.candles.candles {
+            csv.push_str(&format!(
+                "{},{},{},{},{},{}\n",
+                c.t, c.open, c.high, c.low, c.close, c.volume
+            ));
+        }
+        let base = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let dir = base.join("exports");
+        match fs::create_dir_all(&dir)
+            .and_then(|_| fs::write(dir.join(&name), csv.as_bytes()).map(|_| ()))
+        {
+            Ok(()) => {
+                self.push_toast(ToastKind::Success, format!("Saved {name}"));
+                self.export_msg = Some((format!("Saved exports/{name}"), Instant::now()));
+            }
+            Err(e) => {
+                self.push_toast(ToastKind::Error, format!("Export failed: {e}"));
+            }
+        }
+    }
+
+    /// Copy the same CSV to the clipboard.
+    fn copy_csv_clipboard(&self, ctx: &egui::Context) {
+        let mut csv = String::from("t,open,high,low,close,volume\n");
+        for c in &self.data.candles.candles {
+            csv.push_str(&format!(
+                "{},{},{},{},{},{}\n",
+                c.t, c.open, c.high, c.low, c.close, c.volume
+            ));
+        }
+        ctx.output_mut(|o| o.copied_text = csv);
     }
 
     fn body(&mut self, ctx: &egui::Context) {
@@ -3156,6 +3727,9 @@ impl BharatApp {
             Tab::PcaProjection => self.draw_pca_projection(ui),
             Tab::ThreeD_Gallery => self.draw_three_d_gallery(ui),
             Tab::FourInOne => self.draw_four_in_one(ui),
+            Tab::Alerts => self.draw_alerts(ui),
+            Tab::News => self.draw_news(ui),
+            Tab::Calendar => self.draw_calendar(ui),
         }
     }
 
@@ -8461,6 +9035,289 @@ impl BharatApp {
         }
     }
 
+    /// v4.0 Alerts tab: rule list with toggles, an add-rule form, and recently
+    /// fired events. Rules persist to `alerts.json`; evaluation happens in
+    /// [`Self::evaluate_alerts`] on fresh data, not here.
+    fn draw_alerts(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("Alerts — triggers with toasts").strong());
+        ui.label(
+            RichText::new(format!(
+                "{} rule{} ({} on) · {} recent events",
+                self.alerts.len(),
+                if self.alerts.len() == 1 { "" } else { "s" },
+                self.alerts.iter().filter(|r| r.enabled).count(),
+                self.alert_events.len()
+            ))
+            .color(Color32::GRAY)
+            .small(),
+        );
+        ui.separator();
+
+        ui.collapsing("Add rule", |ui| {
+            let d = &mut self.alert_draft;
+            if d.symbol.is_empty() {
+                d.symbol = self.selected_company.clone();
+            }
+            ui.horizontal(|ui| {
+                ui.label("Symbol:");
+                ui.text_edit_singleline(&mut d.symbol).on_hover_text("Ticker, e.g. RELIANCE.NS");
+                egui::ComboBox::from_id_source("alert_kind_pick")
+                    .selected_text(ALERT_KIND_OPTIONS[d.kind_idx.min(ALERT_KIND_OPTIONS.len() - 1)])
+                    .show_ui(ui, |ui| {
+                        for (i, name) in ALERT_KIND_OPTIONS.iter().enumerate() {
+                            ui.selectable_value(&mut d.kind_idx, i, *name);
+                        }
+                    });
+            });
+            ui.horizontal(|ui| {
+                ui.label("Level / %:");
+                ui.text_edit_singleline(&mut d.level_text)
+                    .on_hover_text("Price, percent, RSI level, volume multiple or forecast %");
+                ui.label("Bars:");
+                ui.text_edit_singleline(&mut d.bars_text)
+                    .on_hover_text("Window length where the kind uses one");
+                if d.kind_idx == ALERT_KIND_OPTIONS.len() - 1 {
+                    ui.checkbox(&mut d.buy_side, "BUY (off = SELL)");
+                }
+            });
+            if ui.button("Add alert").clicked() {
+                let symbol = d.symbol.trim().to_uppercase();
+                if symbol.is_empty() {
+                    self.push_toast(ToastKind::Error, "Alert needs a symbol");
+                } else {
+                    match draft_to_kind(d) {
+                        Ok(kind) => {
+                            let id = self.next_alert_id;
+                            self.next_alert_id += 1;
+                            self.alerts.push(bt_analytics::alerts::AlertRule {
+                                id,
+                                symbol: symbol.clone(),
+                                kind: kind.clone(),
+                                enabled: true,
+                                cooldown_secs: 3600,
+                                last_fired: None,
+                            });
+                            save_json_file("alerts.json", &self.alerts);
+                            self.push_toast(
+                                ToastKind::Success,
+                                format!("Alert #{id}: {symbol} {}", kind.label()),
+                            );
+                            self.alert_draft.level_text.clear();
+                        }
+                        Err(e) => self.push_toast(ToastKind::Error, e),
+                    }
+                }
+            }
+        });
+        ui.separator();
+
+        let mut delete: Option<usize> = None;
+        let mut changed = false;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for (i, rule) in self.alerts.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    let was = rule.enabled;
+                    ui.checkbox(&mut rule.enabled, "");
+                    if rule.enabled != was {
+                        changed = true;
+                    }
+                    ui.label(
+                        RichText::new(format!("#{} {} — {}", rule.id, rule.symbol, rule.kind.label()))
+                            .strong(),
+                    );
+                    let fired = rule
+                        .last_fired
+                        .map(|t| format!("fired {}", t.format("%d %b %H:%M")))
+                        .unwrap_or_else(|| "never fired".to_string());
+                    ui.label(RichText::new(fired).color(Color32::GRAY).small());
+                    if ui.small_button("Delete").clicked() {
+                        delete = Some(i);
+                    }
+                });
+            }
+            if self.alert_events.is_empty() {
+                ui.label(RichText::new("No events yet. Rules fire on fresh data and hourly.").weak());
+            } else {
+                ui.separator();
+                ui.label(RichText::new("Recent events").strong());
+                for ev in self.alert_events.iter().rev().take(10) {
+                    ui.label(format!(
+                        "{} · {} · {}",
+                        ev.at.format("%d %b %H:%M"),
+                        ev.symbol,
+                        ev.message
+                    ));
+                }
+            }
+        });
+        if let Some(i) = delete {
+            let rule = self.alerts.remove(i);
+            save_json_file("alerts.json", &self.alerts);
+            self.push_toast(ToastKind::Info, format!("Deleted alert #{}", rule.id));
+        } else if changed {
+            save_json_file("alerts.json", &self.alerts);
+        }
+    }
+
+    /// v4.0 News tab: RSS headlines with VADER sentiment, symbol filter, and a
+    /// persisted reading list. Fetching is throttled and happens on a worker;
+    /// this only renders.
+    fn draw_news(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("News — headlines with sentiment").strong());
+            if ui.button("Refresh feeds").clicked() {
+                self.news_at = None;
+                self.trigger_news_fetch();
+            }
+            match (&self.news_error, self.news_at) {
+                (Some(e), _) => {
+                    ui.colored_label(LOSS, format!("Feed error: {e}"));
+                }
+                (None, Some(at)) => {
+                    ui.label(
+                        RichText::new(format!(
+                            "{} articles · {}s ago",
+                            self.news_items.len(),
+                            at.elapsed().as_secs()
+                        ))
+                        .color(Color32::GRAY)
+                        .small(),
+                    );
+                }
+                (None, None) => {
+                    ui.spinner();
+                    ui.label(RichText::new("Loading feeds…").color(Color32::GRAY).small());
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Filter:");
+            ui.text_edit_singleline(&mut self.market_search)
+                .on_hover_text("Match against title and summary");
+            let saved_n = self.reading_list.len();
+            ui.label(
+                RichText::new(format!("Saved: {saved_n} (click ☆ on any story)"))
+                    .color(Color32::GRAY)
+                    .small(),
+            );
+        });
+        ui.separator();
+
+        let q = self.market_search.to_lowercase();
+        let mut toggle_save: Option<String> = None;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for a in &self.news_items {
+                if !q.is_empty()
+                    && !a.title.to_lowercase().contains(&q)
+                    && !a.summary.to_lowercase().contains(&q)
+                {
+                    continue;
+                }
+                let (score, label) = a
+                    .sentiment
+                    .map(|s| (s as f64, bt_analytics::sentiment::label(s as f64)))
+                    .unwrap_or((0.0, "—"));
+                let dot = match label {
+                    "Positive" => PROFIT,
+                    "Negative" => LOSS,
+                    _ => Color32::GRAY,
+                };
+                ui.horizontal(|ui| {
+                    ui.colored_label(dot, RichText::new("●").strong());
+                    ui.label(RichText::new(&a.title).strong());
+                });
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "{} · {} · sentiment {label} ({score:+.2})",
+                            a.source,
+                            a.published
+                                .map(|t| t.format("%d %b %H:%M").to_string())
+                                .unwrap_or_else(|| "undated".to_string())
+                        ))
+                        .color(Color32::GRAY)
+                        .small(),
+                    );
+                    let saved = self.reading_list.iter().any(|l| l == &a.link);
+                    if ui
+                        .small_button(if saved { "★ Saved" } else { "☆ Save" })
+                        .on_hover_text("Toggle reading list")
+                        .clicked()
+                    {
+                        toggle_save = Some(a.link.clone());
+                    }
+                    if !a.link.is_empty() {
+                        ui.hyperlink_to("Open ↗", &a.link);
+                    }
+                });
+                if !a.summary.is_empty() {
+                    ui.label(RichText::new(&a.summary).small().weak());
+                }
+                ui.separator();
+            }
+            if self.news_items.is_empty() && self.news_error.is_none() {
+                ui.label(RichText::new("Fetching headlines in the background…").weak());
+            }
+        });
+        if let Some(link) = toggle_save {
+            if self.reading_list.iter().any(|l| l == &link) {
+                self.reading_list.retain(|l| l != &link);
+            } else {
+                self.reading_list.push(link);
+            }
+            save_json_file("reading_list.json", &self.reading_list);
+        }
+    }
+
+    /// v4.0 Calendar tab: dated events with live countdowns. RBI MPC and FOMC
+    /// dates are the published 2026 schedules; India CPI recurs around the
+    /// 12th. Dismissed events persist to `calendar_cache.json`.
+    fn draw_calendar(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("Calendar — events with countdowns").strong());
+        ui.label(
+            RichText::new("RBI MPC and FOMC dates are the published 2026 schedules; CPI recurs monthly.")
+                .color(Color32::GRAY)
+                .small(),
+        );
+        ui.separator();
+        let now = Utc::now();
+        let mut dismiss: Option<String> = None;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for ev in calendar_events() {
+                if self.calendar_dismissed.iter().any(|id| id == &ev.id) {
+                    continue;
+                }
+                let (cd, past) = countdown_text(now, ev.date);
+                let impact = match ev.impact {
+                    "High" => LOSS,
+                    "Medium" => AMBER,
+                    _ => PROFIT,
+                };
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(if past { "✓" } else { "⏳" }).strong());
+                    ui.label(RichText::new(&ev.name).strong());
+                    ui.label(RichText::new(ev.impact).color(impact).small());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("Dismiss").clicked() {
+                            dismiss = Some(ev.id.clone());
+                        }
+                        ui.label(
+                            RichText::new(format!("{} · {}", ev.date.format("%d %b %Y"), cd))
+                                .color(if past { Color32::GRAY } else { PROFIT })
+                                .monospace(),
+                        );
+                    });
+                });
+                ui.label(RichText::new(&ev.source).color(Color32::GRAY).small());
+                ui.separator();
+            }
+        });
+        if let Some(id) = dismiss {
+            self.calendar_dismissed.push(id);
+            save_json_file("calendar_cache.json", &self.calendar_dismissed);
+        }
+    }
+
     fn draw_correlation_network(&self, ui: &mut egui::Ui) {
         ui.label(RichText::new("Correlation Network").strong());
         let avail = ui.available_size();
@@ -11216,10 +12073,76 @@ fn normal_inverse(p: f64) -> f64 {
     }
 }
 
+    /// Global keyboard shortcuts. Skipped while the user is typing: F5 inside a
+    /// text field must not refresh, and `/` must type a slash. `?` is Shift+`/`
+    /// on every layout, so it is checked first — otherwise both arms fire.
+    ///
+    /// egui 0.28's `key_pressed` takes only the key; modifiers come from
+    /// `input.modifiers`, which is why this does not pass a second argument.
+    fn handle_shortcuts(app: &mut BharatApp, ctx: &egui::Context) {
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if app.show_shortcuts {
+                app.show_shortcuts = false;
+            } else if !app.company_search.is_empty() {
+                app.company_search.clear();
+            }
+            return;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Slash) && i.modifiers.shift) {
+            app.show_shortcuts = true;
+            return;
+        }
+        if ctx.wants_keyboard_input() {
+            return;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::F5)) {
+            app.trigger_fetch();
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Slash) && !i.modifiers.shift) {
+            app.focus_company_search = true;
+        }
+    }
+
+    /// `?` overlay listing the implemented shortcuts. Rendered last so it sits
+    /// above every panel.
+    fn shortcuts_overlay(app: &mut BharatApp, ctx: &egui::Context) {
+        if !app.show_shortcuts {
+            return;
+        }
+        egui::Window::new("Keyboard shortcuts")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(RichText::new("Keyboard shortcuts").strong());
+                ui.separator();
+                egui::Grid::new("shortcuts_grid")
+                    .num_columns(2)
+                    .spacing([24.0, 4.0])
+                    .show(ui, |ui| {
+                        for (keys, action) in [
+                            ("F5", "Refresh current symbol now"),
+                            ("/", "Focus the company search box"),
+                            ("?", "Show this overlay"),
+                            ("Esc", "Close overlay / clear search"),
+                        ] {
+                            ui.monospace(keys);
+                            ui.label(action);
+                            ui.end_row();
+                        }
+                    });
+                ui.separator();
+                if ui.button("Close (Esc)").clicked() {
+                    app.show_shortcuts = false;
+                }
+            });
+    }
+
 impl eframe::App for BharatApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_messages();
         self.save_prefs();
+        handle_shortcuts(self, ctx);
 
         if self.live {
             if let Some(last) = self.last_fetch {
@@ -11238,6 +12161,21 @@ impl eframe::App for BharatApp {
                     self.refresh_market_data();
                 }
             }
+            // Alert rules re-evaluate at most once a minute on top of every
+            // completed fetch, so a condition that becomes true between
+            // refreshes still fires without evaluating every frame.
+            let due = self
+                .alerts_last_eval
+                .map(|t| t.elapsed() >= Duration::from_secs(60))
+                .unwrap_or(true);
+            if due && !self.data.candles.candles.is_empty() {
+                self.alerts_last_eval = Some(Instant::now());
+                self.evaluate_alerts();
+            }
+        }
+        // Fresh headlines whenever the News tab is showing (throttled inside).
+        if self.tab == Tab::News {
+            self.trigger_news_fetch();
         }
 
         ctx.set_visuals(if self.dark {
@@ -11250,6 +12188,8 @@ impl eframe::App for BharatApp {
         self.tab_bar(ctx);
         self.status_bar(ctx);
         self.error_toast(ctx);
+        self.toasts(ctx);
+        shortcuts_overlay(self, ctx);
         self.body(ctx);
         ctx.request_repaint_after(Duration::from_millis(100));
     }
@@ -11410,6 +12350,274 @@ mod forecast_plot_tests {
     }
 }
 
+/// Pair two optional series tails, dropping NaN warmup values.
+///
+/// Indicator series start with NaN until the window fills; a cross or band
+/// check must see two real numbers or nothing at all.
+fn finite_pair(a: Option<&f64>, b: Option<&f64>) -> Option<(f64, f64)> {
+    match (a.copied(), b.copied()) {
+        (Some(x), Some(y)) if x.is_finite() && y.is_finite() => Some((x, y)),
+        _ => None,
+    }
+}
+
+/// Make a string safe for use as a filename on Windows.
+fn sanitize_filename(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Best-effort native Windows toast. Failures are swallowed: the in-app toast
+/// is the reliable channel, this one is a convenience for when the app is
+/// minimized.
+#[cfg(windows)]
+fn native_toast(title: &str, body: &str) {
+    let _ = (|| -> Result<(), Box<dyn std::error::Error>> {
+        winrt_notification::Toast::new(winrt_notification::Toast::POWERSHELL_APP_ID)
+            .title(title)
+            .text1(&body.chars().take(200).collect::<String>())
+            .show()?;
+        Ok(())
+    })();
+}
+
+#[cfg(not(windows))]
+fn native_toast(_title: &str, _body: &str) {}
+
+/// One dated market event.
+#[derive(Debug, Clone)]
+struct CalendarEvent {
+    id: String,
+    name: String,
+    date: chrono::NaiveDate,
+    impact: &'static str,
+    source: String,
+}
+
+/// Event schedule. RBI MPC and FOMC dates are the officially published 2026
+/// schedules (RBI press release 23 Mar 2026; federalreserve.gov calendars);
+/// India CPI recurs around the 12th of each month (MoSPI convention), so the
+/// next three 12ths are generated rather than hardcoded.
+fn calendar_events() -> Vec<CalendarEvent> {
+    use chrono::{Datelike, NaiveDate};
+    let mut evs = vec![
+        ("rbi-mpc-oct-2026", "RBI MPC Decision", NaiveDate::from_ymd_opt(2026, 10, 7), "High",
+            "Repo 5.25%, neutral stance (Feb 2026). Policy announcement on the last day."),
+        ("rbi-mpc-dec-2026", "RBI MPC Decision", NaiveDate::from_ymd_opt(2026, 12, 4), "High",
+            "Policy announcement on the last day of the Dec 2–4 meeting."),
+        ("fomc-oct-2026", "FOMC Decision", NaiveDate::from_ymd_opt(2026, 10, 28), "High",
+            "Statement 2pm ET on the last day of the Oct 27–28 meeting."),
+        ("fomc-dec-2026", "FOMC Decision + SEP", NaiveDate::from_ymd_opt(2026, 12, 9), "High",
+            "Statement plus Summary of Economic Projections, Dec 8–9 meeting."),
+        ("rbi-mpc-feb-2027", "RBI MPC Decision", NaiveDate::from_ymd_opt(2027, 2, 5), "High",
+            "Final meeting of FY27, Feb 3–5."),
+    ]
+    .into_iter()
+    .filter_map(|(id, name, date, impact, source)| {
+        date.map(|d| CalendarEvent {
+            id: id.to_string(),
+            name: name.to_string(),
+            date: d,
+            impact,
+            source: source.to_string(),
+        })
+    })
+    .collect::<Vec<_>>();
+
+    // Next three India CPI releases (12th of month, MoSPI convention).
+    let today = Utc::now().date_naive();
+    let mut y = today.year();
+    let mut m = today.month();
+    for i in 0..3 {
+        if i > 0 || today.day() > 12 {
+            m += 1;
+            if m > 12 {
+                m = 1;
+                y += 1;
+            }
+        }
+        if let Some(d) = NaiveDate::from_ymd_opt(y, m, 12) {
+            evs.push(CalendarEvent {
+                id: format!("india-cpi-{}-{:02}", y, m),
+                name: "India CPI Inflation".to_string(),
+                date: d,
+                impact: "High",
+                source: "Released around the 12th each month (MoSPI).".to_string(),
+            });
+        }
+        m += 1;
+        if m > 12 {
+            m = 1;
+            y += 1;
+        }
+    }
+    evs.sort_by_key(|e| e.date);
+    evs
+}
+
+/// Human countdown: "Today", "in Nd", or "Nd ago".
+fn countdown_text(now: DateTime<Utc>, date: chrono::NaiveDate) -> (String, bool) {
+    let days = date.signed_duration_since(now.date_naive()).num_days();
+    if days == 0 {
+        ("Today".to_string(), false)
+    } else if days > 0 {
+        (format!("in {days}d"), false)
+    } else {
+        (format!("{}d ago", -days), true)
+    }
+}
+
+/// Fuzzy company search over name + ticker, best match first.
+///
+/// Empty query returns the full list in order; otherwise the top `limit`
+/// matches by Skim score. Matching runs against both the raw and lowercased
+/// haystack because company names carry mixed case (`RELIANCE` vs `Reliance`)
+/// and the scorer is case-sensitive.
+fn fuzzy_company_matches(query: &str, limit: usize) -> Vec<(&'static str, &'static str, &'static str)> {
+    if query.is_empty() {
+        return COMPANY_LIST.to_vec();
+    }
+    let matcher = SkimMatcherV2::default();
+    let mut scored: Vec<(&'static str, &'static str, &'static str, i64)> = COMPANY_LIST
+        .iter()
+        .filter_map(|(name, ticker, exchange)| {
+            let hay = format!("{name} {ticker}");
+            matcher
+                .fuzzy_match(&hay, query)
+                .or_else(|| matcher.fuzzy_match(&hay.to_lowercase(), &query.to_lowercase()))
+                .map(|score| (*name, *ticker, *exchange, score))
+        })
+        .collect();
+    scored.sort_by_key(|a| std::cmp::Reverse(a.3));
+    scored.truncate(limit.max(1));
+    scored
+        .into_iter()
+        .map(|(n, t, e, _)| (n, t, e))
+        .collect()
+}
+
+#[cfg(test)]
+mod v4_tools_tests {
+    use super::*;
+
+    #[test]
+    fn fuzzy_search_finds_tickers_out_of_order() {
+        // "rlnc" skips letters the substring search would require in order.
+        let hits = fuzzy_company_matches("rlnc", 10);
+        assert!(
+            hits.iter().any(|(_, t, _)| *t == "RELIANCE.NS"),
+            "fuzzy 'rlnc' should reach RELIANCE.NS"
+        );
+        // Exact ticker still ranks first.
+        let hits = fuzzy_company_matches("tcs", 10);
+        assert_eq!(hits.first().map(|(_, t, _)| *t), Some("TCS.NS"));
+    }
+
+    #[test]
+    fn fuzzy_search_empty_query_returns_everything() {
+        assert_eq!(fuzzy_company_matches("", 10).len(), COMPANY_LIST.len());
+    }
+
+    #[test]
+    fn fuzzy_search_respects_the_limit() {
+        assert!(fuzzy_company_matches("a", 5).len() <= 5);
+        assert!(fuzzy_company_matches("zzz-no-such-company", 10).is_empty());
+    }
+
+    #[test]
+    fn sanitize_filename_keeps_safe_chars_only() {
+        assert_eq!(sanitize_filename("RELIANCE.NS"), "RELIANCE.NS");
+        assert_eq!(sanitize_filename("1y"), "1y");
+        assert_eq!(sanitize_filename("a/b\\c:d*e?f\"g<h>i|j"), "a_b_c_d_e_f_g_h_i_j");
+        assert_eq!(sanitize_filename(""), "");
+    }
+
+    #[test]
+    fn countdown_text_covers_today_future_past() {
+        use chrono::NaiveDate;
+        let now = Utc::now();
+        let today = now.date_naive();
+        assert_eq!(countdown_text(now, today), ("Today".to_string(), false));
+        let future = today + ChronoDuration::days(5);
+        assert_eq!(countdown_text(now, future), ("in 5d".to_string(), false));
+        let past = today - ChronoDuration::days(3);
+        assert_eq!(countdown_text(now, past), ("3d ago".to_string(), true));
+        let _ = NaiveDate::from_ymd_opt(2026, 1, 1);
+    }
+
+    #[test]
+    fn calendar_has_the_verified_policy_dates_and_is_sorted() {
+        let evs = calendar_events();
+        let names: Vec<&str> = evs.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"RBI MPC Decision"));
+        assert!(names.contains(&"FOMC Decision"));
+        assert!(names.contains(&"India CPI Inflation"));
+        let oct_mpc = evs.iter().find(|e| e.id == "rbi-mpc-oct-2026").unwrap();
+        assert_eq!(oct_mpc.date.format("%Y-%m-%d").to_string(), "2026-10-07");
+        let dec_fomc = evs.iter().find(|e| e.id == "fomc-dec-2026").unwrap();
+        assert_eq!(dec_fomc.date.format("%Y-%m-%d").to_string(), "2026-12-09");
+        let mut sorted = evs.clone();
+        sorted.sort_by_key(|e| e.date);
+        let ids: Vec<&str> = evs.iter().map(|e| e.id.as_str()).collect();
+        let sorted_ids: Vec<&str> = sorted.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, sorted_ids, "events must come out sorted");
+    }
+
+    #[test]
+    fn draft_to_kind_maps_every_option() {
+        let mk = |idx: usize, level: &str, bars: &str| AlertDraft {
+            symbol: "X".to_string(),
+            kind_idx: idx,
+            level_text: level.to_string(),
+            bars_text: bars.to_string(),
+            buy_side: true,
+        };
+        assert!(matches!(
+            draft_to_kind(&mk(0, "1500", "10")),
+            Ok(bt_analytics::alerts::AlertKind::PriceAbove { .. })
+        ));
+        assert!(matches!(
+            draft_to_kind(&mk(6, "0", "10")),
+            Ok(bt_analytics::alerts::AlertKind::MacdBullCross)
+        ));
+        assert!(matches!(
+            draft_to_kind(&mk(11, "0", "10")),
+            Ok(bt_analytics::alerts::AlertKind::SignalIs { buy: true })
+        ));
+        assert!(draft_to_kind(&mk(0, "abc", "10")).is_err());
+        assert!(draft_to_kind(&mk(2, "5", "x")).is_err());
+    }
+
+    #[test]
+    fn caps_match_the_spec() {
+        assert_eq!(MAX_WATCHLIST, 50);
+        assert_eq!(MAX_RECENT, 10);
+        assert_eq!(ALERT_KIND_OPTIONS.len(), 12);
+    }
+
+    #[test]
+    fn new_tool_tabs_are_listed() {
+        use std::collections::HashSet;
+        let listed: HashSet<Tab> = CATEGORIES
+            .iter()
+            .flat_map(|c| tabs_in_category(*c))
+            .map(|(t, _)| *t)
+            .collect();
+        for tab in [Tab::Alerts, Tab::News, Tab::Calendar] {
+            assert!(listed.contains(&tab), "{tab:?} not listed in any category");
+        }
+        let tools = tabs_in_category(TabCategory::Tools);
+        assert_eq!(tools.len(), 3);
+    }
+}
+
 fn main() -> eframe::Result<()> {
     // Opt-in loopback API. Failing to open the socket must never stop the
     // terminal from drawing charts, so the result is only reported.
@@ -11426,7 +12634,7 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native(
-        &format!("{} v3 — Made by {}", APP_NAME, AUTHOR),
+        &format!("{} v4 — Made by {}", APP_NAME, AUTHOR),
         options,
         Box::new(|cc| Ok(Box::new(BharatApp::new(cc)))),
     )

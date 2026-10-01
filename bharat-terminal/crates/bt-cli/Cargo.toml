@@ -21,3 +21,5 @@ bt-analytics = { path = "../bt-analytics" }
 clap = { version = "4", features = ["derive", "env"] }
 tokio = { version = "1", features = ["full"] }
 chrono = "0.4"
+# watchlist add/list/remove shares the app's prefs.json via raw JSON.
+serde_json = { workspace = true }

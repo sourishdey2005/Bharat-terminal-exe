@@ -229,6 +229,188 @@ impl Default for NSEProvider {
     }
 }
 
+/// One day of institutional flow. Values are ₹ crore, positive = net buy.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FiiDiiActivity {
+    pub date: String,
+    pub fii_net: f64,
+    pub dii_net: f64,
+}
+
+/// One India VIX daily bar.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VixBar {
+    pub date: String,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+}
+
+impl NSEProvider {
+    /// Daily FII/DII net activity (₹ crore).
+    ///
+    /// NSE rotates these auxiliary paths without notice, so the endpoint lives
+    /// in one constant and parsing is lenient across field spellings. A moved or
+    /// blocked endpoint fails closed as `Err`, never as a panic or empty vec
+    /// that callers could mistake for "no flow".
+    pub async fn fetch_fii_dii_activity(&self) -> Result<Vec<FiiDiiActivity>> {
+        const URL: &str = "https://www.nseindia.com/api/fii-dii-trading-activity";
+        let resp = self.fetch_with_retry(URL).await?;
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| BtError::InvalidInput(format!("FII/DII JSON error: {e}")))?;
+        parse_fii_dii_body(&body)
+    }
+
+    /// India VIX daily history between `from` and `to` (`DD-MM-YYYY`).
+    pub async fn fetch_daily_volatility(&self, from: &str, to: &str) -> Result<Vec<VixBar>> {
+        let url = format!("{BASE_URL}/api/historical/vixhistory?from={from}&to={to}");
+        let resp = self.fetch_with_retry(&url).await?;
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| BtError::InvalidInput(format!("VIX JSON error: {e}")))?;
+        parse_vix_body(&body)
+    }
+
+    /// Top `n` gainers of an index (e.g. `"NIFTY 50"`) by day change %.
+    ///
+    /// Reuses the same `equity-stockIndices` endpoint as [`Self::fetch_index`],
+    /// so no new endpoint is introduced; the ranking is done client-side.
+    pub async fn fetch_top_gainers(&self, index: &str, n: usize) -> Result<Vec<NSEIndex>> {
+        let mut rows = self.fetch_index(index).await?;
+        rows.sort_by(|a, b| {
+            b.change_pct
+                .partial_cmp(&a.change_pct)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        rows.truncate(n.max(1));
+        Ok(rows)
+    }
+
+    /// Top `n` losers of an index by day change %.
+    pub async fn fetch_top_losers(&self, index: &str, n: usize) -> Result<Vec<NSEIndex>> {
+        let mut rows = self.fetch_index(index).await?;
+        rows.sort_by(|a, b| {
+            a.change_pct
+                .partial_cmp(&b.change_pct)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        rows.truncate(n.max(1));
+        Ok(rows)
+    }
+
+    /// Constituents sorted by absolute day change % (a volume-free proxy for
+    /// "most active" from the same endpoint; true traded volumes need the full
+    /// quote feed).
+    pub async fn fetch_most_active(&self, index: &str, n: usize) -> Result<Vec<NSEIndex>> {
+        let mut rows = self.fetch_index(index).await?;
+        rows.sort_by(|a, b| {
+            b.change_pct
+                .abs()
+                .partial_cmp(&a.change_pct.abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        rows.truncate(n.max(1));
+        Ok(rows)
+    }
+}
+
+/// Lenient FII/DII parsing across the field spellings NSE has used.
+pub fn parse_fii_dii_body(body: &serde_json::Value) -> Result<Vec<FiiDiiActivity>> {
+    let rows: &[serde_json::Value] = body
+        .get("data")
+        .and_then(|v| v.as_array())
+        .map(Vec::as_slice)
+        .or_else(|| body.as_array().map(Vec::as_slice))
+        .ok_or_else(|| BtError::InvalidInput("FII/DII: no data array".into()))?;
+    let mut out = Vec::new();
+    for r in rows {
+        let obj = match r.as_object() {
+            Some(o) => o,
+            None => continue,
+        };
+        let get = |keys: &[&str]| -> Option<f64> {
+            keys.iter().find_map(|k| {
+                obj.iter().find_map(|(name, v)| {
+                    if name.to_lowercase().contains(&k.to_lowercase()) {
+                        v.as_f64().or_else(|| {
+                            v.as_str()
+                                .and_then(|s| s.replace(',', "").parse::<f64>().ok())
+                        })
+                    } else {
+                        None
+                    }
+                })
+            })
+        };
+        let date = obj
+            .iter()
+            .find(|(k, _)| k.to_lowercase().contains("date"))
+            .and_then(|(_, v)| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let (Some(fii), Some(dii)) = (
+            get(&["fiinet", "fii_net", "fiin et"]),
+            get(&["diinet", "dii_net"]),
+        ) else {
+            continue;
+        };
+        out.push(FiiDiiActivity {
+            date,
+            fii_net: fii,
+            dii_net: dii,
+        });
+    }
+    Ok(out)
+}
+
+/// Lenient India VIX parsing (`DATE/OPEN/HIGH/LOW/CLOSE`, case-insensitive).
+pub fn parse_vix_body(body: &serde_json::Value) -> Result<Vec<VixBar>> {
+    let rows = body
+        .get("data")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| BtError::InvalidInput("VIX: no data array".into()))?;
+    let mut out = Vec::new();
+    for r in rows {
+        let obj = match r.as_object() {
+            Some(o) => o,
+            None => continue,
+        };
+        let get = |key: &str| -> Option<f64> {
+            obj.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(key))
+                .and_then(|(_, v)| {
+                    v.as_f64().or_else(|| {
+                        v.as_str()
+                            .and_then(|s| s.replace(',', "").parse::<f64>().ok())
+                    })
+                })
+        };
+        let date = obj
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("date"))
+            .and_then(|(_, v)| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let (Some(o), Some(h), Some(l), Some(c)) =
+            (get("open"), get("high"), get("low"), get("close"))
+        else {
+            continue;
+        };
+        out.push(VixBar {
+            date,
+            open: o,
+            high: h,
+            low: l,
+            close: c,
+        });
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,5 +445,35 @@ mod tests {
         let index = provider.fetch_index("NIFTY 50").await;
         assert!(index.is_ok());
         assert!(!index.unwrap().is_empty());
+    }
+
+    #[test]
+    fn fii_dii_parsing_accepts_field_variants() {
+        let body = serde_json::json!({"data": [
+            {"date": "30-Sep-2026", "fiiNet": 1234.5, "diiNet": -321.0},
+            {"TRADEDATE": "29-Sep-2026", "FII_NET": "2,000.0", "DII_NET": "500"}
+        ]});
+        let out = parse_fii_dii_body(&body).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].fii_net, 1234.5);
+        assert_eq!(out[1].dii_net, 500.0);
+    }
+
+    #[test]
+    fn fii_dii_skips_rows_without_both_legs() {
+        let body = serde_json::json!({"data": [{"date": "x", "fiiNet": 1.0}]});
+        assert!(parse_fii_dii_body(&body).unwrap().is_empty());
+        assert!(parse_fii_dii_body(&serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn vix_parsing_accepts_case_variants() {
+        let body = serde_json::json!({"data": [
+            {"DATE": "30-Sep-2026", "OPEN": 12.1, "HIGH": 12.8, "LOW": 11.9, "CLOSE": 12.5}
+        ]});
+        let out = parse_vix_body(&body).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].close, 12.5);
+        assert_eq!(out[0].date, "30-Sep-2026");
     }
 }

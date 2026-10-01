@@ -13,12 +13,14 @@
 //! - Portfolio analytics (Beta, Alpha, Correlation, Efficient Frontier)
 
 pub mod extended;
+pub mod alerts;
 pub mod forecast;
 pub mod indicators;
 pub mod models;
 pub mod ort_runtime;
 pub mod quant_analytics;
 pub mod risk;
+pub mod sentiment;
 pub mod signal;
 
 pub use extended::{
@@ -40,6 +42,8 @@ pub use models::{
     ModelSkill, NarrativeEngine, QuantileConeOutput, QuantileForecaster, SkillBook, SlidingBuffer,
     TtmEngine, TtmForecastResult,
 };
+pub use alerts::{AlertEvent, AlertKind, AlertRule, MarketSnapshot, condition_message, evaluate};
+pub use sentiment::{label as sentiment_label, score as sentiment_score, score_labeled};
 pub use quant_analytics::{
     FftCycleOutput, QuantAnalyticsEngine, QuantError, Regime, RegimeOutput, FFT_MAX_BARS,
     FFT_MIN_BARS, REGIME_MIN_BARS, REGIME_STATES,

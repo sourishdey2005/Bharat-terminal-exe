@@ -17,9 +17,11 @@ tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 ort = { workspace = true }
-oxidiviner = { workspace = true }
+oxidiviner = "1"
 rustfft = { workspace = true }
 sysinfo = { workspace = true }
+# v4.0: VADER lexicon sentiment for news headlines (News tab).
+vader_sentiment = { workspace = true }
 
 [dev-dependencies]
 # Integration tests in tests/ need bt-core directly to build candle fixtures.

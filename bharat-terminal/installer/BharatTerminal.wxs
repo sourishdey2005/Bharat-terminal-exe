@@ -1,7 +1,7 @@
 <!-- Bharat Terminal — Windows installer (WiX v5).
      Per-user install: no UAC prompt, lives under %LOCALAPPDATA%\Programs.
      Built with: wix build BharatTerminal.wxs -o <out>.msi
-                 -ext WixToolset.UI.wixext -arch x64 -d AppVersion=3.0.0
+                 -ext WixToolset.UI.wixext -arch x64 -d AppVersion=4.0.0
      Made by Sourish Dey. -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">

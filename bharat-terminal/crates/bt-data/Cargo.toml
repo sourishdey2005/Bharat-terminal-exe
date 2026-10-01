@@ -22,6 +22,8 @@ futures-util = "0.3"
 rusqlite = { version = "0.32", features = ["bundled"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 csv = "1"
+# v4.0: RSS/Atom parsing for the News tab (Google News, exchange feeds).
+feed-rs = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

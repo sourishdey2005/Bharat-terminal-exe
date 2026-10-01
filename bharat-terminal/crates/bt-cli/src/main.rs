@@ -85,12 +85,12 @@ impl RangeArg {
     }
 }
 
-/// BHARAT TERMINAL v2 — Bloomberg power. Zero cost. Made in India.
+/// BHARAT TERMINAL v4 — Bloomberg power. Zero cost. Made in India.
 #[derive(Debug, Parser)]
 #[command(
     name = "bt-cli",
     version,
-    about = "Bharat Terminal v2 — render visualizations with real market data."
+    about = "BHARAT TERMINAL v4 — render visualizations with real market data."
 )]
 struct Cli {
     /// Symbol to fetch (e.g., RELIANCE.NS, AAPL, BTC-USD). Default: RELIANCE.NS
@@ -120,11 +120,54 @@ struct Cli {
     /// List all supported companies and exit.
     #[arg(long, default_value_t = false)]
     list_companies: bool,
+
+    /// Subcommand. When omitted, the classic render flow runs unchanged.
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+/// v4.0 subcommands. `render` is the historical default and stays the
+/// no-subcommand path, so existing scripts keep working byte for byte.
+#[derive(Debug, Clone, clap::Subcommand)]
+enum Commands {
+    /// Run a forecaster over fetched closes and print the path to stdout.
+    Forecast {
+        /// Symbol to forecast (e.g., RELIANCE.NS).
+        #[arg(long, default_value = "RELIANCE.NS")]
+        symbol: String,
+        /// Engine: chronos, dlinear, nhits or auto.
+        #[arg(long, default_value = "auto")]
+        engine: String,
+        /// Bars to project.
+        #[arg(long, default_value_t = 20)]
+        horizon: usize,
+    },
+    /// Manage the shared watchlist (same prefs.json the app reads).
+    Watchlist {
+        #[command(subcommand)]
+        action: WatchlistAction,
+    },
+}
+
+#[derive(Debug, Clone, clap::Subcommand)]
+enum WatchlistAction {
+    /// Add a ticker (no-op when already starred or the list is full).
+    Add {
+        /// Ticker, e.g. RELIANCE.NS.
+        symbol: String,
+    },
+    /// Remove a ticker (no-op when absent).
+    Remove {
+        /// Ticker, e.g. RELIANCE.NS.
+        symbol: String,
+    },
+    /// Print starred tickers, one per line.
+    List,
 }
 
 fn banner() {
     println!("================================================================");
-    println!(" {APP_NAME} v2");
+    println!(" {APP_NAME} v4");
     println!(" {TAGLINE}");
     println!(" Made by {AUTHOR}");
     println!("================================================================");
@@ -529,6 +572,117 @@ async fn render_all(
     Ok(rendered)
 }
 
+/// Forecast `horizon` bars for `symbol` and print `engine, value` lines.
+///
+/// Fetches a year of daily bars (enough history for every engine) and runs the
+/// same fallback chain the app uses, so the CLI and the Forecast tab agree.
+async fn run_forecast(
+    symbol: &str,
+    engine: &str,
+    horizon: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use bt_analytics::forecast::{Engine, Forecaster};
+
+    if horizon == 0 {
+        return Err("horizon must be at least 1".into());
+    }
+    let preferred = match engine.to_lowercase().as_str() {
+        "chronos" => Engine::Chronos,
+        "dlinear" => Engine::DLinear,
+        "nhits" => Engine::NHits,
+        "auto" => Engine::Auto,
+        other => return Err(format!("unknown engine {other:?}: use chronos, dlinear, nhits or auto").into()),
+    };
+    let service = DataService::new()?;
+    let series = fetch_series(&service, symbol, RangeArg::Y1).await;
+    let closes = series.closes();
+    let forecaster = Forecaster::with_default_paths();
+    let (values, name) = forecaster
+        .predict_with_preference(preferred, &closes, horizon)
+        .map_err(|e| format!("forecast failed: {e}"))?;
+    println!("engine: {name}");
+    println!("symbol: {symbol}  bars: {}  horizon: {horizon}", closes.len());
+    for (i, v) in values.iter().enumerate() {
+        println!("+{}: {:.2}", i + 1, v);
+    }
+    Ok(())
+}
+
+/// prefs.json path shared with the desktop app (exe-dir `data/`).
+fn app_prefs_path() -> std::path::PathBuf {
+    let base = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    base.join("data").join("prefs.json")
+}
+
+fn read_watchlist() -> Vec<String> {
+    std::fs::read_to_string(app_prefs_path())
+        .ok()
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+        .and_then(|v| v.get("watchlist").cloned())
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default()
+}
+
+fn write_watchlist(list: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let path = app_prefs_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut doc: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    doc["watchlist"] = serde_json::to_value(list)?;
+    std::fs::write(&path, serde_json::to_string_pretty(&doc)?)?;
+    Ok(())
+}
+
+/// Manage the watchlist the desktop app reads from the same file.
+fn run_watchlist(action: WatchlistAction) -> Result<(), Box<dyn std::error::Error>> {
+    const MAX: usize = 50;
+    let mut list = read_watchlist();
+    match action {
+        WatchlistAction::Add { symbol } => {
+            let s = symbol.trim().to_uppercase();
+            if s.is_empty() {
+                return Err("empty symbol".into());
+            }
+            if list.iter().any(|w| w == &s) {
+                println!("{s} is already starred");
+            } else if list.len() >= MAX {
+                return Err(format!("watchlist is full ({MAX} symbols)").into());
+            } else {
+                list.push(s.clone());
+                write_watchlist(&list)?;
+                println!("starred {s} ({} of {MAX})", list.len());
+            }
+        }
+        WatchlistAction::Remove { symbol } => {
+            let s = symbol.trim().to_uppercase();
+            let before = list.len();
+            list.retain(|w| w != &s);
+            if list.len() == before {
+                println!("{s} was not starred");
+            } else {
+                write_watchlist(&list)?;
+                println!("unstarred {s}");
+            }
+        }
+        WatchlistAction::List => {
+            if list.is_empty() {
+                println!("watchlist is empty — star symbols in the app or with `watchlist add`");
+            }
+            for s in &list {
+                println!("{s}");
+            }
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -539,6 +693,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if cli.list_companies {
         list_companies();
         return Ok(());
+    }
+
+    match cli.command {
+        Some(Commands::Forecast {
+            symbol,
+            engine,
+            horizon,
+        }) => return run_forecast(&symbol, &engine, horizon).await,
+        Some(Commands::Watchlist { action }) => return run_watchlist(action),
+        None => {}
     }
 
     std::fs::create_dir_all(&cli.out_dir)?;
@@ -589,7 +753,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         " Total rendered: {} charts in {:.2?}",
         total_rendered, elapsed
     );
-    println!(" {APP_NAME} v2 -- Made by {AUTHOR}");
+    println!(" {APP_NAME} v4 -- Made by {AUTHOR}");
     println!("================================================================");
 
     Ok(())

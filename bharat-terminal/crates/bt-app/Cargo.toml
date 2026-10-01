@@ -36,6 +36,14 @@ tracing = { workspace = true }
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors"] }
 
+# v4.0: fuzzy symbol search in the header dropdown.
+fuzzy-matcher = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# v4.0: native Windows toast notifications for fired alerts. Best-effort:
+# failures are swallowed and the in-app toast is always shown.
+winrt-notification = { workspace = true }
+
 [dev-dependencies]
 # Router-level tests drive the app with `tower::ServiceExt::oneshot`.
 tower = { version = "0.5", features = ["util"] }

@@ -10,11 +10,11 @@ members = [
 ]
 
 [workspace.package]
-version = "3.0.0"
+version = "4.0.0"
 edition = "2021"
 authors = ["Sourish Dey"]
 license = "MIT"
-description = "Bharat Terminal v3 — 130+ visualizations, real market data, Windows installer. Made by Sourish Dey."
+description = "Bharat Terminal v4 — 190+ visualizations, alerts, news, calendar, real market data, Windows installer. Made by Sourish Dey."
 
 [workspace.dependencies]
 thiserror = "1.0"
@@ -46,6 +46,12 @@ ndarray = "0.15"
 # Pure Rust, no BLAS: a 256-point transform is tens of microseconds.
 rustfft = "6.2"
 sysinfo = "0.30"
+# v4.0 additions: RSS parsing (News tab), VADER sentiment (news + alerts),
+# fuzzy symbol search (header dropdown), native Windows toasts (alerts).
+feed-rs = "2"
+vader_sentiment = "0.1"
+fuzzy-matcher = "0.3"
+winrt-notification = "0.5"
 
 [profile.release]
 opt-level = 3
