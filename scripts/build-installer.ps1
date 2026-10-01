@@ -196,7 +196,27 @@ Copy-Item (Join-Path $root "README.md") $zipStage -Force
 Copy-Item $ortDll $zipStage -Force
 Get-ChildItem $nativeDir -Filter "*.dll" | ForEach-Object { Copy-Item $_.FullName $zipStage -Force }
 Copy-Item (Join-Path $project "assets") $zipStage -Recurse -Force
-Copy-Item (Join-Path $project "models") $zipStage -Recurse -Force
+
+# Copy models one file at a time so the optional ~1 GB Qwen weights can be left
+# out. A blanket `Copy-Item models\` would silently pull them in on any machine
+# where scripts/download-qwen.ps1 had been run, turning a 160 MB portable ZIP
+# into a 1.2 GB one. Qwen is opt-in for the end user too, so shipping it here
+# would bloat every download for a model most people will not run.
+$qwenGgufName = "qwen2.5-1.5b-instruct-q4_k_m.gguf"
+$modelsSrc = Join-Path $project "models"
+$zipModels = Join-Path $zipStage "models"
+New-Item -ItemType Directory -Path $zipModels -Force | Out-Null
+$skipped = 0
+Get-ChildItem $modelsSrc -File | ForEach-Object {
+    if ($_.Name -eq $qwenGgufName) {
+        $skipped = 1
+        return
+    }
+    Copy-Item $_.FullName $zipModels -Force
+}
+if ($skipped) {
+    Write-Host "  left the optional $qwenGgufName out of the ZIP (~1 GB); run scripts\download-qwen.ps1 on the target machine to enable it" -ForegroundColor DarkGray
+}
 Copy-Item (Join-Path $project "scripts") $zipStage -Recurse -Force
 Copy-Item $payloadRuntime (Join-Path $zipStage "python_runtime") -Recurse -Force
 
@@ -233,6 +253,11 @@ if (-not (Test-Path $portableZip)) {
 }
 $zipMb = [math]::Round((Get-Item $portableZip).Length / 1MB, 1)
 Write-Host "  portable ZIP: $zipMb MB, $($stagedZipFiles.Count) files (interpreter + numpy + SmolLM2 + ONNX verified)" -ForegroundColor DarkGray
+# A backstop on the size check above: if a future edit reintroduces a blanket
+# models\ copy, this is what catches it before a 1 GB archive is published.
+if ($zipMb -gt 400) {
+    throw "portable ZIP is $zipMb MB, which suggests the optional Qwen weights were staged. Refusing to publish."
+}
 
 Write-Host ""
 Write-Host "========================================" -ForegroundColor Green
@@ -241,5 +266,6 @@ Write-Host "========================================" -ForegroundColor Green
 Write-Host " Installer: $msiOut"
 Write-Host " Portable:  $portableExe"
 Write-Host " Zip:       $portableZip"
+Write-Host " Chat:      SmolLM2-135M ships in the box; Qwen2.5-1.5B is opt-in via scripts\download-qwen.ps1" -ForegroundColor DarkGray
 Write-Host " Made by Sourish Dey" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Green

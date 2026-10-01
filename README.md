@@ -841,7 +841,7 @@ BharatTerminal/
 | Metric | Count |
 |:-------|:------:|
 | Rust source files (bt-viz) | 203 |
-| GUI tabs | 185 |
+| GUI tabs | 189 |
 | 3D / surface views | 20 |
 | CLI visualizations | 25 |
 | Technical indicators | 30+ |
@@ -849,6 +849,7 @@ BharatTerminal/
 | Bollinger Band strategies | 10 |
 | India-specific modules | 30+ |
 | Total crates | 6 |
+| Workspace tests | 930 |
 
 ---
 
@@ -966,30 +967,107 @@ let (values, engine) = f.predict_with_engine(&closes, 20)?;
 println!("{} forecast {} points", engine, values.len());
 ```
 
-### AI Chat (SmolLM2-135M)
+### AI Chat (SmolLM2-135M, optional Qwen2.5-1.5B)
 
-The floating chat window runs **SmolLM2-135M-Instruct** locally via
-[Candle](https://github.com/huggingface/candle), HuggingFace's pure-Rust
-ML framework. No C++ toolchain, no Python, no cloud calls.
+The floating chat window runs a language model **locally** via
+[Candle](https://github.com/huggingface/candle), HuggingFace's pure-Rust ML
+framework. No C++ toolchain, no Python, no cloud calls.
 
-The model is a 135M-parameter instruction-tuned LLM quantized to Q4_K_M
-(~105 MB). Inference is CPU-only over the KV cache, and a 96-token reply
-takes ~13 s on this machine's release build (debug builds are ~10x slower —
-measure release only). The weights load lazily on first chat open, never at
-startup, and inference always runs on a worker thread: the UI never blocks.
+Two models are supported, and the chat window picks whichever is installed:
+
+| Model | Size | Speed | Notes |
+|---|---|---|---|
+| **SmolLM2-135M-Instruct** (default) | ~105 MB | ~10 s / 96 tokens | Ships in the box. Green badge. |
+| **Qwen2.5-1.5B-Instruct** | ~1 GB | ~60–120 s / reply | Opt-in. Better answers, far slower. |
+
+Generation uses the KV cache properly: one prefill forward over the prompt at
+position 0, then single-token forwards with an advancing position. (A common
+mistake is re-feeding the whole growing sequence at position 0 every step, which
+recomputes everything and mis-indexes the cache.) The weights load lazily on
+first chat open, never at startup, and inference always runs on a worker thread:
+the UI never blocks.
 
 Each question is wrapped in an instruct prompt carrying whatever the app
 already measured — symbol, last price, Chronos-Bolt forecast, RSI(14) — so
-the model reasons over real numbers. If the model or tokenizer is missing
-at startup, the chat automatically falls back to intent matching against
-live app data — the same behavior as v4.1. The engine status badge in the
-chat window shows which mode is active: **SmolLM2-135M** (green),
-**Loading…** (amber), or **Intent matching** (grey).
+the model reasons over real numbers. If the model or tokenizer is missing,
+the chat automatically falls back to intent matching against live app data — the
+same behavior as v4.1. The engine status badge in the chat window shows which
+mode is active: the model's name (green), **Loading…** (amber), or **Intent
+matching** (grey).
 
-Setup: `models/SmolLM2-135M-Instruct.Q4_K_M.gguf` ships in the repo;
-fetch the matching `models/tokenizer.json` once with
-`powershell -ExecutionPolicy Bypass -File scripts/download-tokenizer.ps1`
-(a plain curl from HuggingFace, ~2 MB, no Python needed).
+Setup: `models/SmolLM2-135M-Instruct.Q4_K_M.gguf` and `models/tokenizer.json`
+ship in the installers, so chat works immediately. For the larger model, run
+`powershell -ExecutionPolicy Bypass -File scripts/download-qwen.ps1` once (a
+plain curl from HuggingFace, ~1 GB, no Python needed); the badge switches to
+Qwen2.5-1.5B.
+
+**Made by Sourish Dey**
+
+### Advisor (deterministic rule engine)
+
+The **Advisor** tab is a readout, not a predictor. It scores the indicators the
+app has already measured against fixed, named thresholds and reports what they
+say, with the raw score and an evidence table so a reader who disagrees can see
+exactly which input drove the verdict. Given the same data it always returns the
+same answer — you can audit the rules and argue with a threshold, but you cannot
+be shown a different verdict on a different day.
+
+- **Verdict badge** — Strong Buy / Buy / Hold / Reduce / Sell / Strong Sell,
+  with a confidence percentage and the net score.
+- **Evidence** — every input that moved the score, with its reading.
+- **Risk flags** — high volatility, thin volume. These qualify the result
+  without moving it.
+- **Risk plan** — a worked position size from a stated risk budget and a 2× ATR
+  stop, capped at 25% of capital. Deliberately arithmetic rather than Kelly:
+  Kelly's answer to a wrong win-rate estimate is a catastrophic position.
+- **Explain** — sends the verdict to the chat window with the advisor context
+  attached, so the model explains measured numbers instead of guessing.
+
+It never gives buy/sell advice and never forecasts — it explains the measured
+data, and says so on the panel. **Scan** applies the same rules across the whole
+watchlist, ranked by how strongly the inputs agree.
+
+**Made by Sourish Dey**
+
+### Social Sentiment & Earnings (free, no API keys)
+
+Two new Tools tabs pull from free public endpoints:
+
+- **Social** — fetches Reddit and StockTwits concurrently and shows the merged
+  bull/bear split. The classifier is a small deterministic lexicon: "short
+  squeeze" reads as bullish despite containing "short", and negation matches
+  whole words only, since "nothing" must not read as a negation. A source that
+  fails or rate-limits is shown as absent rather than folded into a neutral
+  score — "we could not ask" is not "nobody is talking about this".
+- **Earnings** — upcoming report dates from Yahoo, for the viewed symbol or the
+  whole watchlist. A missing EPS estimate renders as an em-dash, and an
+  unannounced date stays "unscheduled" rather than defaulting to 1970.
+
+**Made by Sourish Dey**
+
+### Signal Detectors (pure analytics, no model)
+
+Four deterministic detectors, each solving a problem where the obvious approach
+is wrong. All are tested against synthetic fixtures and never hit the network.
+
+- **Volume anomalies** — a rolling z-score against the instrument's own trailing
+  mean, rather than a fixed "3× average" that would flag constantly in quiet
+  regimes. The baseline deliberately *excludes* the bar being tested; including
+  it would let a spike inflate its own statistics and hide.
+- **Gap scanner** — every overnight gap is confirmed against the volume that
+  followed it. A gap on no volume is a thin-market artefact, so unconfirmed gaps
+  are labelled as such rather than presented as a repricing.
+- **Correlation regime** — detects the calm→crisis switch, where correlations
+  converge and "diversification" evaporates exactly when it is wanted. A risk
+  number computed under the wrong regime looks precise and is wrong.
+- **Forecast cone** — four nested quantile bands that widen with the horizon,
+  built from geometry that *rejects* inverted quantiles rather than drawing a
+  fan with the 90th percentile below the 10th. The Chronos engine emits three
+  quantiles, so p25/p75 are interpolated and labelled as interpolated.
+
+The **Drawdown & Recovery** chart now reports max depth, recovery rate, mean
+recovery time, and the deepest episode, marking each trough by whether its peak
+ever came back.
 
 **Made by Sourish Dey**
 
