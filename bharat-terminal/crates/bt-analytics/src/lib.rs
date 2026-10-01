@@ -12,21 +12,38 @@
 //! - Risk metrics (VaR, CVaR, Sharpe, Sortino, Max Drawdown)
 //! - Portfolio analytics (Beta, Alpha, Correlation, Efficient Frontier)
 
+pub mod advisor;
+pub mod corr_regime;
 pub mod extended;
 pub mod alerts;
 pub mod backtest;
 pub mod forecast;
+pub mod gap_scanner;
 pub mod indicators;
 pub mod models;
+pub mod multi_scanner;
 pub mod options;
 pub mod ort_runtime;
 pub mod patterns;
 pub mod portfolio;
 pub mod quant_analytics;
+pub mod rebalance;
 pub mod risk;
+pub mod risk_advisor;
 pub mod screener;
 pub mod sentiment;
 pub mod signal;
+pub mod signals;
+pub mod volume_anomaly;
+
+pub use advisor::{Action, AdvisorInput, AdvisorOutput, advise};
+pub use corr_regime::{CorrRegime, RegimeScan};
+pub use gap_scanner::{GapHit, scan as scan_gaps, scan_default as scan_gaps_default};
+pub use multi_scanner::{ScanRow, advisor_input_for, scan as scan_watchlist};
+pub use rebalance::{RebalanceTrade, TargetWeight, rebalance_to_targets};
+pub use risk_advisor::{RiskPlan, plan as risk_plan};
+pub use signals::{CompositeSignal, SignalSource, composite as composite_signal};
+pub use volume_anomaly::{VolumeAnomaly, detect as detect_volume_anomalies};
 
 pub use extended::{
     ad_line, alma, aroon, aroon_osc, coppock, dpo, elder_ray, eom, fib_levels, force_index,

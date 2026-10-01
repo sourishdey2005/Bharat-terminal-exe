@@ -13,6 +13,7 @@ pub mod bhavcopy;
 pub mod binance;
 pub mod cache;
 pub mod coinbase;
+pub mod earnings;
 pub mod fmp;
 pub mod india;
 pub mod moneycontrol;
@@ -21,11 +22,15 @@ pub mod nse;
 pub mod nse_options;
 pub mod provider;
 pub mod sec;
+pub mod social;
 pub mod symbol;
 pub mod us_options;
 pub mod worldbank;
 pub mod yahoo;
 pub mod amfi;
+
+pub use earnings::{EarningsEvent, EarningsProvider, parse_calendar};
+pub use social::{SentimentScore, SocialProvider};
 
 pub use provider::{CompanyProfile, DataProvider, Interval, Quote, SymbolInfo};
 pub use symbol::{COMPANY_LIST, DEFAULT_COMPANY};

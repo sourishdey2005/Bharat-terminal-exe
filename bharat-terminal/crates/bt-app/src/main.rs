@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 mod api;
 mod chat_llm;
+mod chat_qwen;
 
 use crate::chat_llm::{ChatEngineStatus, SmolLM2Engine};
 

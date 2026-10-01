@@ -39,8 +39,8 @@ tower-http = { version = "0.6", features = ["cors"] }
 # v4.0: fuzzy symbol search in the header dropdown.
 fuzzy-matcher = { workspace = true }
 
-# v4.2: on-device SmolLM2-135M chat via Candle (pure Rust, no C++ toolchain).
-# CPU-only; the GGUF (~105 MB) and tokenizer.json live in models/ and load
+# v4.2: on-device SmolLM2-135M + Qwen2.5-1.5B chat via Candle (pure Rust, no C++ toolchain).
+# CPU-only; the GGUFs (~105 MB + ~1 GB) and tokenizer.json live in models/ and load
 # lazily on first chat use, never at startup. hf-hub is deliberately absent:
 # the tokenizer ships via scripts/download-tokenizer.ps1, so nothing downloads
 # at build or run time.
