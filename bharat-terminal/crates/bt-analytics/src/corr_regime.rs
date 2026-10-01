@@ -15,7 +15,7 @@
 //! reference window, which makes the finding a statement about a *change*, not
 //! about an absolute level.
 
-use bt_core::{Candle, Result};
+use bt_core::Result;
 
 /// Bars per rolling correlation window.
 pub const WINDOW: usize = 30;
@@ -313,9 +313,7 @@ mod tests {
         let tail_base: Vec<f64> = (0..n).map(|i| 200.0 + (i as f64).sin()).collect();
         let start = n - WINDOW;
         for s in [&mut a, &mut b, &mut c] {
-            for i in start..n {
-                s[i] = tail_base[i];
-            }
+            s[start..n].copy_from_slice(&tail_base[start..n]);
         }
         let s = scan(&[a, b, c]).unwrap();
         assert_eq!(s.previous, CorrRegime::Calm, "reference window: {s:?}");

@@ -4,8 +4,13 @@
 //! Live SmolLM2 inference checks. `#[ignore]`d: they need the 105MB GGUF +
 //! tokenizer.json in models/ and take seconds per run. Run explicitly:
 //! `cargo test -p bt-app --test chat_llm_live -- --ignored --nocapture`.
+
+// Both engine modules are included, because `ChatModel` in chat_llm refers to
+// `crate::chat_qwen`. Including only one would leave that path unresolved.
 #[path = "../src/chat_llm.rs"]
 mod chat_llm;
+#[path = "../src/chat_qwen.rs"]
+mod chat_qwen;
 
 use chat_llm::{ChatEngineStatus, SmolLM2Engine};
 use std::time::Instant;

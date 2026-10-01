@@ -190,6 +190,9 @@ struct RedditSearch {
 #[derive(Debug, Deserialize)]
 struct TwMessage {
     body: String,
+    /// Retained in the type so a future timeline view can order messages by
+    /// time without another schema change; the classifier does not need it.
+    #[allow(dead_code)]
     created_at: String,
 }
 
@@ -308,7 +311,7 @@ impl SocialProvider {
             // 429 is the common case and deserves its own wording, because
             // "rate limited" and "does not exist" call for different retries.
             if status.as_u16() == 429 {
-                return Err(format!("rate limited (429), try again shortly"));
+                return Err("rate limited (429), try again shortly".to_string());
             }
             return Err(format!("HTTP {status}"));
         }
@@ -383,7 +386,7 @@ mod tests {
         // the counter past i8.
         let text = format!("{} {}", "bull ".repeat(200), "bear ".repeat(200));
         let v = classify(&text);
-        assert!(v >= -1 && v <= 1, "got {v}");
+        assert!((-1..=1).contains(&v), "got {v}");
     }
 
     #[test]

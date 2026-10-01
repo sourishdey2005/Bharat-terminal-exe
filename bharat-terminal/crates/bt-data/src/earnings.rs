@@ -12,7 +12,6 @@
 use bt_core::{BtError, Result};
 use chrono::{DateTime, TimeZone, Utc};
 use reqwest::Client;
-use serde::Deserialize;
 use std::time::Duration as StdDuration;
 use tracing::instrument;
 

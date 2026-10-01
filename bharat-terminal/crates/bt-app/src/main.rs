@@ -15,10 +15,12 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 mod api;
+mod chat_export;
 mod chat_llm;
 mod chat_qwen;
+mod panel_advisor;
 
-use crate::chat_llm::{ChatEngineStatus, SmolLM2Engine};
+use crate::chat_llm::{ChatEngineStatus, ChatModel};
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use eframe::egui;
@@ -1503,6 +1505,14 @@ enum Tab {
     Compare,
     /// v4.1 technical screens over cached symbols (`screens/*.json`).
     Screener,
+    /// v4.2 deterministic rule verdict, evidence table and risk plan.
+    Advisor,
+    /// v4.2 social sentiment from Reddit and StockTwits.
+    Social,
+    /// v4.2 upcoming earnings calendar.
+    Earnings,
+    /// v4.2 watchlist-wide rule sweep, ranked by composite score.
+    Scan,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1790,6 +1800,11 @@ fn tabs_in_category(cat: TabCategory) -> &'static [(Tab, &'static str)] {
             (Tab::Portfolio, "Portfolio"),
             (Tab::Compare, "Compare"),
             (Tab::Screener, "Screener"),
+            // v4.2 additions, appended so the existing row keeps its order.
+            (Tab::Advisor, "Advisor"),
+            (Tab::Social, "Social"),
+            (Tab::Earnings, "Earnings"),
+            (Tab::Scan, "Scan"),
         ],
     }
 }
@@ -1864,14 +1879,24 @@ enum AppMessage {
     OptionsReady(bt_core::OptionChain, OptionsSource),
     OptionsExpiries(Vec<(String, String)>),
     OptionsError(String),
-    /// SmolLM2 finished loading on the worker (Some) or failed (None).
-    ChatLlmLoaded(Option<SmolLM2Engine>),
+    /// SmolLM2 or Qwen finished loading on the worker (None if neither is
+    /// installed, in which case intent matching answers).
+    ChatLlmLoaded(Option<ChatModel>),
     /// One inference finished; the engine travels back with the answer.
     ChatReply {
         question: String,
         answer: String,
-        engine: SmolLM2Engine,
+        engine: ChatModel,
     },
+    /// Social sentiment arrived. Either source may be `None` when it failed,
+    /// so one rate-limited provider cannot blank the other.
+    SocialReady {
+        reddit: Option<bt_data::social::SentimentScore>,
+        stocktwits: Option<bt_data::social::SentimentScore>,
+    },
+    /// Earnings arrived. `Err` is kept as a string rather than dropped, so the
+    /// panel can say why it is empty instead of implying there is nothing due.
+    EarningsReady(std::result::Result<Vec<bt_data::earnings::EarningsEvent>, String>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2370,6 +2395,16 @@ struct BharatApp {
     /// v4.1 Screener tab: last filter text and matching tickers.
     screen_filter: String,
     screen_results: Vec<String>,
+    /// v4.2 Advisor/Social/Earnings/Scan panel state.
+    social_reddit: Option<bt_data::social::SentimentScore>,
+    social_twits: Option<bt_data::social::SentimentScore>,
+    social_loading: bool,
+    /// Symbol the in-flight social fetch was for, so a late reply is not shown
+    /// against a symbol the user has since navigated away from.
+    social_symbol: String,
+    earnings: Vec<bt_data::earnings::EarningsEvent>,
+    earnings_error: Option<String>,
+    earnings_loading: bool,
     screen_error: Option<String>,
     screen_ran_at: Option<Instant>,
     /// v4.1 AI chat: floating window, message history, input box.
@@ -2378,12 +2413,14 @@ struct BharatApp {
     chat_input: String,
     /// SmolLM2 engine. `None` until the first chat open triggers a background
     /// load; the 100MB+ weights must never block startup or a frame.
-    chat_llm: Option<SmolLM2Engine>,
+    chat_llm: Option<ChatModel>,
     /// Badge state for the chat window.
     chat_llm_status: ChatEngineStatus,
     /// An inference run is on the worker; extra sends fall back to intents
     /// rather than queueing behind a multi-second generation.
     chat_llm_in_flight: bool,
+    /// Result of the last chat-export attempt, shown in the chat window.
+    chat_export_notice: Option<String>,
     /// v4.1 voice alerts opt-in (Windows SAPI, off by default).
     voice_alerts: bool,
 }
@@ -2852,12 +2889,20 @@ impl BharatApp {
             screen_results: Vec::new(),
             screen_error: None,
             screen_ran_at: None,
+            social_reddit: None,
+            social_twits: None,
+            social_loading: false,
+            social_symbol: String::new(),
+            earnings: Vec::new(),
+            earnings_error: None,
+            earnings_loading: false,
             show_chat: false,
             chat_messages: VecDeque::new(),
             chat_input: String::new(),
             chat_llm: None,
             chat_llm_status: ChatEngineStatus::Unloaded,
             chat_llm_in_flight: false,
+            chat_export_notice: None,
             voice_alerts: prefs.voice_alerts,
         };
         app.next_alert_id = app.alerts.iter().map(|r| r.id).max().unwrap_or(0) + 1;
@@ -3105,6 +3150,28 @@ impl BharatApp {
                     self.chat_messages.push_back((question, answer));
                     while self.chat_messages.len() > 50 {
                         self.chat_messages.pop_front();
+                    }
+                }
+                AppMessage::SocialReady {
+                    reddit,
+                    stocktwits,
+                } => {
+                    self.social_loading = false;
+                    self.social_reddit = reddit;
+                    self.social_twits = stocktwits;
+                }
+                AppMessage::EarningsReady(result) => {
+                    self.earnings_loading = false;
+                    match result {
+                        Ok(events) => {
+                            self.earnings = events;
+                            self.earnings_error = None;
+                        }
+                        Err(e) => {
+                            // Keep whatever was already on screen: a failed
+                            // refresh must not blank a working calendar.
+                            self.earnings_error = Some(e);
+                        }
                     }
                 }
             }
@@ -4046,6 +4113,10 @@ impl BharatApp {
             Tab::Portfolio => self.draw_portfolio(ui),
             Tab::Compare => self.draw_compare(ui),
             Tab::Screener => self.draw_screener(ui),
+            Tab::Advisor => self.draw_advisor(ui),
+            Tab::Social => self.draw_social(ui),
+            Tab::Earnings => self.draw_earnings(ui),
+            Tab::Scan => self.draw_scan(ui),
         }
     }
 
@@ -10024,6 +10095,387 @@ impl BharatApp {
         });
     }
 
+    /// v4.2 Advisor: the deterministic verdict for the symbol in the header.
+    ///
+    /// All the maths lives in `panel_advisor`; this only supplies the state the
+    /// panel needs and forwards the "Explain" press to the chat window.
+    fn draw_advisor(&mut self, ui: &mut egui::Ui) {
+        let symbol = self.selected_company.clone();
+        let forecast_change = self.forecast_change_percent();
+        let view = panel_advisor::AdvisorView {
+            symbol: &symbol,
+            candles: &self.data.candles.candles,
+            forecast_change_pct: forecast_change,
+            watchsignal: None,
+            capital: self.portfolio_capital(),
+        };
+
+        // The Explain button opens the chat window pre-loaded with a question
+        // about this verdict, so the model's context is the advisor output
+        // rather than whatever the user happened to type.
+        let explain = ui
+            .horizontal(|ui| {
+                ui.label(RichText::new("Explain this verdict in chat").small());
+                ui.button("Explain")
+            })
+            .inner
+            .clicked();
+
+        panel_advisor::draw(ui, &view);
+
+        if explain {
+            let question = format!(
+                "Explain the advisor verdict for {symbol}: what are the signals and what do they say?"
+            );
+            self.show_chat = true;
+            self.chat_input = question.clone();
+            self.answer_chat(question);
+        }
+    }
+
+    /// Forecast move over the horizon as a percentage, if one was computed.
+    ///
+    /// Returns `None` rather than `Some(0.0)` when there is no usable forecast,
+    /// so the advisor treats "not forecast" as an absent input instead of a
+    /// perfectly neutral one.
+    fn forecast_change_percent(&self) -> Option<f64> {
+        let last = self.forecast_values.last().copied()?;
+        let anchor = self.data.candles.candles.last().map(|c| c.close)?;
+        if !last.is_finite() || !anchor.is_finite() || anchor.abs() < 1e-12 {
+            return None;
+        }
+        Some((last - anchor) / anchor * 100.0)
+    }
+
+    /// Total portfolio value, falling back to the example capital when the
+    /// portfolio is empty so the risk plan has a basis to size against.
+    ///
+    /// Prices come from the same cache lookup the Portfolio tab uses, so the two
+    /// never disagree about what a holding is worth.
+    fn portfolio_capital(&self) -> f64 {
+        use bt_analytics::portfolio as pf;
+        let mut prices: HashMap<String, f64> = HashMap::new();
+        for h in &self.portfolio {
+            if let Some((closes, _)) = cached_ohlcv_any(&h.symbol) {
+                if let Some(&last) = closes.last() {
+                    prices.insert(h.symbol.clone(), last);
+                }
+            }
+        }
+        let v = pf::total_value(&self.portfolio, &prices);
+        if v.is_finite() && v > 1.0 {
+            v
+        } else {
+            panel_advisor::EXAMPLE_CAPITAL
+        }
+    }
+
+    /// v4.2 Social: Reddit and StockTwits sentiment for the viewed symbol.
+    fn draw_social(&mut self, ui: &mut egui::Ui) {
+        use bt_data::social::{SentimentScore, SocialProvider};
+        ui.label(RichText::new("Social sentiment - Reddit and StockTwits").strong());
+        ui.label(
+            RichText::new("Free public endpoints, no API key. Both rate-limit; an error is shown as-is.")
+                .small()
+                .color(Color32::GRAY),
+        );
+        ui.separator();
+
+        let symbol = self.selected_company.clone();
+        if ui.button("Refresh sentiment").clicked() {
+            self.social_loading = true;
+            self.social_symbol = symbol.clone();
+            let tx = self.tx.clone();
+            self.runtime.spawn(async move {
+                let provider = SocialProvider::new();
+                // Report both sources separately as well as merged, so a
+                // single rate-limited source is visibly that and not "no
+                // sentiment exists".
+                let (reddit, twits) =
+                    tokio::join!(provider.fetch_reddit(&symbol), provider.fetch_stocktwits(&symbol));
+                let _ = tx.send(AppMessage::SocialReady {
+                    reddit: reddit.ok(),
+                    stocktwits: twits.ok(),
+                });
+            });
+        }
+
+        if self.social_loading {
+            ui.spinner();
+            ui.label("Fetching…");
+            return;
+        }
+
+        let net = self.social_net();
+        match net {
+            None => {
+                ui.label(
+                    RichText::new("No sentiment fetched yet, or every source failed.")
+                        .color(Color32::GRAY),
+                );
+            }
+            Some(s) => {
+                ui.horizontal(|ui| {
+                    let (r, g, b) = if s > 0.1 {
+                        (0x00, 0xE6, 0x76)
+                    } else if s < -0.1 {
+                        (0xFF, 0x3D, 0x71)
+                    } else {
+                        (0x88, 0x92, 0xA6)
+                    };
+                    ui.label(
+                        RichText::new(format!("net {:+.2}", s))
+                            .color(Color32::from_rgb(r, g, b))
+                            .size(18.0),
+                    );
+                    ui.label(
+                        RichText::new(format!(
+                            "{} bullish / {} bearish / {} unclassified",
+                            self.social_bullish(),
+                            self.social_bearish(),
+                            self.social_neutral()
+                        ))
+                        .color(Color32::GRAY),
+                    );
+                });
+                self.social_bar(ui);
+            }
+        }
+    }
+
+    /// Merged net sentiment across the sources that answered.
+    fn social_net(&self) -> Option<f64> {
+        let parts: Vec<bt_data::social::SentimentScore> =
+            [self.social_reddit, self.social_twits]
+                .into_iter()
+                .flatten()
+                .collect();
+        if parts.is_empty() {
+            return None;
+        }
+        bt_data::social::SentimentScore::merge(&parts).net()
+    }
+
+    fn social_bullish(&self) -> u32 {
+        self.social_reddit
+            .map(|s| s.bullish)
+            .unwrap_or(0)
+            + self.social_twits.map(|s| s.bullish).unwrap_or(0)
+    }
+
+    fn social_bearish(&self) -> u32 {
+        self.social_reddit
+            .map(|s| s.bearish)
+            .unwrap_or(0)
+            + self.social_twits.map(|s| s.bearish).unwrap_or(0)
+    }
+
+    fn social_neutral(&self) -> u32 {
+        self.social_reddit
+            .map(|s| s.neutral)
+            .unwrap_or(0)
+            + self.social_twits.map(|s| s.neutral).unwrap_or(0)
+    }
+
+    /// A single bar showing the bull/bear split.
+    fn social_bar(&self, ui: &mut egui::Ui) {
+        let total = (self.social_bullish() + self.social_bearish()) as f32;
+        if total <= 0.0 {
+            return;
+        }
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 20.0), egui::Sense::hover());
+        let painter = ui.painter();
+        let bull = self.social_bullish() as f32 / total;
+        painter.rect_filled(
+            egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * bull, rect.height())),
+            egui::Rounding::same(3.0),
+            PROFIT,
+        );
+        painter.rect_filled(
+            egui::Rect::from_min_size(
+                egui::pos2(rect.min.x + rect.width() * bull, rect.min.y),
+                egui::vec2(rect.width() * (1.0 - bull), rect.height()),
+            ),
+            egui::Rounding::same(3.0),
+            LOSS,
+        );
+    }
+
+    /// v4.2 Earnings: upcoming reports for the viewed symbol and watchlist.
+    fn draw_earnings(&mut self, ui: &mut egui::Ui) {
+        use bt_data::earnings::EarningsProvider;
+        ui.label(RichText::new("Earnings calendar").strong());
+        ui.label(
+            RichText::new("Dates only, from Yahoo. No result is ever shown for a future event.")
+                .small()
+                .color(Color32::GRAY),
+        );
+        ui.separator();
+
+        let symbol = self.selected_company.clone();
+        ui.horizontal(|ui| {
+            if ui.button("Fetch for viewed symbol").clicked() {
+                self.earnings_loading = true;
+                let tx = self.tx.clone();
+                self.runtime.spawn(async move {
+                    let p = EarningsProvider::new();
+                    let _ = tx.send(AppMessage::EarningsReady(
+                        p.fetch(&symbol).await.map_err(|e| e.to_string()),
+                    ));
+                });
+            }
+            if ui.button("Fetch for watchlist").clicked() {
+                self.earnings_loading = true;
+                let syms: Vec<String> = self.watchlist.clone();
+                let tx = self.tx.clone();
+                self.runtime.spawn(async move {
+                    let p = EarningsProvider::new();
+                    let _ = tx.send(AppMessage::EarningsReady(
+                        p.fetch_many(&syms).await.map_err(|e| e.to_string()),
+                    ));
+                });
+            }
+        });
+
+        if self.earnings_loading {
+            ui.spinner();
+            ui.label("Fetching…");
+            return;
+        }
+
+        if self.earnings_error.is_some() {
+            ui.label(
+                RichText::new(self.earnings_error.clone().unwrap_or_default()).color(LOSS),
+            );
+        }
+
+        if self.earnings.is_empty() {
+            ui.label(
+                RichText::new("No upcoming earnings fetched.").color(Color32::GRAY),
+            );
+            return;
+        }
+
+        let now = chrono::Utc::now();
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            egui::Grid::new("earnings_grid").num_columns(4).striped(true).show(ui, |ui| {
+                ui.label(RichText::new("Symbol").strong());
+                ui.label(RichText::new("Date").strong());
+                ui.label(RichText::new("When").strong());
+                ui.label(RichText::new("Est. EPS").strong());
+                ui.end_row();
+                for e in &self.earnings {
+                    ui.label(&e.symbol);
+                    match e.date {
+                        Some(d) => {
+                            ui.label(d.format("%Y-%m-%d").to_string());
+                        }
+                        None => {
+                            ui.label(RichText::new("unscheduled").color(Color32::GRAY));
+                        }
+                    };
+                    let rel = e.relative_label(now);
+                    ui.label(colored_by_aheadness(&rel));
+                    // A missing estimate must not render as 0.00, which would
+                    // read as an expectation of no earnings.
+                    match e.estimate_eps {
+                        Some(v) => {
+                            ui.label(format!("{v:.2}"));
+                        }
+                        None => {
+                            ui.label(RichText::new("—").color(Color32::GRAY));
+                        }
+                    };
+                    ui.end_row();
+                }
+            });
+        });
+    }
+
+    /// v4.2 Scan: the advisor rules run across the whole watchlist.
+    fn draw_scan(&mut self, ui: &mut egui::Ui) {
+        use bt_analytics::multi_scanner::{actionable_fraction, bullish, scan};
+        ui.label(RichText::new("Watchlist scan - the Advisor rules, ranked").strong());
+        ui.label(
+            RichText::new("Only the viewed symbol's candles are scored; symbols without cached data are left out, not ranked last.")
+                .small()
+                .color(Color32::GRAY),
+        );
+        ui.separator();
+
+        let mut basket: HashMap<String, Vec<Candle>> = HashMap::new();
+        let sym = self.selected_company.clone();
+        basket.insert(sym.clone(), self.data.candles.candles.clone());
+        for s in self.watchlist.clone() {
+            if s == sym {
+                continue;
+            }
+            // Rebuild candles from the cached closes rather than refetching: a
+            // watchlist sweep must never turn into N network requests, and the
+            // multi_scanner only needs close and volume.
+            if let Some((closes, volumes)) = cached_ohlcv_any(&s) {
+                let n = closes.len().min(volumes.len());
+                let candles: Vec<Candle> = (0..n)
+                    .map(|i| Candle {
+                        t: i as f64,
+                        open: closes[i],
+                        high: closes[i],
+                        low: closes[i],
+                        close: closes[i],
+                        volume: volumes[i],
+                    })
+                    .collect();
+                if !candles.is_empty() {
+                    basket.insert(s, candles);
+                }
+            }
+        }
+
+        let rows = scan(&basket);
+        if rows.is_empty() {
+            ui.label(
+                RichText::new("Not enough cached history to score anything.")
+                    .color(Color32::GRAY),
+            );
+            return;
+        }
+
+        if let Some(frac) = actionable_fraction(&rows) {
+            ui.label(format!(
+                "{} of {} resolved to a direction ({:.0}%)",
+                rows.len() - bullish(&rows).len(),
+                rows.len(),
+                frac * 100.0
+            ));
+        }
+        ui.separator();
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            egui::Grid::new("scan_grid").num_columns(4).striped(true).show(ui, |ui| {
+                ui.label(RichText::new("Symbol").strong());
+                ui.label(RichText::new("Read").strong());
+                ui.label(RichText::new("Score").strong());
+                ui.label(RichText::new("Leading signal").strong());
+                ui.end_row();
+                for r in &rows {
+                    let (cr, cg, cb) = r.action.color();
+                    ui.label(&r.symbol);
+                    ui.label(RichText::new(r.action.label()).color(Color32::from_rgb(cr, cg, cb)));
+                    ui.label(format!("{:+}", r.score));
+                    ui.label(RichText::new(&r.headline).small());
+                    ui.end_row();
+                }
+            });
+        });
+
+        ui.separator();
+        ui.label(
+            RichText::new("Made by Sourish Dey")
+                .size(10.0)
+                .color(AMBER),
+        );
+    }
+
     /// Run the current screener filter over cached symbols.
     fn run_screen(&mut self) {
         use bt_analytics::screener as scr;
@@ -13296,12 +13748,20 @@ impl BharatApp {
         }
         // Lazy load on first open: the weights must never block startup or a
         // frame, so loading happens once on a worker thread.
+        //
+        // Qwen2.5-1.5B is tried first and is roughly an order of magnitude
+        // slower per token than the 135M model, so it is only preferred when it
+        // is actually installed; otherwise the smaller model answers.
         if self.chat_llm_status == ChatEngineStatus::Unloaded {
             self.chat_llm_status = ChatEngineStatus::Loading;
             let tx = self.tx.clone();
             self.runtime.spawn(async move {
+                if let Some(engine) = crate::chat_qwen::try_load_default() {
+                    let _ = tx.send(AppMessage::ChatLlmLoaded(Some(ChatModel::Qwen(engine))));
+                    return;
+                }
                 let engine = crate::chat_llm::try_load_default();
-                let _ = tx.send(AppMessage::ChatLlmLoaded(engine));
+                let _ = tx.send(AppMessage::ChatLlmLoaded(engine.map(ChatModel::SmolLM2)));
             });
         }
         let mut send: Option<String> = None;
@@ -13312,7 +13772,15 @@ impl BharatApp {
             .anchor(egui::Align2::RIGHT_TOP, [-16.0_f32, 60.0_f32])
             .show(ctx, |ui| {
                 let (badge, color) = match self.chat_llm_status {
-                    ChatEngineStatus::Ready => ("SmolLM2-135M", Color32::from_rgb(0, 230, 118)),
+                    // The badge names whichever engine actually loaded, so it
+                    // can never claim Qwen while SmolLM2 is answering.
+                    ChatEngineStatus::Ready => (
+                        self.chat_llm
+                            .as_ref()
+                            .map(|e| e.badge())
+                            .unwrap_or("Loading…"),
+                        Color32::from_rgb(0, 230, 118),
+                    ),
                     ChatEngineStatus::Loading => ("Loading…", Color32::from_rgb(255, 176, 0)),
                     ChatEngineStatus::Unavailable => {
                         ("Intent matching", Color32::from_rgb(136, 146, 166))
@@ -13364,11 +13832,57 @@ impl BharatApp {
                         }
                     }
                 });
+                ui.horizontal(|ui| {
+                    // Export writes beside the executable, matching every other
+                    // file this app persists.
+                    for format in [
+                        chat_export::ExportFormat::Markdown,
+                        chat_export::ExportFormat::Json,
+                    ] {
+                        let pressed = ui
+                            .small_button(format.label())
+                            .on_hover_text("Save the transcript next to the executable")
+                            .clicked();
+                        if pressed {
+                            self.chat_export_notice =
+                                self.write_chat_export(format).err();
+                        }
+                    }
+                    if let Some(note) = &self.chat_export_notice {
+                        ui.label(RichText::new(note).small().color(Color32::GRAY));
+                    }
+                });
             });
         if let Some(q) = send {
             self.answer_chat(q);
             self.chat_input.clear();
         }
+    }
+
+    /// Write the chat transcript beside the executable.
+    ///
+    /// Returns the path on success so the UI can confirm where it landed, and a
+    /// human-readable error on failure — writing into a read-only install
+    /// directory is common and must not be a silent no-op.
+    fn write_chat_export(
+        &self,
+        format: chat_export::ExportFormat,
+    ) -> Result<String, String> {
+        if self.chat_messages.is_empty() {
+            return Err("Nothing to export yet".into());
+        }
+        let dir = bt_data::default_cache_dir();
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("Could not create {}: {e}", dir.display()))?;
+        let name = chat_export::suggested_filename(&self.selected_company, format);
+        let path = dir.join(&name);
+        // VecDeque's internals are two contiguous slices; the exporter takes one
+        // flat slice, so the parts are joined in order.
+        let (head, tail) = self.chat_messages.as_slices();
+        let turns: Vec<&chat_export::ChatTurn> = head.iter().chain(tail.iter()).collect();
+        let text = chat_export::export(&self.selected_company, &turns, format);
+        std::fs::write(&path, text).map_err(|e| format!("Could not write {name}: {e}"))?;
+        Ok(format!("Saved {name}"))
     }
 
     /// Route one question: SmolLM2 on a worker when ready, intents otherwise.
@@ -13405,7 +13919,7 @@ impl BharatApp {
             .into_iter()
             .rev()
             .find(|v| v.is_finite());
-        let prompt = SmolLM2Engine::build_contextual_prompt(
+        let prompt = engine.build_contextual_prompt(
             &q,
             &symbol,
             last_price,
@@ -14239,11 +14753,33 @@ mod v4_tools_tests {
             .flat_map(|c| tabs_in_category(*c))
             .map(|(t, _)| *t)
             .collect();
-        for tab in [Tab::Alerts, Tab::News, Tab::Calendar, Tab::Options, Tab::Portfolio, Tab::Compare, Tab::Screener] {
+        for tab in [
+            Tab::Alerts,
+            Tab::News,
+            Tab::Calendar,
+            Tab::Options,
+            Tab::Portfolio,
+            Tab::Compare,
+            Tab::Screener,
+            Tab::Advisor,
+            Tab::Social,
+            Tab::Earnings,
+            Tab::Scan,
+        ] {
             assert!(listed.contains(&tab), "{tab:?} not listed in any category");
         }
         let tools = tabs_in_category(TabCategory::Tools);
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 11);
+        // The v4.2 tabs must sit *after* the v4.1 ones, so the existing row keeps
+        // its order rather than being reshuffled by the addition.
+        let names: Vec<&str> = tools.iter().map(|(_, n)| *n).collect();
+        let pos = |needle: &str| names.iter().position(|n| *n == needle).unwrap_or_else(|| {
+            panic!("{needle} missing from {names:?}");
+        });
+        assert!(pos("Screener") < pos("Advisor"));
+        assert!(pos("Advisor") < pos("Social"));
+        assert!(pos("Social") < pos("Earnings"));
+        assert!(pos("Earnings") < pos("Scan"));
     }
 
     #[test]
@@ -14330,6 +14866,27 @@ fn cached_ohlcv_any(symbol: &str) -> Option<(Vec<f64>, Vec<f64>)> {
         }
     }
     None
+}
+
+/// Colour a relative-date label by whether the event is still ahead.
+///
+/// Near events are amber so they stand out in a long grid; anything already past
+/// is dimmed, because a stale calendar entry is history, not news.
+fn colored_by_aheadness(label: &str) -> RichText {
+    if label == "unscheduled" {
+        return RichText::new(label).color(Color32::GRAY);
+    }
+    if label == "today" {
+        return RichText::new(label).color(AMBER);
+    }
+    if let Some(rest) = label.strip_prefix("in ") {
+        let days: u32 = rest.trim_end_matches('d').parse().unwrap_or(u32::MAX);
+        if days <= 7 {
+            return RichText::new(label).color(AMBER);
+        }
+        return RichText::new(label);
+    }
+    RichText::new(label).color(Color32::GRAY)
 }
 
 /// Screens directory beside the executable (`screens/<name>.json`).

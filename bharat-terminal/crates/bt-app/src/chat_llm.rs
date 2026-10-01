@@ -263,6 +263,76 @@ pub fn try_load_default() -> Option<SmolLM2Engine> {
     }
 }
 
+/// Either local model, behind one interface.
+///
+/// The chat window holds exactly one of these. Making the choice a single enum
+/// rather than two parallel `Option`s is what keeps the badge honest: there is
+/// only ever one engine field, so the label cannot drift from the model that is
+/// actually answering.
+pub enum ChatModel {
+    /// SmolLM2-135M — fast, small, the default when Qwen is not installed.
+    SmolLM2(SmolLM2Engine),
+    /// Qwen2.5-1.5B — better answers, roughly an order of magnitude slower.
+    Qwen(crate::chat_qwen::QwenEngine),
+}
+
+impl ChatModel {
+    /// Name shown in the chat badge.
+    pub fn badge(&self) -> &'static str {
+        match self {
+            ChatModel::SmolLM2(_) => "SmolLM2-135M",
+            ChatModel::Qwen(_) => "Qwen2.5-1.5B",
+        }
+    }
+
+    /// Whether the weights are resident.
+    pub fn is_loaded(&self) -> bool {
+        match self {
+            ChatModel::SmolLM2(e) => e.is_loaded(),
+            ChatModel::Qwen(e) => e.is_loaded(),
+        }
+    }
+
+    /// Generate a reply. Both engines share the same KV-cache discipline and
+    /// the same `max_tokens == 0` meaning, so this needs no per-model special
+    /// casing at the call site.
+    pub fn generate(&mut self, prompt: &str, max_tokens: usize) -> Result<String, String> {
+        match self {
+            ChatModel::SmolLM2(e) => e.generate(prompt, max_tokens),
+            ChatModel::Qwen(e) => e.generate(prompt, max_tokens),
+        }
+    }
+
+    /// Build a context-carrying prompt in whichever dialect this model expects.
+    ///
+    /// The two differ: SmolLM2 uses bare `system`/`user`/`assistant` roles while
+    /// Qwen2.5 expects real ChatML `<|im_start|>` markers, and Qwen will
+    /// continue the user's turn rather than answering if they are missing.
+    pub fn build_contextual_prompt(
+        &self,
+        user_question: &str,
+        symbol: &str,
+        last_price: f64,
+        forecast: Option<&[f64]>,
+        rsi: Option<f64>,
+    ) -> String {
+        match self {
+            ChatModel::SmolLM2(_) => SmolLM2Engine::build_contextual_prompt(
+                user_question, symbol, last_price, forecast, rsi,
+            ),
+            ChatModel::Qwen(_) => crate::chat_qwen::QwenEngine::build_contextual_prompt(
+                user_question, symbol, last_price, forecast, rsi,
+            ),
+        }
+    }
+}
+
+impl std::fmt::Debug for ChatModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ChatModel").field(&self.badge()).finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

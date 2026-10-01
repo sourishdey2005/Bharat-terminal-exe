@@ -79,7 +79,7 @@ pub fn advisor_input_for(symbol: &str, candles: &[Candle]) -> AdvisorInput {
 
     let atr_pct = last_finite(&crate::indicators::atr(&series, 14))
         .filter(|a| *a > 0.0)
-        .filter(|a| last_price.abs() > 1e-12)
+        .filter(|_| last_price.abs() > 1e-12)
         .map(|a| a / last_price * 100.0);
 
     let volume_ratio = if candles.len() < 21 {
