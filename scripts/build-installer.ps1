@@ -220,9 +220,16 @@ if (-not (& $zipHas "onnxruntime.dll")) {
 
 $portableZip = Join-Path $releasesDir "BharatTerminal-v4.2.0-portable.zip"
 if (Test-Path $portableZip) { Remove-Item $portableZip -Force }
-Compress-Archive -Path (Join-Path $zipStage "*") -DestinationPath $portableZip -CompressionLevel Optimal
+# ZipFile.CreateFromDirectory, not Compress-Archive: Compress-Archive fails with
+# "The requested operation cannot be performed on a file with a user-mapped
+# section open" once the staged tree contains a large file an indexer or AV has
+# mapped (the 105 MB GGUF reliably trips this), and it aborts the whole build.
+# CreateFromDirectory writes the same archive without that limitation.
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+[System.IO.Compression.ZipFile]::CreateFromDirectory(
+    $zipStage, $portableZip, [System.IO.Compression.CompressionLevel]::Optimal, $false)
 if (-not (Test-Path $portableZip)) {
-    throw "Compress-Archive reported success but $portableZip does not exist"
+    throw "ZipFile.CreateFromDirectory reported success but $portableZip does not exist"
 }
 $zipMb = [math]::Round((Get-Item $portableZip).Length / 1MB, 1)
 Write-Host "  portable ZIP: $zipMb MB, $($stagedZipFiles.Count) files (interpreter + numpy + SmolLM2 + ONNX verified)" -ForegroundColor DarkGray

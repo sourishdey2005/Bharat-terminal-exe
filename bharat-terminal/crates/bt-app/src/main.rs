@@ -3342,9 +3342,6 @@ impl BharatApp {
                         ui.label(RichText::new(msg).color(PROFIT).small());
                     }
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new(format!("Made by {AUTHOR}")).color(AMBER));
-                });
             });
         });
     }
