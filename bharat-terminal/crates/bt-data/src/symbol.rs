@@ -3,8 +3,11 @@
 
 use bt_core::{APP_NAME, AUTHOR, TAGLINE};
 
-/// Company list with 300 entries: (display_name, ticker, exchange)
-/// Covers NSE India, BSE India, NYSE, NASDAQ, Crypto, Indices, and Commodities.
+/// Company list with 500+ entries: (display_name, ticker, exchange)
+/// Covers NSE India, BSE India, NYSE, NASDAQ, US ETFs, Crypto, Indian/US/
+/// European/Asia-Pacific indices, European and Asia-Pacific stocks, Commodities
+/// and Forex. Entries are append-only: existing rows are never reordered, and
+/// new coverage goes in versioned sections at the end.
 pub const COMPANY_LIST: &[(&str, &str, &str)] = &[
     // Indian — NSE (Nifty 50 constituents + more)
     ("Reliance Industries", "RELIANCE.NS", "NSE"),
@@ -305,6 +308,231 @@ pub const COMPANY_LIST: &[(&str, &str, &str)] = &[
     ("Wheat", "ZW=F", "Commodity"),
     ("Coffee", "KC=F", "Commodity"),
     ("Sugar", "SB=F", "Commodity"),
+    // v4.1 — Crypto additions (Coinbase + Binance coverage)
+    ("Binance Coin", "BNB-USD", "Crypto"),
+    ("Bitcoin Cash", "BCH-USD", "Crypto"),
+    ("NEAR Protocol", "NEAR-USD", "Crypto"),
+    ("Aptos", "APT-USD", "Crypto"),
+    // v4.1 — Nifty Next 50 top names missing above
+    ("Bajaj Holdings", "BAJAJHLDNG.NS", "NSE"),
+    ("ICICI Lombard", "ICICIGI.NS", "NSE"),
+    ("IndiGo", "INDIGO.NS", "NSE"),
+    ("Jindal Steel", "JINDALSTEL.NS", "NSE"),
+    ("Life Insurance Corp", "LICI.NS", "NSE"),
+    ("LTIMindtree", "LTIM.NS", "NSE"),
+    // v4.1 — Nifty Midcap 150 top names missing above
+    ("Aditya Birla Capital", "ABCAPITAL.NS", "NSE"),
+    ("ACC", "ACC.NS", "NSE"),
+    ("Bata India", "BATAINDIA.NS", "NSE"),
+    ("Container Corp", "CONCOR.NS", "NSE"),
+    ("Escorts Kubota", "ESCORTS.NS", "NSE"),
+    // v4.1 — Nifty Smallcap 250 top names missing above
+    ("Aarti Industries", "AARTIIND.NS", "NSE"),
+    ("Atul", "ATUL.NS", "NSE"),
+    ("Balrampur Chini", "BALRAMCHIN.NS", "NSE"),
+    ("Blue Dart Express", "BLUEDART.NS", "NSE"),
+    ("Castrol India", "CASTROLIND.NS", "NSE"),
+    ("CEAT", "CEATLTD.NS", "NSE"),
+    ("Cyient", "CYIENT.NS", "NSE"),
+    ("Deepak Nitrite", "DEEPAKNTR.NS", "NSE"),
+    ("Finolex Industries", "FINPIPE.NS", "NSE"),
+    // v4.1 — Additional sector coverage
+    ("AU Small Finance Bank", "AUBANK.NS", "NSE"),
+    ("Yes Bank", "YESBANK.NS", "NSE"),
+    ("KPIT Technologies", "KPITTECH.NS", "NSE"),
+    ("TVS Motor", "TVSMOTOR.NS", "NSE"),
+    ("Samvardhana Motherson", "MOTHERSON.NS", "NSE"),
+    ("MRF", "MRF.NS", "NSE"),
+    ("Vedanta", "VEDL.NS", "NSE"),
+    ("SAIL", "SAIL.NS", "NSE"),
+    ("NMDC", "NMDC.NS", "NSE"),
+    ("NALCO", "NATIONALUM.NS", "NSE"),
+    ("Oil India", "OIL.NS", "NSE"),
+    ("Marico", "MARICO.NS", "NSE"),
+    ("Colgate-Palmolive India", "COLPAL.NS", "NSE"),
+    ("Emami", "EMAMILTD.NS", "NSE"),
+    ("Radico Khaitan", "RADICO.NS", "NSE"),
+    // v4.1 — BSE twins of the Nifty 50 (same companies, .BO suffix)
+    ("Reliance Industries (BSE)", "RELIANCE.BO", "BSE"),
+    ("TCS (BSE)", "TCS.BO", "BSE"),
+    ("HDFC Bank (BSE)", "HDFCBANK.BO", "BSE"),
+    ("ICICI Bank (BSE)", "ICICIBANK.BO", "BSE"),
+    ("Infosys (BSE)", "INFY.BO", "BSE"),
+    ("Hindustan Unilever (BSE)", "HINDUNILVR.BO", "BSE"),
+    ("ITC (BSE)", "ITC.BO", "BSE"),
+    ("State Bank of India (BSE)", "SBIN.BO", "BSE"),
+    ("Bharti Airtel (BSE)", "BHARTIARTL.BO", "BSE"),
+    ("Bajaj Finance (BSE)", "BAJFINANCE.BO", "BSE"),
+    ("Kotak Mahindra Bank (BSE)", "KOTAKBANK.BO", "BSE"),
+    ("Larsen & Toubro (BSE)", "LT.BO", "BSE"),
+    ("HCL Technologies (BSE)", "HCLTECH.BO", "BSE"),
+    ("Asian Paints (BSE)", "ASIANPAINT.BO", "BSE"),
+    ("Axis Bank (BSE)", "AXISBANK.BO", "BSE"),
+    ("Maruti Suzuki (BSE)", "MARUTI.BO", "BSE"),
+    ("Sun Pharma (BSE)", "SUNPHARMA.BO", "BSE"),
+    ("Titan Company (BSE)", "TITAN.BO", "BSE"),
+    ("UltraTech Cement (BSE)", "ULTRACEMCO.BO", "BSE"),
+    ("Wipro (BSE)", "WIPRO.BO", "BSE"),
+    ("Nestle India (BSE)", "NESTLEIND.BO", "BSE"),
+    ("Bajaj Finserv (BSE)", "BAJAJFINSV.BO", "BSE"),
+    ("Adani Enterprises (BSE)", "ADANIENT.BO", "BSE"),
+    ("Adani Ports (BSE)", "ADANIPORTS.BO", "BSE"),
+    ("Tata Motors (BSE)", "TATAMOTORS.BO", "BSE"),
+    ("Tata Steel (BSE)", "TATASTEEL.BO", "BSE"),
+    ("JSW Steel (BSE)", "JSWSTEEL.BO", "BSE"),
+    ("Hindalco (BSE)", "HINDALCO.BO", "BSE"),
+    ("ONGC (BSE)", "ONGC.BO", "BSE"),
+    ("NTPC (BSE)", "NTPC.BO", "BSE"),
+    ("Power Grid (BSE)", "POWERGRID.BO", "BSE"),
+    ("Coal India (BSE)", "COALINDIA.BO", "BSE"),
+    ("Tech Mahindra (BSE)", "TECHM.BO", "BSE"),
+    ("IndusInd Bank (BSE)", "INDUSINDBK.BO", "BSE"),
+    ("Dr Reddy's Labs (BSE)", "DRREDDY.BO", "BSE"),
+    ("Cipla (BSE)", "CIPLA.BO", "BSE"),
+    ("Divi's Laboratories (BSE)", "DIVISLAB.BO", "BSE"),
+    ("Eicher Motors (BSE)", "EICHERMOT.BO", "BSE"),
+    ("Hero MotoCorp (BSE)", "HEROMOTOCO.BO", "BSE"),
+    ("Bajaj Auto (BSE)", "BAJAJ-AUTO.BO", "BSE"),
+    ("Britannia Industries (BSE)", "BRITANNIA.BO", "BSE"),
+    ("Grasim Industries (BSE)", "GRASIM.BO", "BSE"),
+    ("Shree Cement (BSE)", "SHREECEM.BO", "BSE"),
+    ("Tata Consumer Products (BSE)", "TATACONSUM.BO", "BSE"),
+    ("Apollo Hospitals (BSE)", "APOLLOHOSP.BO", "BSE"),
+    ("HDFC Life Insurance (BSE)", "HDFCLIFE.BO", "BSE"),
+    ("SBI Life Insurance (BSE)", "SBILIFE.BO", "BSE"),
+    ("Mahindra & Mahindra (BSE)", "M&M.BO", "BSE"),
+    ("UPL (BSE)", "UPL.BO", "BSE"),
+    ("Bharat Petroleum (BSE)", "BPCL.BO", "BSE"),
+    // v4.1 — Indian sector indices
+    ("Bank Nifty", "^NSEBANK", "Index"),
+    ("Nifty IT", "^CNXIT", "Index"),
+    ("Nifty Auto", "^CNXAUTO", "Index"),
+    ("Nifty Pharma", "^CNXPHARMA", "Index"),
+    ("Nifty FMCG", "^CNXFMCG", "Index"),
+    ("Nifty Metal", "^CNXMETAL", "Index"),
+    ("Nifty Energy", "^CNXENERGY", "Index"),
+    ("Nifty Realty", "^CNXREALTY", "Index"),
+    ("Nifty Infrastructure", "^CNXINFRA", "Index"),
+    ("BSE Midcap", "^BSEMIDCAP", "Index"),
+    ("BSE Smallcap", "^BSESMALLCAP", "Index"),
+    // v4.1 — US S&P 500 names missing above
+    ("Chevron", "CVX", "NYSE"),
+    // v4.1 — NASDAQ 100 names missing above
+    ("ASML", "ASML", "NASDAQ"),
+    ("T-Mobile", "TMUS", "NASDAQ"),
+    ("Booking Holdings", "BKNG", "NASDAQ"),
+    ("Intuitive Surgical", "ISRG", "NASDAQ"),
+    ("Honeywell", "HON", "NASDAQ"),
+    ("Mondelez", "MDLZ", "NASDAQ"),
+    ("ADP", "ADP", "NASDAQ"),
+    // v4.1 — US ETFs
+    ("SPDR S&P 500", "SPY", "ETF"),
+    ("Invesco QQQ", "QQQ", "ETF"),
+    ("SPDR Dow Jones", "DIA", "ETF"),
+    ("iShares Russell 2000", "IWM", "ETF"),
+    ("Vanguard Total Market", "VTI", "ETF"),
+    ("Vanguard S&P 500", "VOO", "ETF"),
+    ("Vanguard Developed Markets", "VEA", "ETF"),
+    ("Vanguard Emerging Markets", "VWO", "ETF"),
+    ("SPDR Gold", "GLD", "ETF"),
+    ("iShares Silver", "SLV", "ETF"),
+    ("US Oil Fund", "USO", "ETF"),
+    ("20-Year Treasury", "TLT", "ETF"),
+    ("High Yield Corp Bond", "HYG", "ETF"),
+    ("ARK Innovation", "ARKK", "ETF"),
+    ("Financials", "XLF", "ETF"),
+    ("Technology", "XLK", "ETF"),
+    ("Energy", "XLE", "ETF"),
+    ("Healthcare", "XLV", "ETF"),
+    ("Consumer Discretionary", "XLY", "ETF"),
+    ("Consumer Staples", "XLP", "ETF"),
+    // v4.1 — US Treasury yields missing above
+    ("US 5Y Treasury", "^FVX", "Index"),
+    ("US 30Y Treasury", "^TYX", "Index"),
+    // v4.1 — Europe stocks
+    ("ASML (Euronext)", "ASML.AS", "Euronext Amsterdam"),
+    ("SAP", "SAP.DE", "Xetra"),
+    ("Siemens", "SIE.DE", "Xetra"),
+    ("Allianz", "ALV.DE", "Xetra"),
+    ("BASF", "BAS.DE", "Xetra"),
+    ("BMW", "BMW.DE", "Xetra"),
+    ("Mercedes-Benz", "MBG.DE", "Xetra"),
+    ("Volkswagen", "VOW3.DE", "Xetra"),
+    ("Nestle (Swiss)", "NESN.SW", "SWX"),
+    ("Roche", "ROG.SW", "SWX"),
+    ("Novartis", "NOVN.SW", "SWX"),
+    ("UBS", "UBSG.SW", "SWX"),
+    ("LVMH", "MC.PA", "Euronext Paris"),
+    ("L'Oreal", "OR.PA", "Euronext Paris"),
+    ("TotalEnergies", "TTE.PA", "Euronext Paris"),
+    ("Sanofi", "SAN.PA", "Euronext Paris"),
+    ("Airbus", "AIR.PA", "Euronext Paris"),
+    ("Shell", "SHEL.L", "LSE"),
+    ("AstraZeneca", "AZN.L", "LSE"),
+    ("HSBC", "HSBA.L", "LSE"),
+    ("BP", "BP.L", "LSE"),
+    ("Unilever (UK)", "ULVR.L", "LSE"),
+    ("Rio Tinto", "RIO.L", "LSE"),
+    ("GSK", "GSK.L", "LSE"),
+    ("Barclays", "BARC.L", "LSE"),
+    // v4.1 — European indices
+    ("DAX (Germany)", "^GDAXI", "Index"),
+    ("CAC 40 (France)", "^FCHI", "Index"),
+    ("Euro Stoxx 50", "^STOXX50E", "Index"),
+    ("SMI (Switzerland)", "^SSMI", "Index"),
+    ("IBEX 35 (Spain)", "^IBEX", "Index"),
+    ("FTSE MIB (Italy)", "FTSEMIB.MI", "Index"),
+    // v4.1 — Asia-Pacific stocks
+    ("Toyota", "7203.T", "TSE"),
+    ("Sony", "6758.T", "TSE"),
+    ("Keyence", "6861.T", "TSE"),
+    ("SoftBank", "9984.T", "TSE"),
+    ("Mitsubishi UFJ", "8306.T", "TSE"),
+    ("Samsung Electronics", "005930.KS", "KRX"),
+    ("SK Hynix", "000660.KS", "KRX"),
+    ("Hyundai Motor", "005380.KS", "KRX"),
+    ("Tencent", "0700.HK", "HKEX"),
+    ("Alibaba (HK)", "9988.HK", "HKEX"),
+    ("Meituan", "3690.HK", "HKEX"),
+    ("Xiaomi", "1810.HK", "HKEX"),
+    ("Ping An Insurance", "2318.HK", "HKEX"),
+    ("China Construction Bank", "0939.HK", "HKEX"),
+    ("BHP Group", "BHP.AX", "ASX"),
+    ("Commonwealth Bank", "CBA.AX", "ASX"),
+    ("CSL", "CSL.AX", "ASX"),
+    ("Westpac", "WBC.AX", "ASX"),
+    ("DBS Group", "D05.SI", "SGX"),
+    ("OCBC", "O39.SI", "SGX"),
+    ("UOB", "U11.SI", "SGX"),
+    ("Taiwan Semiconductor (ADR)", "TSM", "NYSE"),
+    ("TSMC (TW)", "2330.TW", "TWSE"),
+    ("Hon Hai Precision", "2317.TW", "TWSE"),
+    ("MediaTek", "2454.TW", "TWSE"),
+    // v4.1 — Asia-Pacific indices
+    ("Nikkei 225 (Japan)", "^N225", "Index"),
+    ("Hang Seng (HK)", "^HSI", "Index"),
+    ("Shanghai Composite", "000001.SS", "Index"),
+    ("KOSPI (Korea)", "^KS11", "Index"),
+    ("Taiwan Weighted", "^TWII", "Index"),
+    ("ASX 200 (Australia)", "^AXJO", "Index"),
+    ("Straits Times (Singapore)", "^STI", "Index"),
+    // v4.1 — Commodities missing above
+    ("Brent Crude", "BZ=F", "Commodity"),
+    ("Cotton", "CT=F", "Commodity"),
+    // v4.1 — Forex (Yahoo FX)
+    ("USD/INR", "USDINR=X", "Forex"),
+    ("EUR/INR", "EURINR=X", "Forex"),
+    ("GBP/INR", "GBPINR=X", "Forex"),
+    ("JPY/INR", "JPYINR=X", "Forex"),
+    ("EUR/USD", "EURUSD=X", "Forex"),
+    ("GBP/USD", "GBPUSD=X", "Forex"),
+    ("USD/JPY", "USDJPY=X", "Forex"),
+    ("USD/CNY", "USDCNY=X", "Forex"),
+    ("AUD/USD", "AUDUSD=X", "Forex"),
+    ("USD/CAD", "USDCAD=X", "Forex"),
+    ("USD/CHF", "USDCHF=X", "Forex"),
+    // v4.1 — Crypto indices
+    ("CMC Crypto 200", "^CMC200", "Index"),
 ];
 
 /// Resolve a friendly name or ticker to a Yahoo Finance symbol.
@@ -455,5 +683,54 @@ mod tests {
         assert!(info.contains("Sourish Dey"));
         assert!(info.contains("Bloomberg power"));
         assert!(info.contains("Made in India"));
+    }
+
+    /// v4.1 universe: every ticker must be unique (case-insensitive), or
+    /// `resolve`/`display_name` silently return the first duplicate.
+    #[test]
+    fn test_no_duplicate_tickers() {
+        use std::collections::HashSet;
+        let mut seen = HashSet::new();
+        for (_, ticker, _) in COMPANY_LIST {
+            let key = ticker.to_uppercase();
+            assert!(seen.insert(key.clone()), "duplicate ticker: {key}");
+        }
+    }
+
+    /// v4.1 universe: spot-check the newly added coverage resolves.
+    #[test]
+    fn test_v41_universe_resolves() {
+        // Crypto additions.
+        assert_eq!(resolve("Binance Coin"), "BNB-USD");
+        assert_eq!(resolve("APT-USD"), "APT-USD");
+        // New NSE names.
+        assert_eq!(resolve("IndiGo"), "INDIGO.NS");
+        assert_eq!(resolve("Blue Dart Express"), "BLUEDART.NS");
+        // BSE twins.
+        assert_eq!(resolve("RELIANCE.BO"), "RELIANCE.BO");
+        assert_eq!(display_name("TCS.BO"), "TCS (BSE)");
+        // ETFs, regions, FX.
+        assert_eq!(resolve("SPY"), "SPY");
+        assert_eq!(exchange("SPY"), "ETF");
+        assert_eq!(resolve("Toyota"), "7203.T");
+        assert_eq!(exchange("7203.T"), "TSE");
+        assert_eq!(resolve("USD/INR"), "USDINR=X");
+        assert_eq!(exchange("USDINR=X"), "Forex");
+        assert_eq!(resolve("Brent Crude"), "BZ=F");
+        assert_eq!(resolve("CMC Crypto 200"), "^CMC200");
+        // Existing entries still resolve first (append-only order).
+        assert_eq!(resolve("Reliance Industries"), "RELIANCE.NS");
+        assert!(COMPANY_LIST.len() >= 500, "universe shrank: {}", COMPANY_LIST.len());
+    }
+
+    /// v4.1 universe: every entry has a non-empty name, ticker and exchange.
+    #[test]
+    fn test_entries_are_well_formed() {
+        for (name, ticker, exchange) in COMPANY_LIST {
+            assert!(!name.is_empty(), "empty name for {ticker}");
+            assert!(!ticker.is_empty(), "empty ticker for {name}");
+            assert!(!exchange.is_empty(), "empty exchange for {ticker}");
+            assert!(!ticker.contains(' '), "ticker with space: {ticker}");
+        }
     }
 }

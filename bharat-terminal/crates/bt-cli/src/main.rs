@@ -147,6 +147,36 @@ enum Commands {
         #[command(subcommand)]
         action: WatchlistAction,
     },
+    /// Backtest an SMA-cross strategy over fetched closes.
+    Backtest {
+        /// Symbol to backtest (e.g., RELIANCE.NS).
+        #[arg(long, default_value = "RELIANCE.NS")]
+        symbol: String,
+        /// Fast SMA window in bars.
+        #[arg(long, default_value_t = 10)]
+        fast: usize,
+        /// Slow SMA window in bars.
+        #[arg(long, default_value_t = 30)]
+        slow: usize,
+    },
+    /// Screen cached symbols with technical filters.
+    Screen {
+        /// Filter expression, e.g. "rsi<30 AND change_5d>2".
+        #[arg(long, default_value = "rsi<30")]
+        filter: String,
+        /// Output CSV path.
+        #[arg(long, default_value = "screen_results.csv")]
+        output: PathBuf,
+    },
+    /// Export portfolio holdings with cached prices to CSV.
+    ExportPortfolio {
+        /// portfolio.json path (default: exe-dir data/portfolio.json).
+        #[arg(long)]
+        portfolio: Option<PathBuf>,
+        /// Output CSV path.
+        #[arg(long, default_value = "portfolio_export.csv")]
+        output: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, clap::Subcommand)]
@@ -683,6 +713,177 @@ fn run_watchlist(action: WatchlistAction) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
+/// Backtest SMA-cross over a year of daily closes and print the tape.
+async fn run_backtest(
+    symbol: &str,
+    fast: usize,
+    slow: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let service = DataService::new()?;
+    let series = fetch_series(&service, symbol, RangeArg::Y1).await;
+    let closes = series.closes();
+    let r = bt_analytics::backtest_sma_cross(&closes, fast, slow)
+        .ok_or("backtest needs at least 2 closes")?;
+    println!("strategy: {}", r.strategy);
+    println!("symbol: {symbol}  bars: {}", closes.len());
+    println!("total return: {:+.2}%", r.total_return * 100.0);
+    println!("buy-and-hold: {:+.2}%", r.buy_hold_return * 100.0);
+    println!("sharpe (ann.): {:.2}", r.sharpe);
+    println!("max drawdown:  {:.2}%", r.max_drawdown * 100.0);
+    println!("exposure:      {:.0}% of bars", r.exposure * 100.0);
+    Ok(())
+}
+
+/// Screen cached symbols with a technical filter expression and write matches
+/// to CSV. Cache-only by design: screening 500 symbols over the network would
+/// take minutes and hammer the providers; the report states its coverage so a
+/// thin cache reads as thin.
+async fn run_screen(
+    filter: &str,
+    output: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use bt_analytics::screener as scr;
+    let filters =
+        scr::parse_filters(filter).map_err(|e| format!("bad filter: {e}"))?;
+    let cache = bt_data::cache::Cache::new(bt_data::default_cache_path())?;
+    let mut rows = Vec::new();
+    let mut screened = 0usize;
+    for (_, ticker, _) in bt_data::COMPANY_LIST {
+        if ticker.contains('-') || ticker.contains('=') || ticker.starts_with('^') {
+            continue;
+        }
+        let mut found = None;
+        for iv in ["1d", "1wk", "1mo"] {
+            if let Ok(Some(candles)) = cache.get_ohlcv(ticker, iv) {
+                if candles.len() >= 20 {
+                    found = Some(candles);
+                    break;
+                }
+            }
+        }
+        let Some(candles) = found else { continue };
+        screened += 1;
+        let closes: Vec<f64> = candles.iter().map(|c| c.close).collect();
+        let volumes: Vec<f64> = candles.iter().map(|c| c.volume).collect();
+        rows.push(scr::compute_technicals(ticker, &closes, &volumes));
+    }
+    let hits = scr::apply_filters(&rows, &filters);
+    let mut csv = String::from("symbol,price,rsi,macd_hist,change_5d,change_20d,volume_ratio,sma50_ratio,sma200_ratio,bb_pos,high52_dist,low52_dist\n");
+    for r in &hits {
+        let f = |k: &str| {
+            r.get(k)
+                .filter(|v| v.is_finite())
+                .map(|v| format!("{v:.4}"))
+                .unwrap_or_default()
+        };
+        csv.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            r.symbol,
+            f("price"),
+            f("rsi"),
+            f("macd_hist"),
+            f("change_5d"),
+            f("change_20d"),
+            f("volume_ratio"),
+            f("sma50_ratio"),
+            f("sma200_ratio"),
+            f("bb_pos"),
+            f("high52_dist"),
+            f("low52_dist"),
+        ));
+    }
+    if let Some(parent) = output.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    std::fs::write(output, csv)?;
+    println!(
+        "screened {screened} cached symbols, {} match -> {}",
+        hits.len(),
+        output.display()
+    );
+    Ok(())
+}
+
+/// Export portfolio holdings with cached prices to CSV.
+///
+/// `--format` is deliberately CSV-only: the xlsx writer is a v4.2 dependency
+/// and this command refuses to pretend otherwise.
+fn run_export_portfolio(
+    portfolio: Option<&std::path::Path>,
+    output: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use bt_analytics::portfolio as pf;
+    use std::collections::HashMap;
+
+    let path = portfolio.map(|p| p.to_path_buf()).unwrap_or_else(|| {
+        let base = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        base.join("data").join("portfolio.json")
+    });
+    let text =
+        std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let holdings: Vec<pf::Holding> = serde_json::from_str(&text)
+        .map_err(|e| format!("parse {}: {e}", path.display()))?;
+    pf::validate(&holdings).map_err(|e| format!("invalid holdings: {e}"))?;
+
+    let cache = bt_data::cache::Cache::new(bt_data::default_cache_path())?;
+    let mut prices = HashMap::new();
+    for h in &holdings {
+        for iv in ["1d", "1wk", "1mo"] {
+            if let Ok(Some(candles)) = cache.get_ohlcv(&h.symbol, iv) {
+                if let Some(last) = candles.last() {
+                    prices.insert(h.symbol.clone(), last.close);
+                    break;
+                }
+            }
+        }
+    }
+    let mut csv = String::from("symbol,qty,avg_price,last_price,market_value,pnl,pnl_pct\n");
+    for h in &holdings {
+        let px = prices.get(&h.symbol).copied().unwrap_or(f64::NAN);
+        let (mv, pnl, pct) = if px.is_finite() {
+            (
+                format!("{:.2}", h.market_value(px)),
+                format!("{:+.2}", h.pnl(px)),
+                format!("{:+.2}", h.pnl_pct(px)),
+            )
+        } else {
+            ("".to_string(), "".to_string(), "".to_string())
+        };
+        csv.push_str(&format!(
+            "{},{},{},{},{},{},{}\n",
+            h.symbol,
+            h.qty,
+            h.avg_price,
+            if px.is_finite() {
+                format!("{px:.2}")
+            } else {
+                "n/a".to_string()
+            },
+            mv,
+            pnl,
+            pct
+        ));
+    }
+    if let Some(parent) = output.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    std::fs::write(output, csv)?;
+    println!(
+        "exported {} holdings ({} priced) -> {}",
+        holdings.len(),
+        prices.len(),
+        output.display()
+    );
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -702,6 +903,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             horizon,
         }) => return run_forecast(&symbol, &engine, horizon).await,
         Some(Commands::Watchlist { action }) => return run_watchlist(action),
+        Some(Commands::Backtest { symbol, fast, slow }) => {
+            return run_backtest(&symbol, fast, slow).await
+        }
+        Some(Commands::Screen { filter, output }) => return run_screen(&filter, &output).await,
+        Some(Commands::ExportPortfolio { portfolio, output }) => {
+            return run_export_portfolio(portfolio.as_deref(), &output)
+        }
         None => {}
     }
 

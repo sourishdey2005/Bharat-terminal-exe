@@ -43,6 +43,13 @@ fuzzy-matcher = { workspace = true }
 # v4.0: native Windows toast notifications for fired alerts. Best-effort:
 # failures are swallowed and the in-app toast is always shown.
 winrt-notification = { workspace = true }
+# v4.1: opt-in voice alerts via Windows SAPI (pure COM, no C++ toolchain).
+# Kept minimal on purpose: only the COM + speech bindings this file uses.
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_Media_Speech",
+] }
 
 [dev-dependencies]
 # Router-level tests drive the app with `tower::ServiceExt::oneshot`.

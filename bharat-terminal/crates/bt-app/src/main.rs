@@ -9,7 +9,7 @@
 //! 163 interactive tabs with category grouping, auto-focus on chart canvas,
 //! and prefs persistence via serde_json.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
@@ -1491,6 +1491,14 @@ enum Tab {
     Alerts,
     News,
     Calendar,
+    /// v4.1 live option chains (NSE + US) with Greeks, payoff and IV views.
+    Options,
+    /// v4.1 holdings, P&L, allocation and risk (`portfolio.json`).
+    Portfolio,
+    /// v4.1 2×2 normalized grid with correlation matrix (`compare.json`).
+    Compare,
+    /// v4.1 technical screens over cached symbols (`screens/*.json`).
+    Screener,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1774,6 +1782,10 @@ fn tabs_in_category(cat: TabCategory) -> &'static [(Tab, &'static str)] {
             (Tab::Alerts, "Alerts"),
             (Tab::News, "News"),
             (Tab::Calendar, "Calendar"),
+            (Tab::Options, "Options"),
+            (Tab::Portfolio, "Portfolio"),
+            (Tab::Compare, "Compare"),
+            (Tab::Screener, "Screener"),
         ],
     }
 }
@@ -1845,6 +1857,9 @@ enum AppMessage {
     QuoteReady(String),
     NewsReady(Vec<NewsArticle>),
     NewsError(String),
+    OptionsReady(bt_core::OptionChain, OptionsSource),
+    OptionsExpiries(Vec<(String, String)>),
+    OptionsError(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1863,6 +1878,15 @@ struct Prefs {
     /// Recently viewed symbols, most recent last, capped at [`MAX_RECENT`].
     #[serde(default)]
     recent_symbols: Vec<String>,
+    /// Last options view mode (`"chain"`, `"payoff"`, `"iv"`, `"oi"`).
+    #[serde(default)]
+    options_view: String,
+    /// Last options expiry per symbol (raw expiry string as listed).
+    #[serde(default)]
+    options_expiries: HashMap<String, String>,
+    /// Voice alerts opt-in (Windows SAPI). Off by default.
+    #[serde(default)]
+    voice_alerts: bool,
 }
 
 /// Starred symbols cap (Part 7: "Up to 50 symbols, persisted").
@@ -1881,6 +1905,9 @@ impl Default for Prefs {
             custom_end: String::new(),
             watchlist: Vec::new(),
             recent_symbols: Vec::new(),
+            options_view: String::new(),
+            options_expiries: HashMap::new(),
+            voice_alerts: false,
         }
     }
 }
@@ -2298,6 +2325,47 @@ struct BharatApp {
     export_msg: Option<(String, Instant)>,
     /// Unsaved new-alert form on the Alerts tab.
     alert_draft: AlertDraft,
+    /// v4.1 Options tab: listed expiries as (display, raw) pairs. Raw equals
+    /// display for NSE dates and holds unix seconds for Yahoo.
+    options_expiries: Vec<(String, String)>,
+    /// Raw expiry currently selected.
+    options_expiry_raw: String,
+    /// Last fetched chain for the current symbol + expiry.
+    options_chain: Option<bt_core::OptionChain>,
+    /// Backend that served it (drives risk-free rate + IV units).
+    options_source: OptionsSource,
+    /// Fetch failure message, shown as a red banner with Retry.
+    options_error: Option<String>,
+    /// Options fetch in flight.
+    options_in_flight: bool,
+    /// Which Options sub-view is showing.
+    options_view: OptionsView,
+    /// Strike selected for the payoff diagram (ATM by default).
+    options_strike: Option<f64>,
+    /// Payoff side toggles.
+    options_is_call: bool,
+    options_is_long: bool,
+    /// Last successful options fetch, for staleness display.
+    options_last_fetch: Option<Instant>,
+    /// Per-symbol last expiry, merged back into prefs on save.
+    options_expiry_map: HashMap<String, String>,
+    /// v4.1 Portfolio tab: holdings from `portfolio.json`.
+    portfolio: Vec<bt_analytics::portfolio::Holding>,
+    /// New-holding form (symbol, qty, avg price as text).
+    portfolio_draft: [String; 3],
+    /// v4.1 Compare tab: up to 4 symbols in a 2x2 grid (`compare.json`).
+    compare_grid: Vec<String>,
+    /// v4.1 Screener tab: last filter text and matching tickers.
+    screen_filter: String,
+    screen_results: Vec<String>,
+    screen_error: Option<String>,
+    screen_ran_at: Option<Instant>,
+    /// v4.1 AI chat: floating window, message history, input box.
+    show_chat: bool,
+    chat_messages: VecDeque<(String, String)>,
+    chat_input: String,
+    /// v4.1 voice alerts opt-in (Windows SAPI, off by default).
+    voice_alerts: bool,
 }
 
 /// One in-app toast: message, severity color, creation time.
@@ -2367,8 +2435,7 @@ const ALERT_KIND_OPTIONS: &[&str] = &[
 ];
 
 /// Build an [`AlertKind`] from the draft, or an error naming the bad field.
-fn draft_to_kind(d: &AlertDraft) -> Result<bt_analytics::alerts::AlertKind, String> {
-    use bt_analytics::alerts::AlertKind as K;
+fn draft_to_kind(d: &AlertDraft) -> Result<bt_analytics::alerts::AlertKind, String> {    use bt_analytics::alerts::AlertKind as K;
     let level: f64 = d.level_text.trim().parse().map_err(|_| {
         format!("level {:?} is not a number", d.level_text.trim())
     })?;
@@ -2395,6 +2462,109 @@ fn draft_to_kind(d: &AlertDraft) -> Result<bt_analytics::alerts::AlertKind, Stri
         },
         _ => K::SignalIs { buy: d.buy_side },
     })
+}
+
+/// Which feed serves an Options request. Decided from the symbol, never from
+/// a toggle: the user should not have to know which backend owns a ticker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OptionsSource {
+    Nse,
+    Yahoo,
+    /// No listed options (index without F&O, ETF without options, crypto, FX…).
+    None,
+}
+
+/// Options tab sub-view, persisted across restarts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum OptionsView {
+    Chain,
+    Payoff,
+    IvSmile,
+    OiBuildup,
+}
+
+impl OptionsView {
+    fn label(self) -> &'static str {
+        match self {
+            OptionsView::Chain => "Chain",
+            OptionsView::Payoff => "Payoff",
+            OptionsView::IvSmile => "IV Smile",
+            OptionsView::OiBuildup => "OI Buildup",
+        }
+    }
+
+    fn from_label(s: &str) -> Self {
+        match s {
+            "payoff" => OptionsView::Payoff,
+            "iv" => OptionsView::IvSmile,
+            "oi" => OptionsView::OiBuildup,
+            _ => OptionsView::Chain,
+        }
+    }
+
+    fn as_label(self) -> &'static str {
+        match self {
+            OptionsView::Chain => "chain",
+            OptionsView::Payoff => "payoff",
+            OptionsView::IvSmile => "iv",
+            OptionsView::OiBuildup => "oi",
+        }
+    }
+}
+
+/// Decide the options backend from a ticker.
+///
+/// NSE first (explicit F&O list + indices), then US listings via the symbol
+/// table's exchange tag. Anything else — crypto, FX, commodities, unknown
+/// tickers — reports [`OptionsSource::None`] with a friendly message instead
+/// of firing a request that cannot succeed.
+fn detect_options_source(symbol: &str) -> OptionsSource {
+    use bt_data::nse_options::is_fno_symbol;
+    if is_fno_symbol(symbol) {
+        return OptionsSource::Nse;
+    }
+    match bt_data::symbol::exchange(symbol) {
+        "NASDAQ" | "NYSE" | "ETF" => OptionsSource::Yahoo,
+        _ => OptionsSource::None,
+    }
+}
+
+/// Chain symbols arrive uppercased and bare (`RELIANCE`, `AAPL`); the app holds
+/// suffixed tickers (`RELIANCE.NS`). Normalize before comparing staleness so a
+/// symbol switch is detected and a same-symbol refresh is not mistaken for one.
+fn normalized_options_symbol(symbol: &str) -> String {
+    let upper = symbol.to_uppercase();
+    upper
+        .strip_suffix(".NS")
+        .or_else(|| upper.strip_suffix(".BO"))
+        .unwrap_or(&upper)
+        .to_string()
+}
+///
+/// `premium` is the price paid (long) or received (short); the sign convention
+/// is long-positive-cost, so a long call pays `max(spot-strike,0) - premium`.
+fn option_payoff_at(spot: f64, strike: f64, premium: f64, is_call: bool, is_long: bool) -> f64 {
+    let intrinsic = if is_call {
+        (spot - strike).max(0.0)
+    } else {
+        (strike - spot).max(0.0)
+    };
+    if is_long {
+        intrinsic - premium
+    } else {
+        premium - intrinsic
+    }
+}
+
+/// Years from now to an NSE `"30-Oct-2026"` expiry, or `None` when the string
+/// does not parse (stale or custom labels must not poison Greeks).
+fn nse_years_to_expiry(expiry: &str) -> Option<f64> {
+    let date = chrono::NaiveDate::parse_from_str(expiry.trim(), "%d-%b-%Y").ok()?;
+    let days = date.signed_duration_since(Utc::now().date_naive()).num_days();
+    if days <= 0 {
+        return None;
+    }
+    Some(days as f64 / 365.0)
 }
 
 /// One plotted series for [`draw_lines_frame`]: legend label, full-length
@@ -2639,8 +2809,46 @@ impl BharatApp {
             calendar_dismissed: load_json_file("calendar_cache.json"),
             export_msg: None,
             alert_draft: AlertDraft::default(),
+            options_expiries: Vec::new(),
+            options_expiry_raw: prefs
+                .options_expiries
+                .get(&prefs.symbol)
+                .cloned()
+                .unwrap_or_default(),
+            options_chain: None,
+            options_source: OptionsSource::None,
+            options_error: None,
+            options_in_flight: false,
+            options_view: OptionsView::from_label(&prefs.options_view),
+            options_strike: None,
+            options_is_call: true,
+            options_is_long: true,
+            options_last_fetch: None,
+            options_expiry_map: prefs.options_expiries.clone(),
+            portfolio: load_json_file("portfolio.json"),
+            portfolio_draft: [String::new(), String::new(), String::new()],
+            compare_grid: load_json_file::<Vec<String>>("compare.json"),
+            screen_filter: String::from("rsi<30"),
+            screen_results: Vec::new(),
+            screen_error: None,
+            screen_ran_at: None,
+            show_chat: false,
+            chat_messages: VecDeque::new(),
+            chat_input: String::new(),
+            voice_alerts: prefs.voice_alerts,
         };
         app.next_alert_id = app.alerts.iter().map(|r| r.id).max().unwrap_or(0) + 1;
+        // Compare grid is always 4 slots; pad a short file, clip a long one.
+        {
+            let defaults = ["RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS"];
+            app.compare_grid.resize_with(4, || String::new());
+            for (i, slot) in app.compare_grid.iter_mut().enumerate() {
+                if slot.trim().is_empty() {
+                    *slot = defaults[i].to_string();
+                }
+            }
+            app.compare_grid.truncate(4);
+        }
 
         app.trigger_fetch();
         app
@@ -2672,6 +2880,18 @@ impl BharatApp {
                 },
                 watchlist: self.watchlist.clone(),
                 recent_symbols: self.recent_symbols.clone(),
+                voice_alerts: self.voice_alerts,
+                options_view: self.options_view.as_label().to_string(),
+                options_expiries: {
+                    let mut map = self.options_expiry_map.clone();
+                    if !self.options_expiry_raw.is_empty() {
+                        map.insert(
+                            self.selected_company.clone(),
+                            self.options_expiry_raw.clone(),
+                        );
+                    }
+                    map
+                },
             };
             prefs.save();
             self.prefs_dirty = false;
@@ -2801,6 +3021,41 @@ impl BharatApp {
                     self.news_in_flight = false;
                     self.news_at = Some(Instant::now());
                     self.news_error = Some(err);
+                }
+                AppMessage::OptionsExpiries(list) => {
+                    self.options_expiries = list;
+                    // Keep the persisted choice when it is still listed,
+                    // otherwise fall back to the nearest expiry.
+                    let persisted = self
+                        .options_expiry_map
+                        .get(&self.selected_company)
+                        .cloned()
+                        .unwrap_or_default();
+                    let valid = self
+                        .options_expiries
+                        .iter()
+                        .any(|(_, raw)| *raw == self.options_expiry_raw);
+                    if !valid {
+                        self.options_expiry_raw = self
+                            .options_expiries
+                            .iter()
+                            .find(|(_, raw)| *raw == persisted)
+                            .or_else(|| self.options_expiries.first())
+                            .map(|(_, raw)| raw.clone())
+                            .unwrap_or_default();
+                    }
+                }
+                AppMessage::OptionsReady(chain, source) => {
+                    self.options_in_flight = false;
+                    self.options_last_fetch = Some(Instant::now());
+                    self.options_error = None;
+                    self.options_source = source;
+                    self.options_chain = Some(chain);
+                    self.options_strike = None;
+                }
+                AppMessage::OptionsError(err) => {
+                    self.options_in_flight = false;
+                    self.options_error = Some(err);
                 }
             }
         }
@@ -3025,6 +3280,13 @@ impl BharatApp {
                 if ui.button("Copy CSV").clicked() {
                     self.copy_csv_clipboard(ctx);
                     self.push_toast(ToastKind::Success, "Candles copied to clipboard");
+                }
+                if ui
+                    .button("💬 Chat")
+                    .on_hover_text("On-device market assistant")
+                    .clicked()
+                {
+                    self.show_chat = !self.show_chat;
                 }
                 if let Some((msg, at)) = &self.export_msg {
                     if at.elapsed() < Duration::from_secs(8) {
@@ -3310,6 +3572,9 @@ impl BharatApp {
                     at: Instant::now(),
                 });
                 native_toast("Bharat Terminal — Alert", &ev.message);
+                if self.voice_alerts {
+                    speak_text(&ev.message);
+                }
                 self.alert_events.push_back(ev);
                 fired += 1;
             }
@@ -3730,6 +3995,10 @@ impl BharatApp {
             Tab::Alerts => self.draw_alerts(ui),
             Tab::News => self.draw_news(ui),
             Tab::Calendar => self.draw_calendar(ui),
+            Tab::Options => self.draw_options(ui),
+            Tab::Portfolio => self.draw_portfolio(ui),
+            Tab::Compare => self.draw_compare(ui),
+            Tab::Screener => self.draw_screener(ui),
         }
     }
 
@@ -9040,6 +9309,17 @@ impl BharatApp {
     /// [`Self::evaluate_alerts`] on fresh data, not here.
     fn draw_alerts(&mut self, ui: &mut egui::Ui) {
         ui.label(RichText::new("Alerts — triggers with toasts").strong());
+        ui.horizontal(|ui| {
+            let was = self.voice_alerts;
+            ui.checkbox(&mut self.voice_alerts, "Voice alerts")
+                .on_hover_text("Opt-in: speak fired alerts via Windows SAPI");
+            if self.voice_alerts != was {
+                self.prefs_dirty = true;
+            }
+            if ui.small_button("Test voice").clicked() {
+                speak_text("Voice alerts on. This is Bharat Terminal.");
+            }
+        });
         ui.label(
             RichText::new(format!(
                 "{} rule{} ({} on) · {} recent events",
@@ -9318,6 +9598,153 @@ impl BharatApp {
         }
     }
 
+    /// v4.1 Portfolio tab: holdings with live-cached prices, P&L, allocation
+    /// and a risk readout. Prices are last cached closes — a holding whose
+    /// symbol was never charted shows "—" instead of a fetched quote, because
+    /// this tab makes no network calls of its own.
+    fn draw_portfolio(&mut self, ui: &mut egui::Ui) {
+        use bt_analytics::portfolio as pf;
+        ui.label(RichText::new("Portfolio — holdings, P&L, allocation, risk").strong());
+
+        // Add form.
+        ui.horizontal(|ui| {
+            ui.label("Symbol:");
+            ui.text_edit_singleline(&mut self.portfolio_draft[0]);
+            ui.label("Qty:");
+            ui.text_edit_singleline(&mut self.portfolio_draft[1]);
+            ui.label("Avg ₹:");
+            ui.text_edit_singleline(&mut self.portfolio_draft[2]);
+            if ui.button("Add holding").clicked() {
+                let symbol = self.portfolio_draft[0].trim().to_uppercase();
+                let qty: f64 = self.portfolio_draft[1].trim().parse().unwrap_or(-1.0);
+                let avg: f64 = self.portfolio_draft[2].trim().parse().unwrap_or(-1.0);
+                let holding = pf::Holding { symbol, qty, avg_price: avg };
+                match pf::validate(std::slice::from_ref(&holding)) {
+                    Ok(()) => {
+                        // Merge into an existing row for the same symbol.
+                        if let Some(h) = self.portfolio.iter_mut().find(|h| h.symbol == holding.symbol) {
+                            let total_qty = h.qty + holding.qty;
+                            h.avg_price = (h.qty * h.avg_price + holding.qty * holding.avg_price) / total_qty;
+                            h.qty = total_qty;
+                        } else {
+                            self.portfolio.push(holding);
+                        }
+                        save_json_file("portfolio.json", &self.portfolio);
+                        self.portfolio_draft = [String::new(), String::new(), String::new()];
+                        self.push_toast(ToastKind::Success, "Holding saved to portfolio.json");
+                    }
+                    Err(e) => self.push_toast(ToastKind::Error, e),
+                }
+            }
+        });
+        ui.separator();
+
+        if self.portfolio.is_empty() {
+            ui.label(RichText::new("No holdings yet. Add your first position above — it persists to portfolio.json.").weak());
+            return;
+        }
+
+        // Prices + returns from cache, per holding.
+        let mut prices = std::collections::HashMap::new();
+        let mut returns: std::collections::HashMap<String, Vec<f64>> = std::collections::HashMap::new();
+        let mut priced = 0usize;
+        for h in &self.portfolio {
+            if let Some((closes, _)) = cached_ohlcv_any(&h.symbol) {
+                if let Some(&last) = closes.last() {
+                    prices.insert(h.symbol.clone(), last);
+                    priced += 1;
+                }
+                if closes.len() > 1 {
+                    let rs: Vec<f64> = closes.windows(2).map(|w| w[1] / w[0].max(1e-12) - 1.0).collect();
+                    returns.insert(h.symbol.clone(), rs);
+                }
+            }
+        }
+
+        let total_cost = pf::total_cost(&self.portfolio);
+        let total_value = pf::total_value(&self.portfolio, &prices);
+        let pnl = pf::compute_pnl(&self.portfolio, &prices);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("Cost: ₹{total_cost:.0}")).monospace());
+            ui.separator();
+            ui.label(RichText::new(format!("Value: ₹{total_value:.0}")).monospace().strong());
+            ui.separator();
+            ui.colored_label(
+                if pnl >= 0.0 { PROFIT } else { LOSS },
+                RichText::new(format!("P&L: ₹{pnl:+.0}")).monospace().strong(),
+            );
+            ui.separator();
+            ui.label(
+                RichText::new(format!("Priced {priced}/{} from cache", self.portfolio.len()))
+                    .color(Color32::GRAY)
+                    .small(),
+            );
+        });
+
+        let mut delete: Option<usize> = None;
+        egui::Grid::new("portfolio_grid")
+            .striped(true)
+            .spacing(Vec2::new(10.0_f32, 2.0_f32))
+            .show(ui, |ui| {
+                for h in ["Symbol", "Qty", "Avg", "LTP", "Value", "P&L", "P&L%", "Wt%", ""] {
+                    ui.label(RichText::new(h).strong().small());
+                }
+                ui.end_row();
+                let alloc = pf::allocation(&self.portfolio, &prices);
+                for (i, h) in self.portfolio.iter().enumerate() {
+                    let px = prices.get(&h.symbol).copied();
+                    ui.label(RichText::new(&h.symbol).monospace().strong());
+                    ui.label(RichText::new(format!("{:.2}", h.qty)).monospace());
+                    ui.label(RichText::new(format!("{:.2}", h.avg_price)).monospace());
+                    match px {
+                        Some(p) => {
+                            ui.label(RichText::new(format!("{p:.2}")).monospace());
+                            ui.label(RichText::new(format!("{:.0}", h.market_value(p))).monospace());
+                            let p = h.pnl(p);
+                            ui.colored_label(
+                                if p >= 0.0 { PROFIT } else { LOSS },
+                                RichText::new(format!("{p:+.0}")).monospace(),
+                            );
+                            ui.colored_label(
+                                if p >= 0.0 { PROFIT } else { LOSS },
+                                RichText::new(format!("{:+.1}%", h.pnl_pct(prices[&h.symbol]))).monospace(),
+                            );
+                        }
+                        None => {
+                            for _ in 0..4 {
+                                ui.label(RichText::new("—").color(Color32::GRAY).monospace());
+                            }
+                        }
+                    }
+                    let w = alloc.get(i).map(|(_, w)| *w).unwrap_or(0.0);
+                    let bars = "█".repeat((w / 5.0).round().clamp(0.0, 20.0) as usize);
+                    ui.label(RichText::new(format!("{w:.1}% {bars}")).monospace().small());
+                    if ui.small_button("✕").on_hover_text("Delete holding").clicked() {
+                        delete = Some(i);
+                    }
+                    ui.end_row();
+                }
+            });
+        if let Some(i) = delete {
+            let h = self.portfolio.remove(i);
+            save_json_file("portfolio.json", &self.portfolio);
+            self.push_toast(ToastKind::Info, format!("Removed {}", h.symbol));
+        }
+
+        let risk = pf::risk_metrics(&self.portfolio, &prices, &returns);
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Risk (uncorrelated assumption, see docs)").strong().small());
+            ui.label(
+                RichText::new(format!("Annual vol: {:.1}%", risk.annual_vol_pct)).monospace(),
+            );
+            ui.label(
+                RichText::new(format!("Worst weighted day: {:+.2}%", risk.worst_weighted_day_pct))
+                    .monospace(),
+            );
+        });
+    }
+
     fn draw_correlation_network(&self, ui: &mut egui::Ui) {
         ui.label(RichText::new("Correlation Network").strong());
         let avail = ui.available_size();
@@ -9353,6 +9780,244 @@ impl BharatApp {
                 nodes[i],
                 egui::FontId::monospace(8.0_f32),
                 Color32::BLACK,
+            );
+        }
+    }
+
+    /// v4.1 Compare tab: 2×2 normalized grid with a correlation matrix.
+    /// Symbols persist to `compare.json`. Series come from cache only — a slot
+    /// without cached data says so instead of fetching, so this tab never
+    /// triggers network traffic of its own.
+    fn draw_compare(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("Compare — 2×2 normalized grid + correlation").strong());
+        ui.horizontal(|ui| {
+            for i in 0..4 {
+                ui.label(format!("{}:", ["A", "B", "C", "D"][i]));
+                if ui
+                    .text_edit_singleline(&mut self.compare_grid[i])
+                    .on_hover_text("Ticker, e.g. RELIANCE.NS")
+                    .changed()
+                {
+                    self.compare_grid[i] = self.compare_grid[i].trim().to_uppercase();
+                }
+            }
+            if ui.button("Save set").clicked() {
+                save_json_file("compare.json", &self.compare_grid);
+                self.push_toast(ToastKind::Success, "Compare set saved");
+            }
+        });
+        ui.separator();
+
+        // Load each slot from cache.
+        let series: Vec<(String, Option<Vec<f64>>)> = self
+            .compare_grid
+            .iter()
+            .map(|s| (s.clone(), cached_ohlcv_any(s).map(|(c, _)| c)))
+            .collect();
+
+        // 2×2 normalized grid, each cell rebased to 100 at its own start.
+        egui::Grid::new("compare_grid")
+            .num_columns(2)
+            .spacing(Vec2::new(8.0_f32, 8.0_f32))
+            .show(ui, |ui| {
+                for (i, (sym, data)) in series.iter().enumerate() {
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new(sym).strong().small());
+                        let h = (ui.available_height() / 2.0 - 30.0).max(120.0_f32);
+                        Plot::new(format!("compare_cell_{i}"))
+                            .height(h)
+                            .legend(Legend::default())
+                            .show(ui, |plot_ui| {
+                                match data {
+                                    Some(closes) if closes.len() >= 2 => {
+                                        let base = closes[0].abs().max(1e-12);
+                                        let pts: PlotPoints = closes
+                                            .iter()
+                                            .enumerate()
+                                            .map(|(j, &c)| [j as f64, c / base * 100.0])
+                                            .collect();
+                                        plot_ui.line(
+                                            Line::new(pts).name(sym.as_str()).width(1.5_f32),
+                                        );
+                                    }
+                                    _ => {
+                                        plot_ui.text(
+                                            egui_plot::Text::new(
+                                                egui_plot::PlotPoint::new(0.0, 0.0),
+                                                "no cached data — open it on any chart tab first",
+                                            ),
+                                        );
+                                    }
+                                }
+                            });
+                    });
+                    if i % 2 == 1 {
+                        ui.end_row();
+                    }
+                }
+            });
+        ui.separator();
+
+        // Correlation matrix over the overlapping tails.
+        ui.label(RichText::new("Correlation (60-bar overlap)").strong().small());
+        egui::Grid::new("compare_corr")
+            .striped(true)
+            .spacing(Vec2::new(10.0_f32, 2.0_f32))
+            .show(ui, |ui| {
+                ui.label(RichText::new("").strong().small());
+                for (sym, _) in &series {
+                    ui.label(RichText::new(sym).strong().small());
+                }
+                ui.end_row();
+                for (a_sym, a_data) in &series {
+                    ui.label(RichText::new(a_sym).strong().small());
+                    for (b_sym, b_data) in &series {
+                        let text = match (a_data, b_data) {
+                            (Some(a), Some(b)) if a_sym == b_sym => "1.00".to_string(),
+                            (Some(a), Some(b)) => pearson(a, b)
+                                .map(|r| format!("{r:+.2}"))
+                                .unwrap_or_else(|| "—".to_string()),
+                            _ => "—".to_string(),
+                        };
+                        ui.label(RichText::new(text).monospace().small());
+                    }
+                    ui.end_row();
+                }
+            });
+    }
+
+    /// v4.1 Screener tab: technical filters over cached symbols.
+    /// Screens save to `screens/<name>.json`. Only symbols with cached daily
+    /// data are screened; the header reports coverage so a thin cache reads as
+    /// thin, not as "no matches".
+    fn draw_screener(&mut self, ui: &mut egui::Ui) {
+        use bt_analytics::screener as scr;
+        ui.label(RichText::new("Screener — technical filters over cached symbols").strong());
+        ui.horizontal(|ui| {
+            ui.label("Filter:");
+            let resp = ui
+                .text_edit_singleline(&mut self.screen_filter)
+                .on_hover_text("e.g. rsi<30 AND change_5d>2  (fields: rsi, macd_hist, price, change_5d, change_20d, volume_ratio, sma50_ratio, sma200_ratio, bb_pos, high52_dist, low52_dist)");
+            if (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                || ui.button("Run screen").clicked()
+            {
+                self.run_screen();
+            }
+            if ui.button("Save screen").clicked() {
+                let dir = screens_dir();
+                let _ = std::fs::create_dir_all(&dir);
+                let name = format!("screen_{}.json", sanitize_filename(&self.screen_filter));
+                let path = dir.join(&name);
+                let payload = serde_json::json!({
+                    "filter": self.screen_filter,
+                    "results": self.screen_results,
+                    "ran_at": Utc::now().format("%Y-%m-%d %H:%M").to_string(),
+                });
+                match std::fs::write(&path, serde_json::to_string_pretty(&payload).unwrap_or_default()) {
+                    Ok(()) => self.push_toast(ToastKind::Success, format!("Saved {name}")),
+                    Err(e) => self.push_toast(ToastKind::Error, format!("Save failed: {e}")),
+                }
+            }
+        });
+        if let Some(e) = &self.screen_error {
+            ui.colored_label(LOSS, format!("Filter error: {e}"));
+        }
+        if let Some(at) = self.screen_ran_at {
+            ui.label(
+                RichText::new(format!(
+                    "{} matches · ran {}s ago",
+                    self.screen_results.len(),
+                    at.elapsed().as_secs()
+                ))
+                .color(Color32::GRAY)
+                .small(),
+            );
+        }
+        ui.separator();
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            egui::Grid::new("screen_results")
+                .striped(true)
+                .spacing(Vec2::new(10.0_f32, 2.0_f32))
+                .show(ui, |ui| {
+                    ui.label(RichText::new("Symbol").strong().small());
+                    ui.label(RichText::new("Price").strong().small());
+                    ui.label(RichText::new("RSI").strong().small());
+                    ui.label(RichText::new("Chg 5d %").strong().small());
+                    ui.label(RichText::new("Vol ×").strong().small());
+                    ui.end_row();
+                    for sym in self.screen_results.clone() {
+                        ui.label(RichText::new(&sym).monospace().strong().small());
+                        match cached_ohlcv_any(&sym) {
+                            Some((closes, volumes)) => {
+                                let row = scr::compute_technicals(&sym, &closes, &volumes);
+                                let f = |k: &str| {
+                                    row.get(k)
+                                        .filter(|v| v.is_finite())
+                                        .map(|v| format!("{v:.1}"))
+                                        .unwrap_or_else(|| "—".to_string())
+                                };
+                                ui.label(RichText::new(f("price")).monospace().small());
+                                ui.label(RichText::new(f("rsi")).monospace().small());
+                                ui.label(RichText::new(f("change_5d")).monospace().small());
+                                ui.label(RichText::new(f("volume_ratio")).monospace().small());
+                            }
+                            None => {
+                                for _ in 0..4 {
+                                    ui.label(RichText::new("—").color(Color32::GRAY).small());
+                                }
+                            }
+                        }
+                        ui.end_row();
+                    }
+                    if self.screen_results.is_empty() && self.screen_ran_at.is_some() {
+                        ui.label(RichText::new("No matches in cached symbols.").weak());
+                        ui.end_row();
+                    }
+                });
+        });
+    }
+
+    /// Run the current screener filter over cached symbols.
+    fn run_screen(&mut self) {
+        use bt_analytics::screener as scr;
+        self.screen_error = None;
+        let filters = match scr::parse_filters(&self.screen_filter) {
+            Ok(f) => f,
+            Err(e) => {
+                self.screen_error = Some(e);
+                self.screen_results.clear();
+                return;
+            }
+        };
+        let mut rows = Vec::new();
+        let mut screened = 0usize;
+        for (name, ticker, _exchange) in bt_data::symbol::COMPANY_LIST {
+            // Crypto/FX/commodities screen on different dynamics; index rows
+            // are aggregates. The filter set is equity-technical.
+            if ticker.contains('-') || ticker.contains('=') || ticker.starts_with('^') {
+                continue;
+            }
+            let Some((closes, volumes)) = cached_ohlcv_any(ticker) else {
+                continue;
+            };
+            screened += 1;
+            rows.push(scr::compute_technicals(ticker, &closes, &volumes));
+            let _ = name;
+        }
+        let hits = scr::apply_filters(&rows, &filters);
+        self.screen_results = hits.into_iter().map(|r| r.symbol.clone()).collect();
+        self.screen_ran_at = Some(Instant::now());
+        if screened == 0 {
+            self.screen_error = Some(
+                "no cached symbols to screen — open symbols on any chart tab first".to_string(),
+            );
+        } else {
+            self.push_toast(
+                ToastKind::Info,
+                format!(
+                    "Screened {screened} cached symbols, {} match",
+                    self.screen_results.len()
+                ),
             );
         }
     }
@@ -10384,6 +11049,597 @@ impl BharatApp {
                     }
                 });
         });
+    }
+
+    /// v4.1 Options tab: live NSE/US chains with Greeks, payoff and IV views.
+    ///
+    /// Data arrives on the worker thread via [`Self::ensure_options_data`];
+    /// this only renders. A symbol with no listed options shows the friendly
+    /// message instead of an empty table, and a blocked fetch shows a red
+    /// banner with Retry rather than a spinner that never resolves.
+    fn draw_options(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Options").strong());
+            ui.label(
+                RichText::new(format!("Symbol: {}", self.selected_company))
+                    .color(AMBER)
+                    .monospace(),
+            );
+            let source_label = match self.options_source {
+                OptionsSource::Nse => "NSE",
+                OptionsSource::Yahoo => "US (Yahoo)",
+                OptionsSource::None => "—",
+            };
+            ui.label(
+                RichText::new(format!("Source: {source_label}"))
+                    .color(Color32::GRAY)
+                    .small(),
+            );
+            if !self.options_expiries.is_empty() {
+                let mut picked = self.options_expiry_raw.clone();
+                egui::ComboBox::from_id_source("options_expiry_pick")
+                    .selected_text(
+                        self.options_expiries
+                            .iter()
+                            .find(|(_, raw)| *raw == self.options_expiry_raw)
+                            .map(|(label, _)| label.as_str())
+                            .unwrap_or("Expiry"),
+                    )
+                    .show_ui(ui, |ui| {
+                        for (label, raw) in &self.options_expiries {
+                            ui.selectable_value(&mut picked, raw.clone(), label);
+                        }
+                    });
+                if picked != self.options_expiry_raw {
+                    self.options_expiry_raw = picked;
+                    self.prefs_dirty = true;
+                    self.options_chain = None;
+                    self.trigger_options_fetch();
+                }
+            }
+            if ui.button("↻").on_hover_text("Re-fetch chain").clicked() {
+                self.options_chain = None;
+                self.options_error = None;
+                self.trigger_options_fetch();
+            }
+            if let Some(at) = self.options_last_fetch {
+                ui.label(
+                    RichText::new(format!("{}s ago", at.elapsed().as_secs()))
+                        .color(Color32::GRAY)
+                        .small(),
+                );
+            }
+        });
+
+        if self.options_source == OptionsSource::None && self.options_chain.is_none() {
+            ui.separator();
+            ui.colored_label(
+                AMBER,
+                format!(
+                    "No options available for {}. F&O underlyings (NSE) and US-listed \
+                     symbols are supported; indices, crypto, FX and commodities are not.",
+                    self.selected_company
+                ),
+            );
+            return;
+        }
+        if let Some(err) = self.options_error.clone() {
+            ui.separator();
+            ui.colored_label(LOSS, format!("Options fetch failed: {err}"));
+            if ui.button("Retry").clicked() {
+                self.options_error = None;
+                self.trigger_options_fetch();
+            }
+        }
+        let Some(chain) = self.options_chain.clone() else {
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Loading option chain…");
+            });
+            return;
+        };
+
+        // Stats row: underlying, ATM, PCR, max pain.
+        let atm = bt_analytics::options::atm_strike(&chain);
+        let pcr = bt_analytics::options::pcr_oi(&chain);
+        let max_pain = bt_analytics::options::max_pain(&chain);
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!("Underlying: {:.2}", chain.underlying_value))
+                    .color(AMBER)
+                    .monospace(),
+            );
+            ui.separator();
+            ui.label(RichText::new(format!("ATM: {:.0}", atm)).monospace());
+            ui.separator();
+            ui.label(
+                RichText::new(format!("PCR (OI): {pcr:.2}"))
+                    .color(if pcr > 1.0 { LOSS } else { PROFIT })
+                    .monospace(),
+            );
+            ui.separator();
+            ui.label(RichText::new(format!("Max pain: {max_pain:.0}")).monospace());
+            ui.separator();
+            ui.label(RichText::new(format!("Expiry: {}", chain.expiry)).color(Color32::GRAY));
+        });
+
+        // Sub-view toggle.
+        ui.horizontal(|ui| {
+            for view in [
+                OptionsView::Chain,
+                OptionsView::Payoff,
+                OptionsView::IvSmile,
+                OptionsView::OiBuildup,
+            ] {
+                if ui
+                    .selectable_label(self.options_view == view, view.label())
+                    .clicked()
+                {
+                    self.options_view = view;
+                    self.prefs_dirty = true;
+                }
+            }
+        });
+        ui.separator();
+
+        match self.options_view {
+            OptionsView::Chain => self.draw_options_chain(ui, &chain),
+            OptionsView::Payoff => self.draw_options_payoff(ui, &chain),
+            OptionsView::IvSmile => self.draw_options_iv(ui, &chain),
+            OptionsView::OiBuildup => self.draw_options_oi(ui, &chain),
+        }
+    }
+
+    /// Chain table: Strike | Call OI | Call Chg | Call LTP | Call IV |
+    /// Put IV | Put LTP | Put Chg | Put OI. ATM row highlighted, click-to-select
+    /// feeds the payoff view.
+    fn draw_options_chain(&mut self, ui: &mut egui::Ui, chain: &bt_core::OptionChain) {
+        let mut picked: Option<f64> = None;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            egui::Grid::new("options_chain_table")
+                .striped(true)
+                .spacing(Vec2::new(8.0_f32, 2.0_f32))
+                .min_col_width(64.0_f32)
+                .show(ui, |ui| {
+                    for h in [
+                        "Strike", "Call OI", "Call Chg", "Call LTP", "Call IV", "Put IV",
+                        "Put LTP", "Put Chg", "Put OI",
+                    ] {
+                        ui.label(RichText::new(h).strong().monospace().size(11.0_f32));
+                    }
+                    ui.end_row();
+                    for r in &chain.strikes {
+                        let atm_mark = if r.atm { " ⭐" } else { "" };
+                        let strike_label = format!("{:.0}{}", r.strike, atm_mark);
+                        if ui
+                            .selectable_label(
+                                self.options_strike == Some(r.strike),
+                                RichText::new(strike_label)
+                                    .monospace()
+                                    .size(11.0_f32)
+                                    .color(if r.atm { AMBER } else { Color32::WHITE })
+                                    .strong(),
+                            )
+                            .on_hover_text("Click for payoff diagram")
+                            .clicked()
+                        {
+                            picked = Some(r.strike);
+                        }
+                        ui.label(
+                            RichText::new(fmt_big_num(r.call.oi as f64))
+                                .monospace()
+                                .size(11.0_f32),
+                        );
+                        ui.colored_label(
+                            if r.call.oi_change >= 0 { PROFIT } else { LOSS },
+                            RichText::new(format!("{:+}", r.call.oi_change))
+                                .monospace()
+                                .size(11.0_f32),
+                        );
+                        ui.label(
+                            RichText::new(format!("{:.2}", r.call.ltp))
+                                .monospace()
+                                .size(11.0_f32),
+                        );
+                        ui.label(
+                            RichText::new(format!("{:.1}%", r.call.iv * 100.0))
+                                .monospace()
+                                .size(11.0_f32),
+                        );
+                        ui.label(
+                            RichText::new(format!("{:.1}%", r.put.iv * 100.0))
+                                .monospace()
+                                .size(11.0_f32),
+                        );
+                        ui.label(
+                            RichText::new(format!("{:.2}", r.put.ltp))
+                                .monospace()
+                                .size(11.0_f32),
+                        );
+                        ui.colored_label(
+                            if r.put.oi_change >= 0 { PROFIT } else { LOSS },
+                            RichText::new(format!("{:+}", r.put.oi_change))
+                                .monospace()
+                                .size(11.0_f32),
+                        );
+                        ui.label(
+                            RichText::new(fmt_big_num(r.put.oi as f64))
+                                .monospace()
+                                .size(11.0_f32),
+                        );
+                        ui.end_row();
+                    }
+                });
+        });
+        if let Some(strike) = picked {
+            self.options_strike = Some(strike);
+            self.options_view = OptionsView::Payoff;
+            self.prefs_dirty = true;
+        }
+    }
+
+    /// Years to the selected expiry, from the raw expiry string of whichever
+    /// backend served the chain. `None` means Greeks cannot be computed.
+    fn options_years_to_expiry(&self) -> Option<f64> {
+        match self.options_source {
+            OptionsSource::Nse => nse_years_to_expiry(&self.options_expiry_raw),
+            OptionsSource::Yahoo => self
+                .options_expiry_raw
+                .parse::<i64>()
+                .ok()
+                .and_then(|ts| {
+                    let days = (ts - Utc::now().timestamp()) as f64 / 86_400.0;
+                    if days > 0.0 {
+                        Some(days / 365.0)
+                    } else {
+                        None
+                    }
+                }),
+            OptionsSource::None => None,
+        }
+    }
+
+    /// Payoff diagram for the selected strike (ATM default): long/short ×
+    /// call/put toggles, ±20% spot range, zero line, breakevens, footer credit.
+    fn draw_options_payoff(&mut self, ui: &mut egui::Ui, chain: &bt_core::OptionChain) {
+        let spot = chain.underlying_value;
+        let strike = self.options_strike.unwrap_or_else(|| {
+            bt_analytics::options::atm_strike(chain).max(spot * 0.9)
+        });
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("Strike: {strike:.0}")).monospace().strong());
+            ui.separator();
+            if ui
+                .selectable_label(self.options_is_call, "Call")
+                .clicked()
+            {
+                self.options_is_call = true;
+            }
+            if ui
+                .selectable_label(!self.options_is_call, "Put")
+                .clicked()
+            {
+                self.options_is_call = false;
+            }
+            ui.separator();
+            if ui.selectable_label(self.options_is_long, "Long").clicked() {
+                self.options_is_long = true;
+            }
+            if ui
+                .selectable_label(!self.options_is_long, "Short")
+                .clicked()
+            {
+                self.options_is_long = false;
+            }
+            let leg = chain
+                .strikes
+                .iter()
+                .find(|r| (r.strike - strike).abs() < 1e-9)
+                .map(|r| {
+                    if self.options_is_call {
+                        &r.call
+                    } else {
+                        &r.put
+                    }
+                });
+            if let Some(leg) = leg {
+                ui.label(
+                    RichText::new(format!("Premium (LTP): {:.2}", leg.ltp))
+                        .color(Color32::GRAY)
+                        .monospace(),
+                );
+            }
+        });
+        let premium = chain
+            .strikes
+            .iter()
+            .find(|r| (r.strike - strike).abs() < 1e-9)
+            .map(|r| {
+                if self.options_is_call {
+                    r.call.ltp
+                } else {
+                    r.put.ltp
+                }
+            })
+            .unwrap_or(0.0);
+        let (is_call, is_long) = (self.options_is_call, self.options_is_long);
+        let lo = spot * 0.8;
+        let hi = spot * 1.2;
+        let pts: PlotPoints = (0..=120)
+            .map(|i| {
+                let s = lo + (hi - lo) * i as f64 / 120.0;
+                [s, option_payoff_at(s, strike, premium, is_call, is_long)]
+            })
+            .collect();
+        // Breakevens: where the line crosses zero.
+        let mut breakevens: Vec<f64> = Vec::new();
+        let mut prev: Option<(f64, f64)> = None;
+        for p in pts.points().iter() {
+            if let Some((ps, pp)) = prev {
+                if (pp < 0.0) != (p.y < 0.0) && (p.x - ps).abs() > 1e-12 {
+                    let t = pp / (pp - p.y);
+                    breakevens.push(ps + t * (p.x - ps));
+                }
+            }
+            prev = Some((p.x, p.y));
+        }
+        let max_p = pts
+            .points()
+            .iter()
+            .map(|p| p.y)
+            .fold(f64::MIN, f64::max);
+        let min_p = pts
+            .points()
+            .iter()
+            .map(|p| p.y)
+            .fold(f64::MAX, f64::min);
+        Plot::new("options_payoff_plot")
+            .legend(Legend::default())
+            .height(ui.available_height().max(200.0_f32))
+            .show(ui, |plot_ui| {
+                plot_ui.line(
+                    Line::new(pts)
+                        .name(format!(
+                            "{} {} {:.0} @ {:.2}",
+                            if is_long { "Long" } else { "Short" },
+                            if is_call { "Call" } else { "Put" },
+                            strike,
+                            premium
+                        ))
+                        .color(AMBER)
+                        .width(2.0_f32),
+                );
+                plot_ui.hline(
+                    egui_plot::HLine::new(0.0)
+                        .name("Zero")
+                        .color(Color32::GRAY),
+                );
+                plot_ui.vline(
+                    egui_plot::VLine::new(spot)
+                        .name(format!("Spot {spot:.0}"))
+                        .color(PROFIT),
+                );
+                for b in &breakevens {
+                    plot_ui.points(
+                        Points::new(vec![[*b, 0.0]])
+                            .name(format!("BE {b:.0}"))
+                            .color(Color32::WHITE)
+                            .radius(4.0_f32),
+                    );
+                }
+            });
+        ui.label(
+            RichText::new(format!(
+                "Max {:.0} / Min {:.0} over ±20% spot · Breakevens: {} · Made by {AUTHOR}",
+                max_p,
+                min_p,
+                breakevens
+                    .iter()
+                    .map(|b| format!("{b:.0}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ))
+            .color(Color32::GRAY)
+            .small(),
+        );
+    }
+
+    /// IV smile: call and put IV across strikes, spot + ATM markers.
+    fn draw_options_iv(&self, ui: &mut egui::Ui, chain: &bt_core::OptionChain) {
+        let spot = chain.underlying_value;
+        let atm = bt_analytics::options::atm_strike(chain);
+        let call_iv: PlotPoints = chain
+            .strikes
+            .iter()
+            .map(|r| [r.strike, r.call.iv * 100.0])
+            .collect();
+        let put_iv: PlotPoints = chain
+            .strikes
+            .iter()
+            .map(|r| [r.strike, r.put.iv * 100.0])
+            .collect();
+        Plot::new("options_iv_plot")
+            .legend(Legend::default())
+            .height(ui.available_height().max(200.0_f32))
+            .show(ui, |plot_ui| {
+                plot_ui.line(Line::new(call_iv).name("Call IV %").color(PROFIT).width(2.0_f32));
+                plot_ui.line(Line::new(put_iv).name("Put IV %").color(LOSS).width(2.0_f32));
+                plot_ui.vline(
+                    egui_plot::VLine::new(spot)
+                        .name(format!("Spot {spot:.0}"))
+                        .color(Color32::WHITE),
+                );
+                plot_ui.vline(
+                    egui_plot::VLine::new(atm)
+                        .name(format!("ATM {atm:.0}"))
+                        .color(AMBER),
+                );
+            });
+        ui.label(
+            RichText::new(format!("ATM {atm:.0} highlighted · Made by {AUTHOR}"))
+                .color(Color32::GRAY)
+                .small(),
+        );
+    }
+
+    /// OI buildup: call vs put open interest per strike.
+    fn draw_options_oi(&self, ui: &mut egui::Ui, chain: &bt_core::OptionChain) {
+        let step = chain
+            .strikes
+            .windows(2)
+            .map(|w| (w[1].strike - w[0].strike).abs())
+            .fold(0.0_f64, f64::max)
+            .max(1.0);
+        let width = step * 0.35;
+        let calls: Vec<Bar> = chain
+            .strikes
+            .iter()
+            .map(|r| {
+                Bar::new(r.strike - width / 2.0, r.call.oi as f64)
+                    .width(width)
+                    .fill(PROFIT)
+                    .name(format!("C {:.0}", r.strike))
+            })
+            .collect();
+        let puts: Vec<Bar> = chain
+            .strikes
+            .iter()
+            .map(|r| {
+                Bar::new(r.strike + width / 2.0, r.put.oi as f64)
+                    .width(width)
+                    .fill(LOSS)
+                    .name(format!("P {:.0}", r.strike))
+            })
+            .collect();
+        Plot::new("options_oi_plot")
+            .legend(Legend::default())
+            .height(ui.available_height().max(200.0_f32))
+            .show(ui, |plot_ui| {
+                plot_ui.bar_chart(BarChart::new(calls).name("Call OI").color(PROFIT));
+                plot_ui.bar_chart(BarChart::new(puts).name("Put OI").color(LOSS));
+            });
+        let pcr = bt_analytics::options::pcr_oi(chain);
+        ui.label(
+            RichText::new(format!("PCR (OI): {pcr:.2} · Made by {AUTHOR}"))
+                .color(Color32::GRAY)
+                .small(),
+        );
+    }
+
+    /// Fetch expiries + nearest chain on a worker thread. Called when the tab
+    /// is showing and data is missing, stale, or for another symbol/expiry.
+    fn trigger_options_fetch(&mut self) {
+        if self.options_in_flight {
+            return;
+        }
+        let symbol = self.selected_company.clone();
+        let source = detect_options_source(&symbol);
+        if source == OptionsSource::None {
+            self.options_chain = None;
+            self.options_source = OptionsSource::None;
+            self.options_error = None;
+            self.options_expiries.clear();
+            return;
+        }
+        self.options_in_flight = true;
+        self.options_error = None;
+        let expiry = self.options_expiry_raw.clone();
+        let tx = self.tx.clone();
+        self.runtime.spawn(async move {
+            match source {
+                OptionsSource::Nse => {
+                    let p = bt_data::nse_options::NseOptionsProvider::new();
+                    if let Err(e) = p.init_session().await {
+                        let _ = tx.send(AppMessage::OptionsError(e.to_string()));
+                        return;
+                    }
+                    let expiries = match p.fetch_expiries(&symbol).await {
+                        Ok(e) => e,
+                        Err(e) => {
+                            let _ = tx.send(AppMessage::OptionsError(e.to_string()));
+                            return;
+                        }
+                    };
+                    let list: Vec<(String, String)> =
+                        expiries.iter().map(|e| (e.clone(), e.clone())).collect();
+                    let _ = tx.send(AppMessage::OptionsExpiries(list));
+                    let pick = if !expiry.is_empty()
+                        && expiries.iter().any(|e| *e == expiry)
+                    {
+                        Some(expiry.as_str())
+                    } else {
+                        None
+                    };
+                    // NSE symbols in the app carry `.NS`; the API wants bare.
+                    let bare = symbol
+                        .strip_suffix(".NS")
+                        .or_else(|| symbol.strip_suffix(".BO"))
+                        .unwrap_or(&symbol);
+                    match p.fetch_chain(bare, pick).await {
+                        Ok(chain) => {
+                            let _ = tx.send(AppMessage::OptionsReady(chain, OptionsSource::Nse));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(AppMessage::OptionsError(e.to_string()));
+                        }
+                    }
+                }
+                OptionsSource::Yahoo => {
+                    let p = bt_data::us_options::UsOptionsProvider::new();
+                    let expiries = match p.fetch_us_expiries(&symbol).await {
+                        Ok(e) => e,
+                        Err(e) => {
+                            let _ = tx.send(AppMessage::OptionsError(e.to_string()));
+                            return;
+                        }
+                    };
+                    let list: Vec<(String, String)> = expiries
+                        .iter()
+                        .map(|ts| {
+                            let label = chrono::DateTime::from_timestamp(*ts, 0)
+                                .map(|d| d.format("%d-%b-%Y").to_string())
+                                .unwrap_or_else(|| ts.to_string());
+                            (label, ts.to_string())
+                        })
+                        .collect();
+                    let _ = tx.send(AppMessage::OptionsExpiries(list));
+                    let pick = expiry.parse::<i64>().ok().filter(|ts| expiries.contains(ts));
+                    match p.fetch_us_chain(&symbol, pick).await {
+                        Ok(chain) => {
+                            let _ = tx.send(AppMessage::OptionsReady(chain, OptionsSource::Yahoo));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(AppMessage::OptionsError(e.to_string()));
+                        }
+                    }
+                }
+                OptionsSource::None => {}
+            }
+        });
+    }
+
+    /// Keep the Options tab fed while it is showing: first load, symbol
+    /// switches, and a 60s staleness refresh. Never fires when another tab is
+    /// up, so background tabs cost no requests.
+    fn ensure_options_data(&mut self) {
+        if self.tab != Tab::Options || self.options_in_flight {
+            return;
+        }
+        let stale_symbol = self
+            .options_chain
+            .as_ref()
+            .map(|c| c.symbol != normalized_options_symbol(&self.selected_company))
+            .unwrap_or(true);
+        let stale_time = self
+            .options_last_fetch
+            .map(|t| t.elapsed() >= Duration::from_secs(60))
+            .unwrap_or(true);
+        if self.options_chain.is_none() || stale_symbol || (stale_time && self.options_error.is_none()) {
+            self.options_chain = if stale_symbol { None } else { self.options_chain.take() };
+            self.trigger_options_fetch();
+        }
     }
 
     fn draw_iv_surface_india(&self, ui: &mut egui::Ui) {
@@ -11979,6 +13235,178 @@ impl BharatApp {
                 }
             });
     }
+
+    /// v4.1 AI chat: floating assistant window.
+    ///
+    /// Answered on-device from live app state (cached prices, forecasts,
+    /// signals, indicators, news sentiment, alerts) by intent matching — not
+    /// by a language model. The window is labeled accordingly so nobody
+    /// mistakes it for one; when an LLM runtime is vendored, this is the seam
+    /// it plugs into.
+    fn draw_chat(&mut self, ctx: &egui::Context) {
+        if !self.show_chat {
+            return;
+        }
+        let mut send: Option<String> = None;
+        egui::Window::new("Market Assistant")
+            .collapsible(true)
+            .resizable(true)
+            .default_size([380.0_f32, 420.0_f32])
+            .anchor(egui::Align2::RIGHT_TOP, [-16.0_f32, 60.0_f32])
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new("On-device assistant — answers from live app data, not an LLM.")
+                        .color(Color32::GRAY)
+                        .small(),
+                );
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .max_height(300.0_f32)
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        if self.chat_messages.is_empty() {
+                            ui.label(
+                                RichText::new("Ask about price, forecast, signal, RSI, news or alerts. Try \"help\".")
+                                    .weak()
+                                    .small(),
+                            );
+                        }
+                        for (q, a) in &self.chat_messages {
+                            ui.label(RichText::new(format!("You: {q}")).strong().small());
+                            ui.label(RichText::new(format!("Assistant: {a}")).small());
+                            ui.separator();
+                        }
+                    });
+                ui.horizontal(|ui| {
+                    let resp = ui.text_edit_singleline(&mut self.chat_input);
+                    if (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                        || ui.button("Send").clicked()
+                    {
+                        let q = self.chat_input.trim().to_string();
+                        if !q.is_empty() {
+                            send = Some(q);
+                        }
+                    }
+                });
+            });
+        if let Some(q) = send {
+            let a = self.respond_chat(&q);
+            self.chat_messages.push_back((q, a));
+            while self.chat_messages.len() > 50 {
+                self.chat_messages.pop_front();
+            }
+            self.chat_input.clear();
+        }
+    }
+
+    /// Answer one question from live state. Every branch says where its number
+    /// came from; unknown questions get the capability list, never a guess.
+    fn respond_chat(&self, question: &str) -> String {
+        let q = question.to_lowercase();
+        let has = |words: &[&str]| words.iter().any(|w| q.contains(w));
+        let symbol = &self.selected_company;
+        let last_close = self.data.candles.candles.last().map(|c| c.close);
+
+        if has(&["help", "what can you", "commands"]) {
+            return "I answer from this app's live data: ask about price (\"price of RELIANCE\"), \
+                forecast (\"forecast\"), signal (\"signal\" / \"buy or sell\"), RSI, news \
+                (\"news\" / \"sentiment\"), or alerts (\"alerts\"). Switch symbols in the header first."
+                .to_string();
+        }
+        if has(&["price", "ltp", "quote", "how much", "worth"]) {
+            return match last_close {
+                Some(p) => {
+                    let prev = self
+                        .data
+                        .candles
+                        .candles
+                        .iter()
+                        .rev()
+                        .nth(1)
+                        .map(|c| c.close)
+                        .unwrap_or(p);
+                    let chg = if prev.abs() > 1e-12 { (p / prev - 1.0) * 100.0 } else { 0.0 };
+                    format!("{symbol} last cached close is {p:.2} ({chg:+.2}% vs prior bar).")
+                }
+                None => format!("No cached data for {symbol} yet — fetch it on any chart tab first."),
+            };
+        }
+        if has(&["forecast", "predict", "target", "tomorrow"]) {
+            return match (self.forecast_values.last(), self.forecast_basis.last()) {
+                (Some(&last), Some(&base)) if base.abs() > 1e-12 => {
+                    let pct = (last / base - 1.0) * 100.0;
+                    format!(
+                        "Last {} run ({} bars) ends at {:.2} ({:+.2}% from {:.2}). Re-run on the Forecast tab for a fresh path.",
+                        self.forecast_engine, self.forecast_values.len(), last, pct, base
+                    )
+                }
+                _ => "No forecast cached yet — open the Forecast tab and press Run forecast.".to_string(),
+            };
+        }
+        if has(&["signal", "buy", "sell", "hold"]) {
+            return match &self.last_signal {
+                Some(s) => format!(
+                    "WatchSignal reads {} at {:.0}% confidence. That is one model vote, not advice.",
+                    s.signal.label(),
+                    s.confidence * 100.0
+                ),
+                None => "No signal computed yet — run a forecast first.".to_string(),
+            };
+        }
+        if has(&["rsi", "overbought", "oversold", "momentum"]) {
+            let rsi = bt_analytics::rsi(&self.data.candles, 14)
+                .into_iter()
+                .rev()
+                .find(|v| v.is_finite());
+            return match rsi {
+                Some(r) => {
+                    let read = if r > 70.0 {
+                        "overbought"
+                    } else if r < 30.0 {
+                        "oversold"
+                    } else {
+                        "neutral"
+                    };
+                    format!("{symbol} RSI(14) is {r:.1} — {read}.")
+                }
+                None => format!("Not enough bars for RSI on {symbol} (need 15+)."),
+            };
+        }
+        if has(&["news", "sentiment", "headline"]) {
+            if self.news_items.is_empty() {
+                return "No headlines cached — open the News tab to fetch.".to_string();
+            }
+            let mut out = format!("Top {} headlines:\n", self.news_items.len().min(3));
+            for a in self.news_items.iter().take(3) {
+                let s = a.sentiment.map(|v| {
+                    format!(" ({})", bt_analytics::sentiment::label(v as f64))
+                }).unwrap_or_default();
+                out.push_str(&format!("• {}{}\n", a.title, s));
+            }
+            return out;
+        }
+        if has(&["alert", "watch"]) {
+            let on = self.alerts.iter().filter(|r| r.enabled).count();
+            return match self.alert_events.back() {
+                Some(ev) => format!(
+                    "{} rules ({} on). Latest event: {} — {}",
+                    self.alerts.len(),
+                    on,
+                    ev.symbol,
+                    ev.message
+                ),
+                None => format!(
+                    "{} rules ({} on), nothing fired yet. Manage them on the Alerts tab.",
+                    self.alerts.len(),
+                    on
+                ),
+            };
+        }
+        "I can report price, forecast, signal, RSI, news sentiment and alerts for the \
+         selected symbol — try \"help\" for examples. I do not predict beyond what the \
+         app's engines computed."
+            .to_string()
+    }
 }
 
 // ==================== HELPERS ====================
@@ -12177,6 +13605,10 @@ impl eframe::App for BharatApp {
         if self.tab == Tab::News {
             self.trigger_news_fetch();
         }
+        // Live chain while the Options tab is showing (freshness inside).
+        if self.tab == Tab::Options {
+            self.ensure_options_data();
+        }
 
         ctx.set_visuals(if self.dark {
             egui::Visuals::dark()
@@ -12190,9 +13622,11 @@ impl eframe::App for BharatApp {
         self.error_toast(ctx);
         self.toasts(ctx);
         shortcuts_overlay(self, ctx);
+        self.draw_chat(ctx);
         self.body(ctx);
         ctx.request_repaint_after(Duration::from_millis(100));
     }
+
 }
 
 /// Share of the plot's height the predicted band is guaranteed.
@@ -12391,6 +13825,47 @@ fn native_toast(title: &str, body: &str) {
 #[cfg(not(windows))]
 fn native_toast(_title: &str, _body: &str) {}
 
+/// Speak `text` aloud via Windows SAPI, on a throwaway thread so the UI never
+/// blocks on audio. Fire-and-forget: failures are swallowed, because a voice
+/// alert that errors is worse than a silent one only if it also breaks the app.
+///
+/// The `windows` crate path for classic SAPI (`ISpVoice`) is exercised here on
+/// first use; if the bindings ever drift, this fails closed at runtime.
+#[cfg(windows)]
+fn speak_text(text: &str) {
+    use windows::core::{GUID, HSTRING};
+    use windows::Win32::Media::Speech::{ISpVoice, SPF_ASYNC, SPF_IS_NOT_XML};
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED,
+    };
+
+    // CLSID_SpVoice is not projected by the `windows` crate, so it is built
+    // from the well-known GUID ({96749377-3391-11D2-9EE3-00C04F797396}).
+    const CLSID_SPVOICE: GUID = GUID::from_u128(0x96749377_3391_11D2_9EE3_00C04F797396);
+    let text = text.chars().take(280).collect::<String>();
+    std::thread::spawn(move || {
+        unsafe {
+            if CoInitializeEx(None, COINIT_MULTITHREADED).is_err() {
+                return;
+            }
+            let voice: Result<ISpVoice, _> =
+                CoCreateInstance(&CLSID_SPVOICE, None, CLSCTX_ALL);
+            if let Ok(voice) = voice {
+                let h = HSTRING::from(text.as_str());
+                let _ = voice.Speak(
+                    &h,
+                    (SPF_ASYNC.0 | SPF_IS_NOT_XML.0) as u32,
+                    None,
+                );
+            }
+            windows::Win32::System::Com::CoUninitialize();
+        }
+    });
+}
+
+#[cfg(not(windows))]
+fn speak_text(_text: &str) {}
+
 /// One dated market event.
 #[derive(Debug, Clone)]
 struct CalendarEvent {
@@ -12495,10 +13970,18 @@ fn fuzzy_company_matches(query: &str, limit: usize) -> Vec<(&'static str, &'stat
                 .map(|score| (*name, *ticker, *exchange, score))
         })
         .collect();
-    scored.sort_by_key(|a| std::cmp::Reverse(a.3));
-    scored.truncate(limit.max(1));
-    scored
+    scored.sort_by(|a, b| b.3.cmp(&a.3));
+    // An exactly-typed ticker always wins: "TCS.BO" must not outrank nothing,
+    // but "TCS.NS" typed in full must come first even if a shorter twin
+    // scores higher on length.
+    let q_upper = query.to_uppercase();
+    let (exact, rest): (Vec<_>, Vec<_>) = scored
         .into_iter()
+        .partition(|(_, t, _, _)| t.to_uppercase() == q_upper);
+    exact
+        .into_iter()
+        .chain(rest)
+        .take(limit.max(1))
         .map(|(n, t, e, _)| (n, t, e))
         .collect()
 }
@@ -12515,8 +13998,14 @@ mod v4_tools_tests {
             hits.iter().any(|(_, t, _)| *t == "RELIANCE.NS"),
             "fuzzy 'rlnc' should reach RELIANCE.NS"
         );
-        // Exact ticker still ranks first.
+        // "tcs" matches both TCS.NS and TCS.BO; either order is fine in the
+        // top results, but a fully-typed ticker must win outright.
         let hits = fuzzy_company_matches("tcs", 10);
+        assert!(
+            hits.iter().take(3).any(|(_, t, _)| *t == "TCS.NS"),
+            "TCS.NS should be in the top 3 for 'tcs'"
+        );
+        let hits = fuzzy_company_matches("TCS.NS", 10);
         assert_eq!(hits.first().map(|(_, t, _)| *t), Some("TCS.NS"));
     }
 
@@ -12610,12 +14099,131 @@ mod v4_tools_tests {
             .flat_map(|c| tabs_in_category(*c))
             .map(|(t, _)| *t)
             .collect();
-        for tab in [Tab::Alerts, Tab::News, Tab::Calendar] {
+        for tab in [Tab::Alerts, Tab::News, Tab::Calendar, Tab::Options, Tab::Portfolio, Tab::Compare, Tab::Screener] {
             assert!(listed.contains(&tab), "{tab:?} not listed in any category");
         }
         let tools = tabs_in_category(TabCategory::Tools);
-        assert_eq!(tools.len(), 3);
+        assert_eq!(tools.len(), 7);
     }
+
+    #[test]
+    fn options_source_routing() {
+        // NSE: indices bare, F&O equities suffixed or bare.
+        assert_eq!(detect_options_source("NIFTY"), OptionsSource::Nse);
+        assert_eq!(detect_options_source("BANKNIFTY"), OptionsSource::Nse);
+        assert_eq!(detect_options_source("RELIANCE.NS"), OptionsSource::Nse);
+        assert_eq!(detect_options_source("TCS.BO"), OptionsSource::Nse);
+        assert_eq!(detect_options_source("tcs"), OptionsSource::Nse);
+        // US listings via the symbol table.
+        assert_eq!(detect_options_source("AAPL"), OptionsSource::Yahoo);
+        assert_eq!(detect_options_source("SPY"), OptionsSource::Yahoo);
+        assert_eq!(detect_options_source("7203.T"), OptionsSource::None);
+        // No options: indices without F&O, crypto, FX, unknown.
+        assert_eq!(detect_options_source("^NSEI"), OptionsSource::None);
+        assert_eq!(detect_options_source("BTC-USD"), OptionsSource::None);
+        assert_eq!(detect_options_source("USDINR=X"), OptionsSource::None);
+        assert_eq!(detect_options_source("NOPE.XYZ"), OptionsSource::None);
+    }
+
+    #[test]
+    fn payoff_math_covers_all_four_positions() {
+        // Long call, strike 100, premium 5: worthless below, linear above.
+        assert_eq!(option_payoff_at(90.0, 100.0, 5.0, true, true), -5.0);
+        assert_eq!(option_payoff_at(110.0, 100.0, 5.0, true, true), 5.0);
+        // Short call mirrors.
+        assert_eq!(option_payoff_at(90.0, 100.0, 5.0, true, false), 5.0);
+        assert_eq!(option_payoff_at(110.0, 100.0, 5.0, true, false), -5.0);
+        // Long put profits downward.
+        assert_eq!(option_payoff_at(90.0, 100.0, 4.0, false, true), 6.0);
+        // Breakeven exactly: intrinsic equals premium.
+        assert_eq!(option_payoff_at(105.0, 100.0, 5.0, true, true), 0.0);
+    }
+
+    #[test]
+    fn nse_expiry_parsing_accepts_only_real_dates() {
+        let y = nse_years_to_expiry("30-Oct-2026").unwrap();
+        assert!(y > 0.0 && y < 5.0, "{y}");
+        assert!(nse_years_to_expiry("not-a-date").is_none());
+        assert!(nse_years_to_expiry("").is_none());
+        // Expired contracts yield no Greeks input.
+        assert!(nse_years_to_expiry("01-Jan-2020").is_none());
+    }
+
+    #[test]
+    fn normalized_symbol_matches_chain_symbols() {
+        assert_eq!(normalized_options_symbol("RELIANCE.NS"), "RELIANCE");
+        assert_eq!(normalized_options_symbol("TCS.BO"), "TCS");
+        assert_eq!(normalized_options_symbol("NIFTY"), "NIFTY");
+        assert_eq!(normalized_options_symbol("aapl"), "AAPL");
+    }
+
+    #[test]
+    fn options_view_labels_round_trip() {
+        for v in [
+            OptionsView::Chain,
+            OptionsView::Payoff,
+            OptionsView::IvSmile,
+            OptionsView::OiBuildup,
+        ] {
+            assert_eq!(OptionsView::from_label(v.as_label()), v);
+            assert!(!v.label().is_empty());
+        }
+        assert_eq!(OptionsView::from_label("bogus"), OptionsView::Chain);
+    }
+}
+
+/// Cached closes + volumes for a symbol, trying daily down to intraday keys.
+///
+/// Returns `None` when nothing usable is cached. This is what keeps the
+/// Portfolio, Compare and Screener tabs free of network calls: they read what
+/// the chart tabs already fetched, and say so when a symbol was never opened.
+fn cached_ohlcv_any(symbol: &str) -> Option<(Vec<f64>, Vec<f64>)> {
+    let cache = bt_data::cache::Cache::new(bt_data::default_cache_path()).ok()?;
+    for iv in ["1d", "1wk", "1mo", "1h", "15m", "5m", "1m"] {
+        if let Ok(Some(candles)) = cache.get_ohlcv(symbol, iv) {
+            if candles.len() >= 20 {
+                return Some((
+                    candles.iter().map(|c| c.close).collect(),
+                    candles.iter().map(|c| c.volume).collect(),
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Screens directory beside the executable (`screens/<name>.json`).
+fn screens_dir() -> std::path::PathBuf {
+    let base = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    base.join("screens")
+}
+
+/// Pearson correlation over the overlapping tail (last 60 points max).
+/// `None` when there is nothing overlap-safe to correlate.
+fn pearson(a: &[f64], b: &[f64]) -> Option<f64> {
+    let n = a.len().min(b.len()).min(60);
+    if n < 5 {
+        return None;
+    }
+    let (a, b) = (&a[a.len() - n..], &b[b.len() - n..]);
+    let (ma, mb) = (
+        a.iter().sum::<f64>() / n as f64,
+        b.iter().sum::<f64>() / n as f64,
+    );
+    let (mut num, mut da, mut db) = (0.0, 0.0, 0.0);
+    for i in 0..n {
+        let (x, y) = (a[i] - ma, b[i] - mb);
+        num += x * y;
+        da += x * x;
+        db += y * y;
+    }
+    if da <= 0.0 || db <= 0.0 || !num.is_finite() {
+        return None;
+    }
+    Some((num / (da * db).sqrt()).clamp(-1.0, 1.0))
 }
 
 fn main() -> eframe::Result<()> {
@@ -12634,7 +14242,7 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native(
-        &format!("{} v4 — Made by {}", APP_NAME, AUTHOR),
+        &format!("{} v4.1 — Made by {}", APP_NAME, AUTHOR),
         options,
         Box::new(|cc| Ok(Box::new(BharatApp::new(cc)))),
     )

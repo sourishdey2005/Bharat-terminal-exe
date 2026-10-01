@@ -1,4 +1,4 @@
-# Bharat Terminal — Windows Installer Builder
+# Bharat Terminal â€” Windows Installer Builder
 # Author: Sourish Dey
 #
 # Builds the release binaries (with embedded icons) and packages them into a
@@ -17,7 +17,7 @@ $root = Split-Path -Parent $PSScriptRoot
 $project = Join-Path $root "bharat-terminal"
 $installerDir = Join-Path $project "installer"
 $nativeDir = Join-Path $project "native"
-$msiOut = Join-Path $project "releases\BharatTerminal-v4.0.0.msi"
+$msiOut = Join-Path $project "releases\BharatTerminal-v4.1.0.msi"
 
 Write-Host "Building Bharat Terminal v4 (release)..." -ForegroundColor Cyan
 cargo build --release --workspace --manifest-path (Join-Path $project "Cargo.toml")
@@ -36,8 +36,8 @@ $ortDll = Join-Path $nativeDir "onnxruntime.dll"
 # refreshed; a stale binary here means the "download the portable build" path
 # silently ships the previous release.
 $releasesDir = Join-Path $project "releases"
-$portableExe = Join-Path $releasesDir "BharatTerminal-v4.0.0.exe"
-$portableCli = Join-Path $releasesDir "BharatTerminal-v4.0.0-cli.exe"
+$portableExe = Join-Path $releasesDir "BharatTerminal-v4.1.0.exe"
+$portableCli = Join-Path $releasesDir "BharatTerminal-v4.1.0-cli.exe"
 if (-not (Test-Path $ortDll)) {
     Write-Host "Fetching ONNX Runtime $ortVersion..." -ForegroundColor Yellow
     New-Item -ItemType Directory -Path $nativeDir -Force | Out-Null
@@ -120,7 +120,7 @@ try {
         -o $msiOut `
         -ext WixToolset.UI.wixext `
         -arch x64 `
-        -d AppVersion=4.0.0 `
+        -d AppVersion=4.1.0 `
         -d "PayloadDir=$payloadRuntime" 2>&1
     $wixLog | ForEach-Object { Write-Host $_ }
     if ($LASTEXITCODE -ne 0) {

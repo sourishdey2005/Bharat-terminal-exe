@@ -14,12 +14,17 @@
 
 pub mod extended;
 pub mod alerts;
+pub mod backtest;
 pub mod forecast;
 pub mod indicators;
 pub mod models;
+pub mod options;
 pub mod ort_runtime;
+pub mod patterns;
+pub mod portfolio;
 pub mod quant_analytics;
 pub mod risk;
+pub mod screener;
 pub mod sentiment;
 pub mod signal;
 
@@ -43,6 +48,11 @@ pub use models::{
     TtmEngine, TtmForecastResult,
 };
 pub use alerts::{AlertEvent, AlertKind, AlertRule, MarketSnapshot, condition_message, evaluate};
+pub use backtest::{BacktestResult, backtest_sma_cross, run_backtest, sma_cross_positions};
+pub use options::{Greeks, atm_strike, black_scholes_greeks, max_pain, pcr_oi, pcr_volume};
+pub use patterns::{PatternHit, detect_all, detect_doji, detect_double_top, detect_engulfing, detect_hammer, detect_head_shoulders};
+pub use portfolio::{Holding, PortfolioRisk, allocation, compute_pnl, risk_metrics, total_cost, total_value, validate as validate_holdings};
+pub use screener::{CmpOp, Filter, ScreenRow, TECHNICAL_FIELDS, apply_filters, compute_technicals, parse_filters};
 pub use sentiment::{label as sentiment_label, score as sentiment_score, score_labeled};
 pub use quant_analytics::{
     FftCycleOutput, QuantAnalyticsEngine, QuantError, Regime, RegimeOutput, FFT_MAX_BARS,

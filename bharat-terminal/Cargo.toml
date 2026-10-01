@@ -10,11 +10,11 @@ members = [
 ]
 
 [workspace.package]
-version = "4.0.0"
+version = "4.1.0"
 edition = "2021"
 authors = ["Sourish Dey"]
 license = "MIT"
-description = "Bharat Terminal v4 — 190+ visualizations, alerts, news, calendar, real market data, Windows installer. Made by Sourish Dey."
+description = "Bharat Terminal v4 â€” 190+ visualizations, alerts, news, calendar, real market data, Windows installer. Made by Sourish Dey."
 
 [workspace.dependencies]
 thiserror = "1.0"

@@ -206,3 +206,45 @@ mod tests {
         }
     }
 }
+
+/// One side of an option strike: exchange-published positioning and price.
+///
+/// Shared by the NSE and US (Yahoo) providers in bt-data and the math in
+/// bt-analytics, so both sides agree on field meaning without either crate
+/// depending on the other.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct OptionLeg {
+    /// Open interest in contracts.
+    pub oi: u64,
+    /// Day change in OI (NSE publishes it; Yahoo legs leave it 0).
+    pub oi_change: i64,
+    /// Traded volume in contracts.
+    pub volume: u64,
+    /// Last traded price.
+    pub ltp: f64,
+    /// Implied volatility as a decimal (0.22, not 22).
+    pub iv: f64,
+}
+
+/// One strike row with both legs.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct OptionStrike {
+    pub strike: f64,
+    pub call: OptionLeg,
+    pub put: OptionLeg,
+    /// Nearest strike to the underlying at fetch time.
+    pub atm: bool,
+}
+
+/// A full chain for one symbol + expiry, in exchange-neutral shape.
+#[derive(Debug, Clone)]
+pub struct OptionChain {
+    pub symbol: String,
+    /// Expiry as published (`"30-Oct-2026"` for NSE, unix seconds as text
+    /// for Yahoo) — opaque here, parsed by whoever needs it.
+    pub expiry: String,
+    pub underlying_value: f64,
+    pub strikes: Vec<OptionStrike>,
+    /// Fetch time, seconds since epoch, for staleness display.
+    pub fetched_at: u64,
+}
